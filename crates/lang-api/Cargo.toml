@@ -1,0 +1,11 @@
+[package]
+name = "lang-api"
+description = "Host-agnostic language-service trait shared by otui-lsp language backends."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]

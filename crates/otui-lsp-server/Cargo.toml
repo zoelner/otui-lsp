@@ -1,0 +1,18 @@
+[package]
+name = "otui-lsp-server"
+description = "Language Server (LSP 3.17) for OTUI/OTML, built on otui-core."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "otui-lsp"
+path = "src/main.rs"
+
+[dependencies]
+otui-core.workspace = true
+lang-api.workspace = true
+# tower-lsp / lsp-types / tokio are added in M3 when the server lifecycle lands.

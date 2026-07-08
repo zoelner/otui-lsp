@@ -1,0 +1,15 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# tree-sitter generated artifacts kept in-tree per crate; ignore local build junk
+node_modules/
+*.log
+
+# local-only tooling, not part of the published project
+.claude/
+
+# editor/OS
+.DS_Store
+*.swp

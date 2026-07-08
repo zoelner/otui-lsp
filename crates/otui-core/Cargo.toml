@@ -1,0 +1,12 @@
+[package]
+name = "otui-core"
+description = "Pure OTUI/OTML language engine: parsing, diagnostics, symbols, completion, formatting (protocol-agnostic)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+lang-api.workspace = true

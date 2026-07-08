@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lang-api",
+    "crates/otui-core",
+    "crates/otui-lsp-server",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zoelner/otui-lsp"
+authors = ["Everton Zoelner <everton.zoelner@gmail.com>"]
+
+[workspace.dependencies]
+lang-api = { path = "crates/lang-api" }
+otui-core = { path = "crates/otui-core" }
+
+[profile.release]
+lto = "thin"
