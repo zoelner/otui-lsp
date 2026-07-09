@@ -12,15 +12,17 @@
 //! tree-sitter [`syntax`] substrate.
 
 pub mod diagnostics;
+pub mod hover;
 pub mod navigation;
 pub mod semantic;
 pub mod style_index;
 pub mod symbols;
 pub mod syntax;
 
+use hover::StyleHover;
 use lang_api::{Diagnostic, DocumentSymbol, LanguageService, SemanticToken};
-use navigation::BaseRef;
-use style_index::StyleDef;
+use navigation::{BaseRef, StyleHeaderRef};
+use style_index::{StyleDef, StyleIndex};
 use syntax::SyntaxTree;
 
 /// The OTUI language backend. Constructed once per workspace/session.
@@ -60,6 +62,37 @@ impl OtuiService {
     #[must_use]
     pub fn base_reference_at(&self, source: &str, offset: usize) -> Option<BaseRef> {
         navigation::base_reference_at(source, offset)
+    }
+
+    /// Locate the top-level `Name < Base` header under `offset`, if the cursor sits on the declared
+    /// name token or the base token (spec §5.5 hover). Returns the whole header descriptor so the
+    /// server can tell which part was hovered by comparing `offset` to the returned spans; `None`
+    /// for nested widgets, property values, or non-header positions.
+    ///
+    /// Inherent (not on the [`LanguageService`] trait) for the same reason as
+    /// [`base_reference_at`](Self::base_reference_at): rendering the hover consumes server-owned
+    /// state (the workspace [`style_index::StyleIndex`]).
+    #[must_use]
+    pub fn style_header_at(&self, source: &str, offset: usize) -> Option<StyleHeaderRef> {
+        navigation::style_header_at(source, offset)
+    }
+
+    /// Describe the hover for the style token under `offset`, resolved against the workspace `index`
+    /// (spec §5.5). Returns a structured [`StyleHover`] — native vs. user base, workspace-resolution,
+    /// definition count and inheritance are all decided here in the engine — or `None` when the cursor
+    /// is not on a top-level style header's name or base token. The server only formats the result
+    /// into an LSP hover.
+    ///
+    /// Inherent (not on the [`LanguageService`] trait) because it consumes server-owned state (the
+    /// workspace [`StyleIndex`]).
+    #[must_use]
+    pub fn style_hover_at(
+        &self,
+        source: &str,
+        offset: usize,
+        index: &StyleIndex,
+    ) -> Option<StyleHover> {
+        hover::style_hover_at(source, offset, index)
     }
 }
 

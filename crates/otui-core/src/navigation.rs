@@ -67,6 +67,81 @@ pub fn base_reference_at(source: &str, offset: usize) -> Option<BaseRef> {
     None
 }
 
+/// A cursor hit anywhere inside a **top-level** `Name < Base` header, describing the whole header.
+///
+/// Returned by [`style_header_at`] when the cursor sits on the declared name token **or** the base
+/// token of a top-level inheritance declaration. The server compares the query offset against
+/// [`name_span`](Self::name_span) / [`base_span`](Self::base_span) to decide which part was hovered
+/// (describe the base vs. describe this style) — the locator itself does not resolve anything.
+///
+/// A bare `Name` header with no `< Base` yields [`base`](Self::base) `None` and
+/// [`base_span`](Self::base_span) `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StyleHeaderRef {
+    /// The declared style name (the `Name` in `Name < Base`).
+    pub name: String,
+    /// The base this style inherits from (the `Base` in `Name < Base`), if the header carries one.
+    pub base: Option<String>,
+    /// The byte span of the declared name token.
+    pub name_span: ByteSpan,
+    /// The byte span of the base token, if present.
+    pub base_span: Option<ByteSpan>,
+}
+
+/// If `offset` falls within the **declared-name** token OR the **base** token of a **top-level**
+/// style header, return the whole header descriptor; otherwise `None`.
+///
+/// Two grammar shapes count as a top-level style header, matching the document-symbol outline:
+/// * a `Name < Base` `style_header` (its `name` and `base` fields), and
+/// * a bare `Name` `container` (a top-level widget tag with no `< Base`) — reported with
+///   [`base`](StyleHeaderRef::base) `None` and [`base_span`](StyleHeaderRef::base_span) `None`, its
+///   tag token standing in for the declared name.
+///
+/// Only the document root's direct children are considered: a header nested inside a widget block is
+/// an *instance*, not a style declaration, and is never reported (mirroring [`base_reference_at`] and
+/// [`extract_style_defs`](crate::style_index::extract_style_defs)). A hit anywhere else in the header
+/// (e.g. on the `<`) yields `None`.
+///
+/// The caller decides which part was hovered by testing the query offset against the returned
+/// [`name_span`](StyleHeaderRef::name_span) / [`base_span`](StyleHeaderRef::base_span). The same
+/// half-open `[start, end)` boundary convention as [`base_reference_at`] applies.
+#[must_use]
+pub fn style_header_at(source: &str, offset: usize) -> Option<StyleHeaderRef> {
+    let tree = SyntaxTree::parse(source)?;
+    let root = tree.root();
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        // The declared-name token differs by shape: a `style_header` carries a `name` field, a bare
+        // `container` carries the whole tag. Anything else is not a top-level style header.
+        let name_node = match child.kind() {
+            "style_header" => child.child_by_field_name("name"),
+            "container" => child.child_by_field_name("tag"),
+            _ => continue,
+        };
+        let Some(name_node) = name_node else {
+            continue;
+        };
+        let name_span = SyntaxTree::span_of(name_node);
+        // Only a `style_header` has a base; a bare container never does.
+        let base_span = child
+            .child_by_field_name("base")
+            .map(SyntaxTree::span_of)
+            .filter(|_| child.kind() == "style_header");
+
+        let in_name = name_span.start <= offset && offset < name_span.end;
+        let in_base = base_span.is_some_and(|span| span.start <= offset && offset < span.end);
+        if in_name || in_base {
+            return Some(StyleHeaderRef {
+                name: source[name_span.start..name_span.end].to_owned(),
+                base: base_span.map(|span| source[span.start..span.end].to_owned()),
+                name_span,
+                base_span,
+            });
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +222,56 @@ mod tests {
         assert!(base_reference_at("", 0).is_none());
         let src = "MainWindow < UIWindow\n";
         assert!(base_reference_at(src, src.len() + 100).is_none());
+    }
+
+    #[test]
+    fn header_at_cursor_on_declared_name_returns_the_header() {
+        let src = "MainWindow < UIWindow\n";
+        let got = style_header_at(src, at(src, "MainWindow")).expect("hit");
+        assert_eq!(got.name, "MainWindow");
+        assert_eq!(got.base.as_deref(), Some("UIWindow"));
+        assert_eq!(&src[got.name_span.start..got.name_span.end], "MainWindow");
+        let base_span = got.base_span.expect("base present");
+        assert_eq!(&src[base_span.start..base_span.end], "UIWindow");
+        // A cursor in the middle of the name is the same hit.
+        assert_eq!(
+            style_header_at(src, at(src, "MainWindow") + 3).as_ref(),
+            Some(&got)
+        );
+    }
+
+    #[test]
+    fn header_at_cursor_on_base_returns_the_header() {
+        let src = "MainWindow < UIWindow\n";
+        let got = style_header_at(src, at(src, "UIWindow")).expect("hit");
+        assert_eq!(got.name, "MainWindow");
+        assert_eq!(got.base.as_deref(), Some("UIWindow"));
+    }
+
+    #[test]
+    fn header_at_bare_header_has_no_base() {
+        let src = "Standalone\n  id: x\n";
+        let got = style_header_at(src, at(src, "Standalone")).expect("hit");
+        assert_eq!(got.name, "Standalone");
+        assert_eq!(got.base, None);
+        assert_eq!(got.base_span, None);
+    }
+
+    #[test]
+    fn header_at_nested_widget_name_is_none() {
+        // The nested `Inner` name is an instance, not a style header.
+        let src = "Outer < UIWidget\n  Inner < UIButton\n    id: x\n";
+        assert!(style_header_at(src, at(src, "Inner")).is_none());
+        // ...but the top-level name is a hit.
+        assert_eq!(
+            style_header_at(src, at(src, "Outer")).map(|h| h.name),
+            Some("Outer".to_owned())
+        );
+    }
+
+    #[test]
+    fn header_at_property_value_is_none() {
+        let src = "MainWindow < UIWindow\n  id: main\n";
+        assert!(style_header_at(src, at(src, "main")).is_none());
     }
 }
