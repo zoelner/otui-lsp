@@ -19,6 +19,7 @@ reviews:
     - "!crates/tree-sitter-otui/src/grammar.json"
     - "!crates/tree-sitter-otui/src/node-types.json"
     - "!crates/tree-sitter-otui/src/tree_sitter/**"
+    - "!crates/otui-core/src/catalog.rs"
     - "!Cargo.lock"
   path_instructions:
     - path: "crates/otui-core/**"
