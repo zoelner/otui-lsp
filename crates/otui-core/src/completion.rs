@@ -5,13 +5,14 @@
 //!
 //! * `$state` selector names ([`schema::STATES`]),
 //! * `anchors.<edge>` edges ([`schema::ANCHOR_EDGES`] + [`schema::SHORTHAND_ANCHORS`]),
-//! * anchor **target** keywords ([`schema::MAGIC_ANCHOR_TARGETS`]) and target-side edges, and
+//! * anchor **target** keywords ([`schema::MAGIC_ANCHOR_TARGETS`]) plus the in-scope widget `id:`
+//!   values reachable in the current document, and target-side edges, and
 //! * `@event` handler names ([`schema::EVENTS`]).
 //!
 //! **Deliberately out of scope** (returns an empty vec): property names and color names. Those come
 //! from the large open-ish catalog the later `cargo xtask` extraction node produces, not from a
-//! hand-transcribed list here (spec §6, §2.10). Property-value enums and sibling-id anchor targets
-//! are likewise deferred. When no closed set applies, this returns nothing — never a guess.
+//! hand-transcribed list here (spec §6, §2.10). Property-value enums are likewise deferred. When no
+//! closed set applies, this returns nothing — never a guess.
 //!
 //! ## How the context is classified
 //!
@@ -38,6 +39,7 @@
 use crate::schema;
 use crate::syntax::SyntaxTree;
 use lang_api::{CompletionItem, CompletionKind};
+use tree_sitter::Node;
 
 /// The closed set that applies at the cursor, once the line prefix has been classified.
 enum Context {
@@ -77,7 +79,7 @@ pub fn complete_at(source: &str, offset: usize) -> Vec<CompletionItem> {
     let prefix = &source[line_start..offset];
 
     match classify(prefix) {
-        Some(context) => items_for(context),
+        Some(context) => items_for(context, source, offset),
         None => Vec::new(),
     }
 }
@@ -85,53 +87,82 @@ pub fn complete_at(source: &str, offset: usize) -> Vec<CompletionItem> {
 /// Classify the closed-set context from the line `prefix` (line start up to the cursor).
 ///
 /// Precise by construction: it only returns a context when the prefix unambiguously matches one of
-/// the three grammar shapes; anything else (a property `key: value`, a bare tag, an inheritance
-/// header, …) yields `None`.
+/// the three grammar shapes AND the cursor is actively building the relevant token; anything else (a
+/// property `key: value`, a completed token followed by whitespace, a tab-indented line, …) yields
+/// `None`.
 fn classify(prefix: &str) -> Option<Context> {
+    // Tab indentation is a hard OTML parse error (the engine rejects it — see the `tab-indentation`
+    // diagnostic), so a tab-indented line is never valid markup: offer nothing on it.
+    let indent = &prefix[..prefix.len() - prefix.trim_start().len()];
+    if indent.contains('\t') {
+        return None;
+    }
+
     // Indentation is spaces; strip it to see the first meaningful char. (A leading `$`/`@`/`anchors`
     // is only ever at the token start of a line, after indentation.)
     let trimmed = prefix.trim_start();
 
-    // `@event` key: the line opens with `@` and has not reached its `:` yet. Past the `:` the value
-    // is embedded Lua (out of scope), so a `:` in the prefix disqualifies it.
+    // `@event` key: the line opens with `@`, the cursor is still inside the single event-name token
+    // (no whitespace yet), and it has not reached its `:` (past which the value is embedded Lua —
+    // out of scope). A completed name followed by a space (`@onClick `) is no longer being built.
     if let Some(rest) = trimmed.strip_prefix('@') {
-        return (!rest.contains(':')).then_some(Context::Events);
+        let building = !rest.contains(':') && !rest.contains(char::is_whitespace);
+        return building.then_some(Context::Events);
     }
 
-    // `$state` selector: the line opens with `$` and has not reached its `:` yet. A `$var` in value
-    // position never reaches here — it sits after a `key:`, so the trimmed prefix starts with the
-    // key, not `$`.
+    // `$state` selector: the line opens with `$` and has not reached its `:`. States are
+    // space-separated, so offer while the cursor is building a state token — right after the `$`
+    // (empty selector), or with a non-empty current segment (a partial state or a `!` negation) —
+    // but not when it sits after a completed state followed by whitespace (`$hover `). A `$var` in
+    // value position never reaches here — it sits after a `key:`, so the trimmed prefix starts with
+    // the key, not `$`.
     if let Some(rest) = trimmed.strip_prefix('$') {
-        return (!rest.contains(':')).then_some(Context::States);
+        if rest.contains(':') {
+            return None;
+        }
+        let current = rest.rsplit(char::is_whitespace).next().unwrap_or("");
+        let building = rest.is_empty() || !current.is_empty();
+        return building.then_some(Context::States);
     }
 
     // `anchors.<edge>: <target>`: only the literal `anchors.` object counts (a generic dotted key
     // like `foo.left:` is not an anchor, per the grammar).
     if trimmed.starts_with("anchors.") {
-        return Some(match trimmed.find(':') {
+        return match trimmed.find(':') {
             // Before the `:` → the edge key slot.
-            None => Context::AnchorEdgeKey,
-            // After the `:` → the value slot. A target-side edge (after `<targetId>.`) vs. the bare
-            // target position is decided by whether the word being typed already has a `.`.
-            Some(colon) => {
-                let value_word = trimmed[colon + 1..]
-                    .rsplit(|c: char| c.is_whitespace())
-                    .next()
-                    .unwrap_or("");
-                if value_word.contains('.') {
-                    Context::AnchorTargetEdge
-                } else {
-                    Context::AnchorTarget
-                }
-            }
-        });
+            None => Some(Context::AnchorEdgeKey),
+            // After the `:` → the value slot.
+            Some(colon) => classify_anchor_value(&trimmed[colon + 1..]),
+        };
     }
 
     None
 }
 
-/// Build the [`CompletionItem`]s for a classified [`Context`], in schema const order (stable).
-fn items_for(context: Context) -> Vec<CompletionItem> {
+/// Classify the anchor **value** slot — the text after `anchors.<edge>:` up to the cursor.
+///
+/// The value is a single target token, so offer only while the cursor is building it:
+/// * an empty value slot (just past the `:`) → the target start → [`Context::AnchorTarget`],
+/// * a non-empty current segment containing `.` → a target-side edge → [`Context::AnchorTargetEdge`],
+/// * a non-empty current segment without `.` → still the target position → [`Context::AnchorTarget`],
+/// * a completed token followed by whitespace (`parent `) → nothing.
+fn classify_anchor_value(value: &str) -> Option<Context> {
+    let current = value.rsplit(char::is_whitespace).next().unwrap_or("");
+    if current.is_empty() {
+        // Empty slot (just after `:`) offers the target start; a trailing space after a completed
+        // token does not.
+        return value.trim().is_empty().then_some(Context::AnchorTarget);
+    }
+    if current.contains('.') {
+        Some(Context::AnchorTargetEdge)
+    } else {
+        Some(Context::AnchorTarget)
+    }
+}
+
+/// Build the [`CompletionItem`]s for a classified [`Context`], in a stable order (schema const order
+/// for the closed sets; magic targets then in-scope ids for the anchor target slot).
+fn items_for(context: Context, source: &str, offset: usize) -> Vec<CompletionItem> {
     match context {
         Context::States => set_items(schema::STATES, CompletionKind::EnumMember, "state"),
         Context::AnchorEdgeKey => {
@@ -152,13 +183,113 @@ fn items_for(context: Context) -> Vec<CompletionItem> {
             CompletionKind::EnumMember,
             "anchor edge",
         ),
-        Context::AnchorTarget => set_items(
-            schema::MAGIC_ANCHOR_TARGETS,
-            CompletionKind::Value,
-            "anchor target",
-        ),
+        Context::AnchorTarget => anchor_target_items(source, offset),
         Context::Events => set_items(schema::EVENTS, CompletionKind::Event, "event handler"),
     }
+}
+
+/// Build the anchor **target** candidates: the magic pseudo-targets (`parent` / `next` / `prev`)
+/// followed by the in-scope widget `id:` values reachable from the anchor's owning widget (spec §6).
+///
+/// Both carry [`CompletionKind::Value`]; the ids are tagged `"widget id"` to distinguish them in the
+/// client. Magic targets come first (schema order), then ids in source order, de-duplicated by label
+/// (an id literally named `parent` collapses into the magic entry).
+fn anchor_target_items(source: &str, offset: usize) -> Vec<CompletionItem> {
+    let mut items = set_items(
+        schema::MAGIC_ANCHOR_TARGETS,
+        CompletionKind::Value,
+        "anchor target",
+    );
+    for id in scope_anchor_ids(source, offset) {
+        if items.iter().any(|item| item.label == id) {
+            continue;
+        }
+        items.push(CompletionItem {
+            label: id,
+            kind: CompletionKind::Value,
+            detail: Some("widget id".to_owned()),
+        });
+    }
+    items
+}
+
+/// Collect the widget `id:` values reachable as anchor targets from the widget owning the anchor at
+/// `offset`: the owner's sibling widgets (same parent) plus its ancestor widgets, in source order,
+/// de-duplicated. A purely **local** CST walk over the current document — anchor targets resolve
+/// within one widget tree, never across files, so the cross-file style index is intentionally not
+/// consulted. Returns empty on a parse failure or when the owner cannot be located.
+fn scope_anchor_ids(source: &str, offset: usize) -> Vec<String> {
+    let Some(tree) = SyntaxTree::parse(source) else {
+        return Vec::new();
+    };
+    let root = tree.root();
+    let lo = offset.saturating_sub(1);
+    let Some(mut node) = root.descendant_for_byte_range(lo, offset) else {
+        return Vec::new();
+    };
+    // Walk up to the widget node that owns the anchor line the cursor sits on.
+    let owner = loop {
+        if is_widget(node) {
+            break node;
+        }
+        match node.parent() {
+            Some(parent) => node = parent,
+            None => return Vec::new(),
+        }
+    };
+
+    // In-scope widgets: the owner's sibling widgets (same parent, excluding the owner itself) and
+    // its ancestor widgets.
+    let mut scope: Vec<Node> = Vec::new();
+    if let Some(parent) = owner.parent() {
+        let mut cursor = parent.walk();
+        for sibling in parent.named_children(&mut cursor) {
+            if is_widget(sibling) && sibling.id() != owner.id() {
+                scope.push(sibling);
+            }
+        }
+    }
+    let mut ancestor = owner.parent();
+    while let Some(node) = ancestor {
+        if is_widget(node) {
+            scope.push(node);
+        }
+        ancestor = node.parent();
+    }
+
+    // Source order, de-duplicated by id text.
+    scope.sort_by_key(Node::start_byte);
+    let mut ids = Vec::new();
+    for widget in scope {
+        if let Some(id) = widget_id(widget, source) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
+/// Whether `node` is a widget node (a bare `container` tag or a `Name < Base` `style_header`).
+fn is_widget(node: Node) -> bool {
+    matches!(node.kind(), "container" | "style_header")
+}
+
+/// The `id:` value declared directly on `widget`, if any (its `id_property` child's value text,
+/// trimmed). `None` when the widget declares no id.
+fn widget_id(widget: Node, source: &str) -> Option<String> {
+    let mut cursor = widget.walk();
+    for child in widget.named_children(&mut cursor) {
+        if child.kind() != "id_property" {
+            continue;
+        }
+        let value = child.child_by_field_name("value")?;
+        let text = source[value.start_byte()..value.end_byte()].trim();
+        if !text.is_empty() {
+            return Some(text.to_owned());
+        }
+    }
+    None
 }
 
 /// Map a schema const slice to completion items with a shared `kind` and `detail`, preserving the
@@ -327,6 +458,114 @@ mod tests {
         let src = "Button\n  // $hover\n";
         let offset = at(src, "$hover") + 1;
         assert!(complete_at(src, offset).is_empty());
+    }
+
+    #[test]
+    fn tab_indented_line_offers_nothing() {
+        // Tab indentation is a hard OTML parse error; no closed set may be offered on such a line.
+        let src = "Button\n\t$hover\n";
+        let offset = at(src, "$") + 1;
+        assert!(complete_at(src, offset).is_empty());
+    }
+
+    #[test]
+    fn complete_event_name_followed_by_space_offers_nothing() {
+        // `@onClick ` — the event name is complete and the cursor sits after a space (no `:` yet);
+        // the token is no longer being built, so nothing is offered.
+        let src = "Button\n  @onClick \n";
+        let offset = at(src, "@onClick ") + "@onClick ".len();
+        assert!(complete_at(src, offset).is_empty());
+    }
+
+    #[test]
+    fn complete_anchor_target_followed_by_space_offers_nothing() {
+        // `anchors.top: parent ` — the target is complete and the cursor sits after a trailing
+        // space; the target token is no longer being built, so nothing is offered.
+        let src = "Widget\n  anchors.top: parent \n";
+        let offset = at(src, "parent ") + "parent ".len();
+        assert!(complete_at(src, offset).is_empty());
+    }
+
+    #[test]
+    fn still_building_tokens_keep_offering_their_sets() {
+        // Partial tokens (the cursor actively building them) still get the whole set.
+        let src = "Button\n  @onCl\n";
+        assert_eq!(
+            labels(&complete_at(src, at(src, "@onCl") + "@onCl".len())),
+            schema::EVENTS
+        );
+
+        let src = "Button\n  $hov\n";
+        assert_eq!(
+            labels(&complete_at(src, at(src, "$hov") + "$hov".len())),
+            schema::STATES
+        );
+
+        // `anchors.to` (partial edge, no colon) still offers edges + shorthands.
+        let src = "Widget\n  anchors.to\n";
+        let mut edges: Vec<&str> = schema::ANCHOR_EDGES.to_vec();
+        edges.extend_from_slice(schema::SHORTHAND_ANCHORS);
+        assert_eq!(
+            labels(&complete_at(
+                src,
+                at(src, "anchors.to") + "anchors.to".len()
+            )),
+            edges
+        );
+
+        // `anchors.top: par` (partial target) still offers the target set (magic targets here — no
+        // ids in this doc).
+        let src = "Widget\n  anchors.top: par\n";
+        assert_eq!(
+            labels(&complete_at(src, at(src, "par\n") + "par".len())),
+            schema::MAGIC_ANCHOR_TARGETS
+        );
+    }
+
+    #[test]
+    fn anchor_target_without_ids_offers_only_magic_targets() {
+        // A document with no widget ids: the target slot offers just `parent`/`next`/`prev`.
+        let src = "Widget\n  anchors.top: \n";
+        let offset = at(src, "anchors.top: ") + "anchors.top: ".len();
+        assert_eq!(
+            labels(&complete_at(src, offset)),
+            schema::MAGIC_ANCHOR_TARGETS
+        );
+    }
+
+    #[test]
+    fn anchor_target_includes_sibling_and_ancestor_ids() {
+        // Button owns the anchor. Reachable ids: its sibling `Label` (id `lbl`) and its ancestor
+        // `Panel` (id `root`); Button's own id `btn` is excluded (a widget cannot anchor to itself).
+        let src = "\
+Panel
+  id: root
+  Button
+    id: btn
+    anchors.top:
+  Label
+    id: lbl
+";
+        let offset = at(src, "anchors.top:") + "anchors.top:".len();
+        let mut expected: Vec<String> = schema::MAGIC_ANCHOR_TARGETS
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        // Source order: `root` (ancestor Panel, earlier in the file) then `lbl` (sibling Label).
+        expected.push("root".to_owned());
+        expected.push("lbl".to_owned());
+        assert_eq!(labels(&complete_at(src, offset)), expected);
+        // Button's own id is not a target; magic targets stay `Value`, ids are tagged `widget id`.
+        let items = complete_at(src, offset);
+        assert!(items.iter().all(|i| i.kind == CompletionKind::Value));
+        assert!(!items.iter().any(|i| i.label == "btn"));
+        assert_eq!(
+            items
+                .iter()
+                .find(|i| i.label == "root")
+                .and_then(|i| i.detail.as_deref()),
+            Some("widget id")
+        );
     }
 
     #[test]
