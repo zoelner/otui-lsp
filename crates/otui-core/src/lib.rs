@@ -7,8 +7,12 @@
 //!
 //! Behavior is a faithful mirror of the real OTClient engine, per the spec vendored at
 //! `docs/otui-language-service-spec.md`. Milestones fill in the submodules
-//! (`syntax`, `schema`, `index`, `diagnostics`, `completion`, `symbols`, `format`); this M1
-//! scaffold only wires the [`LanguageService`] entry point.
+//! (`syntax`, `schema`, `index`, `diagnostics`, `completion`, `symbols`, `format`); this slice
+//! wires the [`LanguageService`] entry point to the parse-level [`diagnostics`] pass over the
+//! tree-sitter [`syntax`] substrate.
+
+pub mod diagnostics;
+pub mod syntax;
 
 use lang_api::{Diagnostic, LanguageService};
 
@@ -29,9 +33,9 @@ impl LanguageService for OtuiService {
         "otui"
     }
 
-    fn diagnostics(&self, _source: &str) -> Vec<Diagnostic> {
-        // Diagnostics are implemented from M3 onward (spec §4). For now, no findings.
-        Vec::new()
+    fn diagnostics(&self, source: &str) -> Vec<Diagnostic> {
+        // Parse-level category of spec §4: indentation faults plus structural parse errors.
+        diagnostics::analyze(source)
     }
 }
 
@@ -46,10 +50,18 @@ mod tests {
     }
 
     #[test]
-    fn scaffold_produces_no_diagnostics_yet() {
+    fn clean_source_produces_no_diagnostics() {
         let svc = OtuiService::new();
         assert!(svc
             .diagnostics("MainWindow < UIWindow\n  id: main\n")
             .is_empty());
+    }
+
+    #[test]
+    fn service_surfaces_parse_level_diagnostics() {
+        let svc = OtuiService::new();
+        let diags = svc.diagnostics("Panel\n\tid: main\n");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "tab-indentation");
     }
 }
