@@ -16,7 +16,7 @@ pub mod semantic;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use lang_api::LanguageService;
+use lang_api::{ByteSpan, LanguageService};
 use otui_core::style_index::{DocId, StyleIndex};
 use otui_core::OtuiService;
 use tokio::sync::RwLock;
@@ -24,11 +24,11 @@ use tower_lsp::jsonrpc::Result as RpcResult;
 use tower_lsp::lsp_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
-    InitializeParams, InitializeResult, InitializedParams, MessageType, OneOf,
+    InitializeParams, InitializeResult, InitializedParams, Location, MessageType, OneOf,
     PositionEncodingKind, SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions,
     SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
-    WorkDoneProgressOptions,
+    ServerCapabilities, ServerInfo, SymbolInformation, SymbolKind, TextDocumentSyncCapability,
+    TextDocumentSyncKind, Url, WorkDoneProgressOptions, WorkspaceSymbolParams,
 };
 use tower_lsp::{Client, LanguageServer};
 
@@ -127,6 +127,30 @@ impl Backend {
     }
 }
 
+/// Build an LSP [`Location`] for `span` in the document identified by `doc_id`.
+///
+/// A style def's spans are byte offsets into **its own** document's text, so the range must be
+/// mapped against that text. Returns `None` — and the caller skips the entry — when `doc_id` is not
+/// a parseable URL or its document is not currently open (its span cannot be mapped to a range; the
+/// index only holds open documents today, so a workspace file-scan for closed files is a later node).
+/// Shared by [`resolve_base_definition`] (go-to-definition) and [`collect_workspace_symbols`]
+/// (workspace symbols).
+fn resolve_location(
+    doc_id: &DocId,
+    span: ByteSpan,
+    documents: &HashMap<Url, Document>,
+    encoding: PositionEncoding,
+) -> Option<Location> {
+    let target_uri = Url::parse(doc_id.as_str()).ok()?;
+    let target_doc = documents.get(&target_uri)?;
+    Some(convert::location_of(
+        target_uri,
+        &target_doc.text,
+        span,
+        encoding,
+    ))
+}
+
 /// Resolve a `Name < Base` base name to its definition site(s) (spec §5.3).
 ///
 /// Fans the name out across the whole workspace index (the namespace is global), building an LSP
@@ -143,22 +167,9 @@ fn resolve_base_definition(
 ) -> Option<GotoDefinitionResponse> {
     let mut locations = Vec::new();
     for (doc_id, def) in index.lookup(base_name) {
-        let Ok(target_uri) = Url::parse(doc_id.as_str()) else {
-            continue;
-        };
-        // The target's `name_span` is a byte span into the target document's text, so its range must
-        // be built against that text. If the defining document is not currently open we cannot map
-        // the span to a range, so we skip it (a workspace file-scan for closed files is a later
-        // node; the index still tracks only open documents today).
-        let Some(target_doc) = documents.get(&target_uri) else {
-            continue;
-        };
-        locations.push(convert::location_of(
-            target_uri,
-            &target_doc.text,
-            def.name_span,
-            encoding,
-        ));
+        if let Some(loc) = resolve_location(doc_id, def.name_span, documents, encoding) {
+            locations.push(loc);
+        }
     }
 
     match locations.len() {
@@ -168,6 +179,52 @@ fn resolve_base_definition(
         )),
         _ => Some(GotoDefinitionResponse::Array(locations)),
     }
+}
+
+/// Collect the workspace's `Name < Base` style definitions that match `query`, as a flat
+/// [`SymbolInformation`] list for `workspace/symbol` (spec §5.2).
+///
+/// Matching is **case-insensitive substring** over the style name — simple and predictable, and the
+/// convention the client expects (it filters further as the user types). An **empty query matches
+/// everything**, so the picker opens showing all styles. Each surviving def maps its [`DocId`] back
+/// to a [`Url`] and builds a [`Location`](tower_lsp::lsp_types::Location) for its `name_span` against
+/// **that** target document's own text (via [`convert::location_of`]), exactly as
+/// [`resolve_base_definition`] does. A def whose document is not currently open is skipped — its span
+/// cannot be mapped to a range (the index only holds open documents today anyway). The widget's base
+/// becomes the entry's `container_name`, giving the picker useful context; native `UI*` bases are
+/// never symbols of their own (they have no def, so are absent from the index) — they surface only as
+/// the `container_name` of a widget that inherits them.
+///
+/// Duplicate style names (legal in the engine) each produce their own entry; nothing is deduped.
+/// Kept as a free function over borrowed state so it can be unit-tested without a live `Client`.
+#[allow(deprecated)] // `SymbolInformation.deprecated` is a mandatory-but-deprecated struct field.
+fn collect_workspace_symbols(
+    index: &StyleIndex,
+    documents: &HashMap<Url, Document>,
+    query: &str,
+    encoding: PositionEncoding,
+) -> Vec<SymbolInformation> {
+    let needle = query.to_lowercase();
+    let mut out = Vec::new();
+    for (doc_id, def) in index.iter() {
+        if !def.name.to_lowercase().contains(&needle) {
+            continue;
+        }
+        // `name_span` is a byte span into the defining document's text; a def whose document is not
+        // open (or whose id is not a URL) cannot be mapped to a range and is skipped.
+        let Some(location) = resolve_location(doc_id, def.name_span, documents, encoding) else {
+            continue;
+        };
+        out.push(SymbolInformation {
+            name: def.name.clone(),
+            kind: SymbolKind::CLASS,
+            tags: None,
+            deprecated: None,
+            location,
+            container_name: def.base.clone(),
+        });
+    }
+    out
 }
 
 /// True if `version` is still the latest known version for a document (per `latest`, typically
@@ -248,6 +305,8 @@ impl LanguageServer for Backend {
                 document_symbol_provider: Some(OneOf::Left(true)),
                 // Go-to-definition: `Name < Base` inheritance references (spec §5.3).
                 definition_provider: Some(OneOf::Left(true)),
+                // Workspace symbols: the global `Name < Base` style namespace (spec §5.2).
+                workspace_symbol_provider: Some(OneOf::Left(true)),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -363,6 +422,19 @@ impl LanguageServer for Backend {
             &base_ref.name,
             encoding,
         ))
+    }
+
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> RpcResult<Option<Vec<SymbolInformation>>> {
+        let encoding = self.encoding();
+        // Take both read locks (mirroring `goto_definition`'s discipline: never nest a write lock).
+        let index = self.style_index.read().await;
+        let documents = self.documents.read().await;
+        let symbols = collect_workspace_symbols(&index, &documents, &params.query, encoding);
+        // Always return a list (empty is fine and conventional); never `None` for "no matches".
+        Ok(Some(symbols))
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -654,6 +726,111 @@ mod tests {
             resolve_base_definition(&index, &documents, "MyPanel", PositionEncoding::Utf16)
                 .is_none()
         );
+    }
+
+    /// Names of the symbols in `syms`, sorted for order-independent assertions (the index iterates
+    /// an unordered map).
+    fn sorted_names(syms: &[SymbolInformation]) -> Vec<String> {
+        let mut names: Vec<String> = syms.iter().map(|s| s.name.clone()).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn empty_query_returns_every_style() {
+        let (index, docs) = workspace(&[
+            ("file:///a.otui", "Alpha < UIWidget\nBeta < UIWindow\n"),
+            ("file:///b.otui", "Gamma < UIButton\n"),
+        ]);
+        let syms = collect_workspace_symbols(&index, &docs, "", PositionEncoding::Utf16);
+        assert_eq!(sorted_names(&syms), ["Alpha", "Beta", "Gamma"]);
+    }
+
+    #[test]
+    fn query_is_a_case_insensitive_substring_filter() {
+        let (index, docs) = workspace(&[(
+            "file:///a.otui",
+            "MainWindow < UIWindow\nMiniPanel < UIWidget\nButton < UIButton\n",
+        )]);
+        // `win` matches `MainWindow` (substring, case-insensitive) but not `MiniPanel`/`Button`.
+        let syms = collect_workspace_symbols(&index, &docs, "win", PositionEncoding::Utf16);
+        assert_eq!(sorted_names(&syms), ["MainWindow"]);
+        // Uppercased query still matches.
+        let syms = collect_workspace_symbols(&index, &docs, "PANEL", PositionEncoding::Utf16);
+        assert_eq!(sorted_names(&syms), ["MiniPanel"]);
+        // A substring in the middle matches too.
+        let syms = collect_workspace_symbols(&index, &docs, "ni", PositionEncoding::Utf16);
+        assert_eq!(sorted_names(&syms), ["MiniPanel"]);
+        // No match → an empty list (never `None` from the collector).
+        let syms = collect_workspace_symbols(&index, &docs, "zzz", PositionEncoding::Utf16);
+        assert!(syms.is_empty());
+    }
+
+    #[test]
+    #[allow(deprecated)] // constructing/reading `SymbolInformation` fields in assertions
+    fn symbol_carries_class_kind_base_container_and_name_span_location() {
+        let (index, docs) = workspace(&[("file:///defs.otui", "MyPanel < UIWidget\n")]);
+        let syms = collect_workspace_symbols(&index, &docs, "MyPanel", PositionEncoding::Utf16);
+        assert_eq!(syms.len(), 1);
+        let sym = &syms[0];
+        assert_eq!(sym.name, "MyPanel");
+        // A style is a named widget type → CLASS.
+        assert_eq!(sym.kind, SymbolKind::CLASS);
+        // The base is surfaced as the container for context in the picker.
+        assert_eq!(sym.container_name.as_deref(), Some("UIWidget"));
+        // The location points at the *name span* in the defining document.
+        assert_eq!(sym.location.uri.as_str(), "file:///defs.otui");
+        assert_eq!(sym.location.range.start, Position::new(0, 0));
+        assert_eq!(sym.location.range.end, Position::new(0, 7));
+    }
+
+    #[test]
+    fn name_span_location_is_resolved_against_the_defining_document() {
+        // The name is not at the document start: its span must map through that document's own text.
+        let (index, docs) =
+            workspace(&[("file:///defs.otui", "First < UIWidget\nSecond < UIWindow\n")]);
+        let syms = collect_workspace_symbols(&index, &docs, "Second", PositionEncoding::Utf16);
+        assert_eq!(syms.len(), 1);
+        // `Second` is on line 1, columns 0..6.
+        assert_eq!(syms[0].location.range.start, Position::new(1, 0));
+        assert_eq!(syms[0].location.range.end, Position::new(1, 6));
+    }
+
+    #[test]
+    fn duplicate_names_across_docs_each_produce_a_symbol() {
+        let (index, docs) = workspace(&[
+            ("file:///a.otui", "Dup < UIWidget\n"),
+            ("file:///b.otui", "Dup < UIWindow\n"),
+        ]);
+        let syms = collect_workspace_symbols(&index, &docs, "Dup", PositionEncoding::Utf16);
+        // Both declarations surface as their own entry — nothing is deduped.
+        assert_eq!(syms.len(), 2);
+        assert_eq!(sorted_names(&syms), ["Dup", "Dup"]);
+    }
+
+    #[test]
+    fn native_base_query_returns_nothing() {
+        // `UIWidget` is a native built-in with no def, so it is absent from the index and never a
+        // symbol of its own — it only appears as a `container_name`.
+        let (index, docs) = workspace(&[("file:///a.otui", "MyPanel < UIWidget\n")]);
+        let syms = collect_workspace_symbols(&index, &docs, "UIWidget", PositionEncoding::Utf16);
+        assert!(syms.is_empty());
+    }
+
+    #[test]
+    fn symbol_of_a_closed_target_is_skipped() {
+        // A def whose document is not open cannot have its name span mapped to a range, so it is
+        // dropped (the index can outlive the document set in principle).
+        let svc = OtuiService::new();
+        let mut index = StyleIndex::new();
+        index.set_document(
+            DocId::from("file:///closed.otui".to_owned()),
+            svc.style_defs("MyPanel < UIWidget\n"),
+        );
+        let documents = HashMap::new(); // nothing open
+        let syms =
+            collect_workspace_symbols(&index, &documents, "MyPanel", PositionEncoding::Utf16);
+        assert!(syms.is_empty());
     }
 
     #[test]
