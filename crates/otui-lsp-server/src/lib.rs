@@ -27,14 +27,15 @@ use tower_lsp::lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
     CodeActionProviderCapability, CodeActionResponse, CompletionOptions, CompletionParams,
     CompletionResponse, Diagnostic as LspDiagnostic, DidChangeTextDocumentParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentSymbolParams,
-    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
-    HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
-    Location, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf, PositionEncodingKind,
-    SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
-    SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
-    SymbolInformation, SymbolKind, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Url,
-    WorkDoneProgressOptions, WorkspaceEdit, WorkspaceSymbolParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
+    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
+    Hover, HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
+    InitializedParams, Location, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf,
+    PositionEncodingKind, SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions,
+    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
+    ServerCapabilities, ServerInfo, SymbolInformation, SymbolKind, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextEdit, Url, WorkDoneProgressOptions, WorkspaceEdit,
+    WorkspaceSymbolParams,
 };
 use tower_lsp::{Client, LanguageServer};
 
@@ -436,6 +437,8 @@ impl LanguageServer for Backend {
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 // Hover: style names and `Name < Base` bases (spec §5.5).
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                // Formatting: whole-document, conservative whitespace normalization (spec §8).
+                document_formatting_provider: Some(OneOf::Left(true)),
                 // Completion: the OTML closed sets (spec §6). `$` / `@` / `.` / `!` re-trigger
                 // completion as those characters open a `$state` selector, an `@event` key, an
                 // `anchors.<edge>` / `<target>.<edge>` dotted position, or a `!`-negated state in a
@@ -666,6 +669,35 @@ impl LanguageServer for Backend {
             encoding,
         );
         Ok(Some(actions))
+    }
+
+    async fn formatting(
+        &self,
+        params: DocumentFormattingParams,
+    ) -> RpcResult<Option<Vec<TextEdit>>> {
+        let uri = params.text_document.uri;
+        let encoding = self.encoding();
+
+        // Serve from the stored document text; an unknown document has nothing to format.
+        let Some(text) = self
+            .documents
+            .read()
+            .await
+            .get(&uri)
+            .map(|doc| doc.text.clone())
+        else {
+            return Ok(None);
+        };
+
+        // Ask the engine to format. `None` means the document does not parse cleanly (parse error /
+        // `ERROR`/`MISSING` node); per the safety gate we then return no edits. Otherwise reply with
+        // a single whole-document replace of the formatted text.
+        let Some(formatted) = self.service.format(&text) else {
+            return Ok(None);
+        };
+        Ok(Some(vec![convert::full_document_edit(
+            &text, formatted, encoding,
+        )]))
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {

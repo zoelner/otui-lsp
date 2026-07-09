@@ -11,7 +11,7 @@ use lang_api::{
 use tower_lsp::lsp_types::{
     CompletionItem as LspCompletionItem, CompletionItemKind as LspCompletionItemKind,
     Diagnostic as LspDiagnostic, DiagnosticSeverity, DocumentSymbol as LspSymbol, Location,
-    NumberOrString, Range, SymbolInformation, SymbolKind as LspSymbolKind, TextEdit, Url,
+    NumberOrString, Position, Range, SymbolInformation, SymbolKind as LspSymbolKind, TextEdit, Url,
 };
 
 use crate::position::{LineIndex, PositionEncoding};
@@ -225,6 +225,22 @@ pub fn completions_to_lsp(items: &[CoreCompletionItem]) -> Vec<LspCompletionItem
     items.iter().map(completion_item_to_lsp).collect()
 }
 
+/// Build a single whole-document [`TextEdit`] replacing all of `text` (from the start to its end
+/// [`Position`] under `encoding`) with `new_text` — the shape `textDocument/formatting` returns
+/// (spec §8). A full-document replace is the simplest safe edit; a minimal-diff edit set is out of
+/// scope.
+pub fn full_document_edit(text: &str, new_text: String, encoding: PositionEncoding) -> TextEdit {
+    let index = LineIndex::new(text);
+    let end = index.position(text.len(), encoding);
+    TextEdit {
+        range: Range {
+            start: Position::new(0, 0),
+            end,
+        },
+        new_text,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,6 +425,27 @@ mod tests {
         assert!(lsp
             .iter()
             .all(|i| i.kind == Some(LspCompletionItemKind::ENUM_MEMBER)));
+    }
+
+    #[test]
+    fn full_document_edit_replaces_the_whole_range_with_formatted_text() {
+        // A formattable document yields one edit spanning [start .. document end] carrying the
+        // formatted text. The over-indented `id` line is normalized by the engine's formatter.
+        let text = "Panel\n    id: main\n";
+        let formatted = OtuiService::new().format(text).expect("formats cleanly");
+        let edit = full_document_edit(text, formatted, PositionEncoding::Utf16);
+        assert_eq!(edit.range.start, Position::new(0, 0));
+        // The document has two lines terminated by `\n`, so its end is the start of line 2.
+        assert_eq!(edit.range.end, Position::new(2, 0));
+        assert_eq!(edit.new_text, "Panel\n  id: main\n");
+    }
+
+    #[test]
+    fn unparsable_document_produces_no_format_edit() {
+        // The `formatting` handler's safety gate: a document with a parse error (here an
+        // unterminated inline array → `ERROR` node) yields `None` from the engine, so the server
+        // returns no edits rather than a spurious whole-document replace.
+        assert!(OtuiService::new().format("x: [a, b\n").is_none());
     }
 
     #[test]
