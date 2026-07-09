@@ -32,7 +32,14 @@ module.exports = grammar({
   // `_newline` / `_indent` / `_dedent` is valid); listing `\n` here lets the
   // internal lexer absorb stray blank lines (e.g. a leading blank line) that no
   // structural token applies to, instead of erroring on them.
-  extras: $ => [/[ \t\r\n]/],
+  //
+  // Full-line `//` / `#` comments are `extras` too: they may appear at any
+  // position and are indentation-neutral (they never open or close a block).
+  // The external scanner (src/scanner.c) detects a comment line, computes the
+  // block structure from the *next real line* by peeking ahead, and hands the
+  // comment's bytes back to the internal lexer so the `comment` token below is
+  // produced here rather than being consumed by the indentation scan.
+  extras: $ => [/[ \t\r\n]/, $.comment],
 
   rules: {
     document: $ => repeat($._statement),
@@ -42,7 +49,6 @@ module.exports = grammar({
     _block: $ => seq($._indent, repeat1($._statement), $._dedent),
 
     _node: $ => choice(
-      $.comment,
       $.style_header,
       $.state_selector,
       $.event_property,
@@ -58,13 +64,12 @@ module.exports = grammar({
     // --- comments (full line only) ------------------------------------------
     // `//` starts a comment anywhere; `#` only starts a comment when followed
     // by whitespace, which keeps `#Name < Base` freeze headers unambiguous.
-    comment: $ => seq(
-      token(choice(
-        seq('//', /[^\n]*/),
-        seq('#', /[ \t]/, /[^\n]*/),
-      )),
-      $._newline,
-    ),
+    // Declared in `extras` (see above): a single token with no trailing
+    // `_newline`, so it can float between statements at any indentation.
+    comment: $ => token(choice(
+      seq('//', /[^\n]*/),
+      seq('#', /[ \t]/, /[^\n]*/),
+    )),
 
     // --- Name < Base style header (§2.2) ------------------------------------
     style_header: $ => seq(

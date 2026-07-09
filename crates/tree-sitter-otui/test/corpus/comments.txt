@@ -45,6 +45,65 @@ Button
     (id_property
       key: (id_key)
       value: (identifier))
+    (comment)
+    (property
+      key: (property_key)
+      value: (identifier))))
+
+================================================================================
+slash comment at block indentation yields a comment node inside the block
+================================================================================
+
+Panel
+  // a block-level comment
+  id: x
+
+--------------------------------------------------------------------------------
+
+(document
+  (container
+    tag: (tag)
+    (comment)
+    (id_property
+      key: (id_key)
+      value: (identifier))))
+
+================================================================================
+hash comment at block indentation yields a comment node inside the block
+================================================================================
+
+Panel
+  # a block-level comment
+  id: x
+
+--------------------------------------------------------------------------------
+
+(document
+  (container
+    tag: (tag)
+    (comment)
+    (id_property
+      key: (id_key)
+      value: (identifier))))
+
+================================================================================
+comment indented deeper than the block is neutral (no spurious indent/dedent)
+================================================================================
+
+Panel
+  id: x
+    // over-indented comment
+  color: y
+
+--------------------------------------------------------------------------------
+
+(document
+  (container
+    tag: (tag)
+    (id_property
+      key: (id_key)
+      value: (identifier))
+    (comment)
     (property
       key: (property_key)
       value: (identifier))))

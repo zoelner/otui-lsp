@@ -103,6 +103,58 @@ static bool scan_block_scalar(TSLexer *lexer, uint16_t ref) {
   return false;
 }
 
+// Peek ahead across the rest of the current comment line plus any following
+// blank or comment lines to find the indentation (leading-space count) of the
+// next *real* content line. Used to keep comments indentation-neutral: a
+// comment's own column never opens or closes a block; the block a comment sits
+// in is decided by the next non-comment, non-blank line instead.
+//
+// Called with the lexer already positioned one char *into* the comment marker
+// (just past the first `/` or `#`). Only ever `advance`s (peeks) and never calls
+// `mark_end`, so the caller's earlier `mark_end` at the comment's start is what
+// bounds the emitted structural token. Returns 0 at EOF.
+static uint32_t peek_next_real_indent(TSLexer *lexer) {
+  for (;;) {
+    // Consume to the end of the current line.
+    while (lexer->lookahead != '\n' && !lexer->eof(lexer)) {
+      advance(lexer);
+    }
+    if (lexer->eof(lexer)) {
+      return 0;
+    }
+    advance(lexer); // consume the newline
+
+    // Measure this line's indentation.
+    uint32_t indent = 0;
+    while (lexer->lookahead == ' ' || lexer->lookahead == '\t') {
+      indent++;
+      advance(lexer);
+    }
+
+    if (lexer->eof(lexer)) {
+      return 0;
+    }
+    if (lexer->lookahead == '\n' || lexer->lookahead == '\r') {
+      continue; // blank line: skip
+    }
+    if (lexer->lookahead == '/') {
+      advance(lexer);
+      if (lexer->lookahead == '/') {
+        continue; // another full-line `//` comment: skip
+      }
+      return indent; // lone `/`: real content
+    }
+    if (lexer->lookahead == '#') {
+      advance(lexer);
+      if (lexer->lookahead == ' ' || lexer->lookahead == '\t') {
+        continue; // another `# ` comment: skip
+      }
+      return indent; // `#Name` freeze header: real content
+    }
+    return indent; // real content
+  }
+}
+
 bool tree_sitter_otui_external_scanner_scan(void *payload, TSLexer *lexer,
                                             const bool *valid_symbols) {
   Scanner *s = (Scanner *)payload;
@@ -154,36 +206,31 @@ bool tree_sitter_otui_external_scanner_scan(void *payload, TSLexer *lexer,
       lexer->mark_end(lexer);
       break;
     } else if (lexer->lookahead == '/') {
-      // Possible `//` comment line: treat as blank for indentation purposes so
-      // a comment's column never opens or closes a block.
-      skip(lexer);
+      // Possible `//` comment line. Mark the structural token's end at the `/`
+      // (zero-width) so the comment's bytes are handed back to the internal
+      // lexer, which tokenizes it as an `extras` `comment`. The block the
+      // comment sits in is decided by the next real line, not the comment's own
+      // column, keeping comments indentation-neutral.
+      lexer->mark_end(lexer);
+      advance(lexer);
       if (lexer->lookahead == '/') {
-        while (lexer->lookahead != '\n' && !lexer->eof(lexer)) {
-          skip(lexer);
-        }
-        // loop again; the trailing newline resets indent
-      } else {
-        lexer->mark_end(lexer);
-        break; // a lone '/', let the internal lexer handle it
+        indent = peek_next_real_indent(lexer);
+        break; // emit the structural token here; internal lexer gets the comment
       }
+      break; // a lone '/', let the internal lexer handle it (mark_end at '/')
     } else if (lexer->lookahead == '#') {
       // Distinguish a `#` full-line comment (§2.1: indentation-neutral, like
       // `//`) from a `#Name < Base` freeze header (real content). They differ
       // only by the char after `#`, so peek past it. `mark_end` is set to the
-      // position of `#` *before* advancing, so on the freeze-header path the `#`
-      // is handed back to the internal lexer un-consumed.
+      // position of `#` *before* advancing, so both paths hand the `#` back to
+      // the internal lexer un-consumed.
       lexer->mark_end(lexer);
       advance(lexer);
       if (lexer->lookahead == ' ' || lexer->lookahead == '\t') {
-        // A `# ` comment: skip the rest of the line, indentation-neutral. The
-        // stale `mark_end` set above is overwritten by whichever break follows.
-        while (lexer->lookahead != '\n' && !lexer->eof(lexer)) {
-          skip(lexer);
-        }
-        // loop again; the trailing newline resets indent
-      } else {
-        break; // `#Name` freeze header — re-lexed from the marked end
+        indent = peek_next_real_indent(lexer);
+        break; // emit the structural token here; internal lexer gets the comment
       }
+      break; // `#Name` freeze header — re-lexed from the marked end
     } else {
       lexer->mark_end(lexer);
       break; // real content
