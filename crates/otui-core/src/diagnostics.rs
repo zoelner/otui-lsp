@@ -49,6 +49,13 @@ pub const INVALID_ANCHOR_EDGE: &str = "invalid-anchor-edge";
 /// value-validating properties (`border`, `display`, `layout`, `anchors.*`) is a separate concern;
 /// this check is the unknown-KEY hint only.
 pub const UNKNOWN_PROPERTY: &str = "unknown-property";
+/// Diagnostic code: a malformed *value* for one of the value-validating properties `display`,
+/// `layout`, `border`, or `border-color*` (spec §2.10). Severity [`Severity::Error`]: unlike an
+/// ordinary property (whose bad value is silently ignored), these properties parse their value and
+/// the engine **throws** on malformed input, so the value is a hard error. The span is the offending
+/// value token only. (`anchors.*`, the fourth value-validating property, has its own dedicated
+/// [`INVALID_ANCHOR_EDGE`] check.)
+pub const INVALID_PROPERTY_VALUE: &str = "invalid-property-value";
 
 /// Computes all parse-level diagnostics for `source`.
 ///
@@ -323,7 +330,10 @@ fn collect_semantic_diagnostics(node: Node<'_>, source: &str, out: &mut Vec<Diag
     match node.kind() {
         "state_selector" => check_state_selector(node, source, out),
         "anchor_property" => check_anchor_property(node, source, out),
-        "property" => check_property(node, source, out),
+        "property" => {
+            check_property(node, source, out);
+            check_property_value(node, source, out);
+        }
         _ => {}
     }
     let mut cursor = node.walk();
@@ -458,6 +468,137 @@ fn check_property(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
             span: SyntaxTree::span_of(key),
         });
     }
+}
+
+/// Validate the *value* of one of the value-validating properties `display`, `layout`, `border`, and
+/// `border-color*` (spec §2.10, §4). Unlike an unknown property *key* (a hint) or an ordinary
+/// property's value (never validated), these families parse their value and the engine **throws** on
+/// malformed input, so a bad value is an [`INVALID_PROPERTY_VALUE`] error spanning the offending value
+/// token. (`anchors.*`, the fourth value-validating property, is checked separately in
+/// [`check_anchor_property`].)
+///
+/// Property tags are matched **exactly** — the engine dispatches on `node->tag() == "..."` — so only
+/// the canonical lowercase/kebab spelling triggers validation; a mis-cased `Display:` is an unknown
+/// property (an unrelated hint) and is not value-validated here.
+///
+/// Faithfulness notes, each mirroring an observed engine behavior:
+/// * `display` — the engine lowercases the value, then matches it against a fixed set; an unknown
+///   value throws. Validated case-insensitively to match ([`schema::is_display_value`]).
+/// * `layout` — the type is taken from the leaf value (`layout: <type>`) or a nested `type:` child
+///   (`layout:` block); a **non-empty** type outside the fixed set throws. Matched case-sensitively,
+///   as the engine does. An absent/empty type does *not* throw (the engine leaves the layout unset).
+/// * `border` — the shorthand must resolve to both a width and a color (or be the single
+///   `none`/`hidden` keyword); otherwise the engine throws ([`schema::is_valid_border`]).
+/// * `border-color*` — the value must parse as a color; the engine throws otherwise
+///   ([`schema::is_border_color_value`]). The numeric `border-width*` sub-properties are deliberately
+///   **not** validated: the engine reads them with a lenient digit-scanning converter that never
+///   throws (a non-numeric value is silently coerced to 0), so they are not an error.
+///
+/// Only a non-empty leaf `key: value` is validated for `display`/`border`/`border-color*` (an empty
+/// value or a block form is skipped — a false negative is preferred over a false positive on a shape
+/// the engine would treat differently); `layout` additionally handles its block form.
+fn check_property_value(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+    let Some(key) = node.child_by_field_name("key") else {
+        return;
+    };
+    match slice(source, key) {
+        "display" => {
+            if let Some((text, span)) = leaf_value(node, source) {
+                if !schema::is_display_value(text) {
+                    push_invalid_value(
+                        out,
+                        format!("`{text}` is not a valid `display` value"),
+                        span,
+                    );
+                }
+            }
+        }
+        "layout" => check_layout_value(node, source, out),
+        "border" => {
+            if let Some((text, span)) = leaf_value(node, source) {
+                if !schema::is_valid_border(text) {
+                    push_invalid_value(
+                        out,
+                        format!(
+                            "`{text}` is not a valid `border` value: expected a width and a color"
+                        ),
+                        span,
+                    );
+                }
+            }
+        }
+        "border-color"
+        | "border-color-top"
+        | "border-color-right"
+        | "border-color-bottom"
+        | "border-color-left" => {
+            if let Some((text, span)) = leaf_value(node, source) {
+                if !schema::is_border_color_value(text) {
+                    push_invalid_value(out, format!("`{text}` is not a valid color"), span);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Validate a `layout` property's type against [`schema::is_layout_type`], handling both the leaf
+/// form (`layout: <type>`) and the block form (`layout:` with a nested `type: <type>` child) — the
+/// engine resolves the type from whichever is present. A non-empty invalid type is an error; an
+/// absent/empty type is not (the engine leaves the layout unset without throwing).
+fn check_layout_value(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+    // Leaf form: `layout: <type>`.
+    if let Some((text, span)) = leaf_value(node, source) {
+        if !schema::is_layout_type(text) {
+            push_invalid_value(out, format!("`{text}` is not a valid `layout` type"), span);
+        }
+        return;
+    }
+    // Block form: `layout:` with a nested `type: <type>` child property.
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "property" {
+            continue;
+        }
+        let Some(child_key) = child.child_by_field_name("key") else {
+            continue;
+        };
+        if slice(source, child_key) != "type" {
+            continue;
+        }
+        if let Some((text, span)) = leaf_value(child, source) {
+            if !schema::is_layout_type(text) {
+                push_invalid_value(out, format!("`{text}` is not a valid `layout` type"), span);
+            }
+        }
+        return;
+    }
+}
+
+/// The trimmed text and byte span of a property's leaf `value` field, or `None` when the property has
+/// no value field (a block form or a bare `key:`) or its value is empty/whitespace. The span covers
+/// exactly the trimmed value token, so a diagnostic points at the value rather than its surrounding
+/// whitespace.
+fn leaf_value<'a>(node: Node<'_>, source: &'a str) -> Option<(&'a str, ByteSpan)> {
+    let value = node.child_by_field_name("value")?;
+    let raw = slice(source, value);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lead = raw.len() - raw.trim_start().len();
+    let start = value.start_byte() + lead;
+    Some((trimmed, ByteSpan::new(start, start + trimmed.len())))
+}
+
+/// Push an [`INVALID_PROPERTY_VALUE`] error (`Severity::Error`) spanning the offending value token.
+fn push_invalid_value(out: &mut Vec<Diagnostic>, message: String, span: ByteSpan) {
+    out.push(Diagnostic {
+        severity: Severity::Error,
+        code: INVALID_PROPERTY_VALUE,
+        message,
+        span,
+    });
 }
 
 #[cfg(test)]
@@ -892,5 +1033,203 @@ Panel
         assert_ne!(d.severity, Severity::Error);
         assert_ne!(d.severity, Severity::Warning);
         assert_eq!(d.severity, Severity::Hint);
+    }
+
+    // --- semantic pass: invalid property value (error) ----------------------------------------
+
+    #[test]
+    fn valid_display_value_is_silent() {
+        let src = "Panel\n  display: flex\n";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != INVALID_PROPERTY_VALUE),
+            "valid display must not be flagged: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_display_value_is_an_error_on_the_value() {
+        let src = "Panel\n  display: blocky\n";
+        let diags = analyze(src);
+        let d = only(&diags, INVALID_PROPERTY_VALUE);
+        assert_eq!(d.severity, Severity::Error);
+        assert_eq!(&src[d.span.start..d.span.end], "blocky");
+    }
+
+    #[test]
+    fn miscased_display_value_is_accepted() {
+        // The engine lowercases the value before matching, so `Flex` is valid.
+        let src = "Panel\n  display: Flex\n";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != INVALID_PROPERTY_VALUE),
+            "case-insensitive display value must not be flagged: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn valid_layout_leaf_value_is_silent() {
+        let src = "Panel\n  layout: verticalBox\n";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != INVALID_PROPERTY_VALUE),
+            "valid layout must not be flagged: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_layout_leaf_value_is_an_error_on_the_value() {
+        let src = "Panel\n  layout: bogusBox\n";
+        let diags = analyze(src);
+        let d = only(&diags, INVALID_PROPERTY_VALUE);
+        assert_eq!(d.severity, Severity::Error);
+        assert_eq!(&src[d.span.start..d.span.end], "bogusBox");
+    }
+
+    #[test]
+    fn miscased_layout_type_is_an_error() {
+        // The engine compares the layout type verbatim (no lowercasing), so `verticalbox` is invalid.
+        let src = "Panel\n  layout: verticalbox\n";
+        let diags = analyze(src);
+        let d = only(&diags, INVALID_PROPERTY_VALUE);
+        assert_eq!(&src[d.span.start..d.span.end], "verticalbox");
+    }
+
+    #[test]
+    fn valid_layout_block_type_is_silent() {
+        // Block form: the engine reads the type from the nested `type:` child.
+        let src = "\
+Panel
+  layout:
+    type: grid
+    cell-size: 32 32
+";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != INVALID_PROPERTY_VALUE),
+            "valid block-form layout must not be flagged: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_layout_block_type_is_an_error_on_the_type_value() {
+        let src = "\
+Panel
+  layout:
+    type: bogusBox
+";
+        let diags = analyze(src);
+        let d = only(&diags, INVALID_PROPERTY_VALUE);
+        assert_eq!(d.severity, Severity::Error);
+        assert_eq!(&src[d.span.start..d.span.end], "bogusBox");
+    }
+
+    #[test]
+    fn layout_block_without_type_is_not_an_error() {
+        // No leaf value and no `type:` child -> the engine leaves the layout unset without throwing.
+        let src = "\
+Panel
+  layout:
+    cell-size: 32 32
+";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != INVALID_PROPERTY_VALUE),
+            "typeless layout block must not be flagged: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn valid_border_shorthand_is_silent() {
+        let src = "Panel\n  border: 2 solid red\n";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != INVALID_PROPERTY_VALUE),
+            "valid border must not be flagged: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn border_none_keyword_is_silent() {
+        let src = "Panel\n  border: none\n";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != INVALID_PROPERTY_VALUE),
+            "`border: none` must not be flagged: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn border_with_only_a_color_is_an_error() {
+        // A color without a width: the engine throws (`border must include width and color`).
+        let src = "Panel\n  border: red\n";
+        let diags = analyze(src);
+        let d = only(&diags, INVALID_PROPERTY_VALUE);
+        assert_eq!(d.severity, Severity::Error);
+        assert_eq!(&src[d.span.start..d.span.end], "red");
+    }
+
+    #[test]
+    fn border_with_only_a_width_is_an_error() {
+        let src = "Panel\n  border: 3\n";
+        let diags = analyze(src);
+        let d = only(&diags, INVALID_PROPERTY_VALUE);
+        assert_eq!(d.severity, Severity::Error);
+        assert_eq!(&src[d.span.start..d.span.end], "3");
+    }
+
+    #[test]
+    fn valid_border_color_is_silent() {
+        let src = "Panel\n  border-color: #ff0000\n";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != INVALID_PROPERTY_VALUE),
+            "valid border-color must not be flagged: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_border_color_is_an_error() {
+        let src = "Panel\n  border-color-top: notacolor\n";
+        let diags = analyze(src);
+        let d = only(&diags, INVALID_PROPERTY_VALUE);
+        assert_eq!(d.severity, Severity::Error);
+        assert_eq!(&src[d.span.start..d.span.end], "notacolor");
+    }
+
+    #[test]
+    fn nonnumeric_border_width_is_not_validated() {
+        // The engine reads `border-width*` with a lenient digit-scanning converter that never throws,
+        // so a non-numeric value is silently coerced, not an error.
+        let src = "Panel\n  border-width: fat\n";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != INVALID_PROPERTY_VALUE),
+            "border-width is not value-validated: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_property_with_a_weird_value_is_not_a_value_error() {
+        // `width` is a known property but NOT one of the four value-validating ones, so a nonsense
+        // value is never an invalid-value error (the engine silently coerces/ignores it).
+        let src = "Panel\n  width: not-a-number\n";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != INVALID_PROPERTY_VALUE),
+            "non-validating property value must not be flagged: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn value_validation_only_fires_for_the_named_properties() {
+        // A mis-cased `Display` is an unknown property (a hint), not value-validated even though its
+        // value would be invalid for the real `display` property.
+        let src = "Panel\n  Display: blocky\n";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != INVALID_PROPERTY_VALUE),
+            "mis-cased property must not be value-validated: {diags:?}"
+        );
     }
 }
