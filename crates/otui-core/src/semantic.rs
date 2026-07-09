@@ -248,6 +248,32 @@ Panel
     }
 
     #[test]
+    fn event_alias_expr_keys_are_properties() {
+        // `@event:` / `&alias:` / `!expr:` key names are all classed as `Property`, same as a
+        // generic `property_key` — only their Lua-bearing values differ (and those values are
+        // untokenized `lua_value`/`hash_literal` bodies, not exercised here).
+        let src = "\
+Button
+  @onClick: g_game.talk(1, 2)
+  &primaryColor: #33AAFF
+  !text: tr('Label')
+";
+        let toks = tokens(src);
+        assert_eq!(
+            token_for(src, &toks, "onClick").kind,
+            SemanticTokenKind::Property
+        );
+        assert_eq!(
+            token_for(src, &toks, "primaryColor").kind,
+            SemanticTokenKind::Property
+        );
+        assert_eq!(
+            token_for(src, &toks, "text").kind,
+            SemanticTokenKind::Property
+        );
+    }
+
+    #[test]
     fn empty_source_yields_no_tokens() {
         assert_eq!(tokens(""), Vec::<SemanticToken>::new());
     }

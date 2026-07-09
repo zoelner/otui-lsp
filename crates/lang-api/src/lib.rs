@@ -158,6 +158,67 @@ mod tests {
     }
 
     #[test]
+    fn all_lists_every_variant_exactly_once_at_its_index() {
+        // Runtime check, driven per-variant below: each variant appears in `ALL` exactly once,
+        // at the position its own `index()` returns.
+        fn assert_at_own_index(kind: SemanticTokenKind) {
+            assert_eq!(
+                SemanticTokenKind::ALL
+                    .iter()
+                    .filter(|&&k| k == kind)
+                    .count(),
+                1,
+                "{kind:?} must appear exactly once in ALL"
+            );
+            assert_eq!(
+                SemanticTokenKind::ALL[kind.index() as usize],
+                kind,
+                "{kind:?} must sit at its own index() position in ALL"
+            );
+        }
+
+        // Every variant, driven through the exhaustive match below. This list must be kept in
+        // sync with the enum, but that sync is compiler-enforced: the match right below has no
+        // wildcard arm, so adding a new `SemanticTokenKind` variant without also adding it here
+        // (and to `ALL`) is a compile error, not a silently-shrunk legend.
+        let kinds = [
+            SemanticTokenKind::Comment,
+            SemanticTokenKind::Type,
+            SemanticTokenKind::Property,
+            SemanticTokenKind::String,
+            SemanticTokenKind::Number,
+            SemanticTokenKind::Boolean,
+            SemanticTokenKind::EnumMember,
+            SemanticTokenKind::Variable,
+            SemanticTokenKind::Operator,
+            SemanticTokenKind::Keyword,
+        ];
+        assert_eq!(
+            kinds.len(),
+            SemanticTokenKind::ALL.len(),
+            "add new variants to this list too"
+        );
+
+        for kind in kinds {
+            // Exhaustive match: a new variant added to `SemanticTokenKind` without a matching
+            // arm here fails to compile, forcing this guard (and `ALL`) to be updated whenever
+            // the enum grows.
+            match kind {
+                SemanticTokenKind::Comment
+                | SemanticTokenKind::Type
+                | SemanticTokenKind::Property
+                | SemanticTokenKind::String
+                | SemanticTokenKind::Number
+                | SemanticTokenKind::Boolean
+                | SemanticTokenKind::EnumMember
+                | SemanticTokenKind::Variable
+                | SemanticTokenKind::Operator
+                | SemanticTokenKind::Keyword => assert_at_own_index(kind),
+            }
+        }
+    }
+
+    #[test]
     fn byte_span_len_and_emptiness() {
         assert_eq!(ByteSpan::new(2, 5).len(), 3);
         assert!(ByteSpan::new(4, 4).is_empty());
