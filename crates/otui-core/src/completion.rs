@@ -321,6 +321,15 @@ mod tests {
     }
 
     #[test]
+    fn inside_a_full_line_comment_offers_nothing() {
+        // A line-start `//` (or `#`) comment is prose, not markup: a `$`/`@` inside it must not
+        // trigger a closed-set completion (the CST-suppression path for `comment`).
+        let src = "Button\n  // $hover\n";
+        let offset = at(src, "$hover") + 1;
+        assert!(complete_at(src, offset).is_empty());
+    }
+
+    #[test]
     fn offscreen_or_unknown_offset_offers_nothing() {
         assert!(complete_at("", 0).is_empty());
         let src = "Button\n  $\n";

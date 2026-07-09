@@ -362,11 +362,17 @@ impl LanguageServer for Backend {
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 // Hover: style names and `Name < Base` bases (spec §5.5).
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
-                // Completion: the OTML closed sets (spec §6). `$` / `@` / `.` re-trigger completion
-                // as those characters open a `$state` selector, an `@event` key, or an
-                // `anchors.<edge>` / `<target>.<edge>` dotted position.
+                // Completion: the OTML closed sets (spec §6). `$` / `@` / `.` / `!` re-trigger
+                // completion as those characters open a `$state` selector, an `@event` key, an
+                // `anchors.<edge>` / `<target>.<edge>` dotted position, or a `!`-negated state in a
+                // multi-state selector (`$hover !…`).
                 completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec!["$".to_owned(), "@".to_owned(), ".".to_owned()]),
+                    trigger_characters: Some(vec![
+                        "$".to_owned(),
+                        "@".to_owned(),
+                        ".".to_owned(),
+                        "!".to_owned(),
+                    ]),
                     ..CompletionOptions::default()
                 }),
                 ..ServerCapabilities::default()
