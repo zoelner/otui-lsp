@@ -200,9 +200,14 @@ fn sorted_dedup(mut v: Vec<String>) -> Vec<String> {
 /// Remove C/C++ comments so a commented-out `node->tag() == "..."` never enters the catalog.
 /// String and character literals are respected so a `"//"` inside a literal is not mistaken for a
 /// comment start. Comment bodies are replaced with a single space to preserve token boundaries.
+///
+/// The scan works on the raw bytes and copies non-comment bytes verbatim (multi-byte UTF-8 sequences
+/// included, byte for byte), decoding back to a `String` only at the end — so non-ASCII content in
+/// the source is never mangled. The only bytes we synthesize are ASCII (`' '`), so the result is
+/// valid UTF-8 whenever the input was.
 fn strip_comments(src: &str) -> String {
     let bytes = src.as_bytes();
-    let mut out = String::with_capacity(src.len());
+    let mut out: Vec<u8> = Vec::with_capacity(src.len());
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
@@ -213,7 +218,7 @@ fn strip_comments(src: &str) -> String {
                 }
             }
             b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                out.push(' ');
+                out.push(b' ');
                 i += 2;
                 while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
                     i += 1;
@@ -222,14 +227,14 @@ fn strip_comments(src: &str) -> String {
             }
             b'"' | b'\'' => {
                 let quote = b;
-                out.push(b as char);
+                out.push(b);
                 i += 1;
                 while i < bytes.len() {
                     let c = bytes[i];
-                    out.push(c as char);
+                    out.push(c);
                     i += 1;
                     if c == b'\\' && i < bytes.len() {
-                        out.push(bytes[i] as char);
+                        out.push(bytes[i]);
                         i += 1;
                     } else if c == quote {
                         break;
@@ -237,12 +242,14 @@ fn strip_comments(src: &str) -> String {
                 }
             }
             _ => {
-                out.push(b as char);
+                out.push(b);
                 i += 1;
             }
         }
     }
-    out
+    // Every synthesized byte is ASCII and every copied byte came from a valid `&str`, so the buffer
+    // is valid UTF-8; `from_utf8_lossy` is a belt-and-suspenders guard that never allocates here.
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Render the catalog into the committed `catalog.rs` source (with a GENERATED banner).
@@ -294,4 +301,45 @@ fn workspace_root() -> PathBuf {
         .parent()
         .expect("xtask manifest dir has a parent (the workspace root)")
         .to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_comments;
+
+    #[test]
+    fn strips_line_and_block_comments_but_keeps_code() {
+        let src = "int a; // a comment\nb == \"x\"; /* block */ c;\n";
+        let out = strip_comments(src);
+        assert!(out.contains("int a;"));
+        assert!(!out.contains("a comment"));
+        assert!(!out.contains("block"));
+        // The string literal survives; the block comment collapses to a boundary space.
+        assert!(out.contains("b == \"x\";"));
+        assert!(out.contains("c;"));
+    }
+
+    #[test]
+    fn a_double_slash_inside_a_string_literal_is_not_a_comment() {
+        let src = "tag == \"http://x\"; // real comment\n";
+        let out = strip_comments(src);
+        assert!(out.contains("\"http://x\""));
+        assert!(!out.contains("real comment"));
+    }
+
+    #[test]
+    fn non_ascii_bytes_are_preserved_verbatim() {
+        // A comment with multi-byte UTF-8 is removed; multi-byte content in code/strings survives
+        // byte-for-byte (a naive `byte as char` cast would mangle these).
+        let src = "x == \"café\"; // córrego\ny;\n";
+        let out = strip_comments(src);
+        assert!(
+            out.contains("\"café\""),
+            "multibyte string literal preserved: {out}"
+        );
+        assert!(!out.contains("córrego"));
+        assert!(out.contains("y;"));
+        // Output stays valid UTF-8 (would have panicked/garbled under the old cast).
+        assert!(out.is_char_boundary(out.len()));
+    }
 }
