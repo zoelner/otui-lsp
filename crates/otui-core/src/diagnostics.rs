@@ -214,6 +214,78 @@ fn indentation_pass(source: &str) -> Vec<Diagnostic> {
     out
 }
 
+/// Whether the structural line containing byte `offset` has valid indentation: spaces-only, a
+/// multiple of 2, and no deeper than one level past the nearest preceding structural line. This is
+/// the exact rule [`indentation_pass`] enforces (the `tab-indentation`, `odd-indentation` and
+/// `invalid-indentation-depth` findings), evaluated for a single line so the `completion` module can
+/// gate on it without re-deriving the depth arithmetic — the two must agree. Block-scalar **content**
+/// (raw text indented under a `|` / `|-` / `|+` marker) is not structure: a cursor on such a line, or
+/// on a blank/comment line, returns `false`.
+pub(crate) fn line_indentation_is_valid(source: &str, offset: usize) -> bool {
+    let lines = split_lines(source);
+    let mut current_depth: usize = 0;
+    let mut i = 0;
+
+    // The target line is the one whose byte range (start ..= end-of-text, i.e. up to its `\n`)
+    // contains `offset`.
+    let contains = |line: &Line<'_>| offset >= line.start && offset <= line.start + line.text.len();
+
+    while i < lines.len() {
+        let line = &lines[i];
+        i += 1;
+
+        let trimmed = line.text.trim();
+        // Blank and comment lines carry no structural depth (`parseLine` skips them). A cursor on one
+        // is not a property-key position, so gate it out.
+        if trimmed.is_empty() || is_comment(trimmed) {
+            if contains(line) {
+                return false;
+            }
+            continue;
+        }
+
+        let sp = leading_spaces(line.text);
+        let has_tab = line.text.as_bytes().get(sp) == Some(&b'\t');
+        let odd = sp % 2 != 0;
+        let depth = sp / 2;
+        // `parseLine`: a jump of more than one level is fatal (checked only when the line is not
+        // already tab/odd-flagged, mirroring `indentation_pass`).
+        let bad_jump = !has_tab && !odd && depth > current_depth + 1;
+
+        if contains(line) {
+            return !has_tab && !odd && !bad_jump;
+        }
+
+        // Advance depth exactly like the pass (set unconditionally, even for a malformed line).
+        current_depth = depth;
+
+        // Block scalars: skip their raw content lines so they neither affect structural depth nor
+        // are mistaken for a structural line. A cursor landing inside the raw body returns `false`.
+        if is_block_scalar_marker(line_value(trimmed)) {
+            while i < lines.len() {
+                let content = &lines[i];
+                if content.text.trim().is_empty() {
+                    if contains(content) {
+                        return false;
+                    }
+                    i += 1;
+                    continue;
+                }
+                if leading_spaces(content.text) > sp {
+                    if contains(content) {
+                        return false; // raw block content, not structure
+                    }
+                    i += 1;
+                } else {
+                    break; // next structural node — reprocess in the outer loop
+                }
+            }
+        }
+    }
+
+    false
+}
+
 /// Depth-first harvest of `ERROR` and `MISSING` nodes. An `ERROR` node's subtree is not descended
 /// into (the whole malformed region is reported once); `MISSING` nodes are reported wherever they
 /// appear.
@@ -394,6 +466,36 @@ mod tests {
 
     fn codes(diags: &[Diagnostic]) -> Vec<&str> {
         diags.iter().map(|d| d.code).collect()
+    }
+
+    #[test]
+    fn line_indentation_is_valid_mirrors_the_pass() {
+        // Byte offset of `needle` in `src`.
+        let at = |src: &str, needle: &str| src.find(needle).expect("needle present");
+
+        // Valid +1 level under a widget.
+        let src = "Panel\n  wid\n";
+        assert!(line_indentation_is_valid(src, at(src, "wid") + 1));
+
+        // Odd (3-space) indentation → invalid.
+        let src = "Panel\n   wid\n";
+        assert!(!line_indentation_is_valid(src, at(src, "wid") + 1));
+
+        // Depth jump of two levels (0 → 2) → invalid.
+        let src = "Panel\n    wid\n";
+        assert!(!line_indentation_is_valid(src, at(src, "wid") + 1));
+
+        // Tab indentation → invalid.
+        let src = "Panel\n\twid\n";
+        assert!(!line_indentation_is_valid(src, at(src, "wid") + 1));
+
+        // A cursor inside a `|` block-scalar body is raw text, not structure → invalid.
+        let src = "Panel\n  @onClick: |\n    some\n";
+        assert!(!line_indentation_is_valid(src, at(src, "some") + 1));
+
+        // Valid +1 under a nested widget (depth 2 under depth 1).
+        let src = "Panel\n  Child\n    wid\n";
+        assert!(line_indentation_is_valid(src, at(src, "wid") + 1));
     }
 
     #[test]
