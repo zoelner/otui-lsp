@@ -11,6 +11,7 @@
 
 pub mod convert;
 pub mod position;
+pub mod semantic;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -22,7 +23,9 @@ use tower_lsp::jsonrpc::Result as RpcResult;
 use tower_lsp::lsp_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     InitializeParams, InitializeResult, InitializedParams, MessageType, PositionEncodingKind,
-    ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
+    SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
+    TextDocumentSyncCapability, TextDocumentSyncKind, Url, WorkDoneProgressOptions,
 };
 use tower_lsp::{Client, LanguageServer};
 
@@ -31,9 +34,9 @@ use crate::position::PositionEncoding;
 /// An open document's full text plus the version it was last synced at.
 #[derive(Debug, Clone)]
 struct Document {
-    /// Kept for future features (hover, completion, …) that need the stored text; not yet read
-    /// anywhere, since diagnostics are published from the freshly received text directly.
-    #[allow(dead_code)]
+    /// The full document text, served back for pull-style requests (e.g. semantic tokens) and
+    /// future features (hover, completion, …). Diagnostics are still published from the freshly
+    /// received text directly.
     text: String,
     version: i32,
 }
@@ -131,6 +134,19 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
+                // Semantic highlighting: advertise a full-document provider with the legend whose
+                // indices match the engine's `SemanticTokenKind`. No delta/range support, no
+                // modifiers.
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        SemanticTokensOptions {
+                            work_done_progress_options: WorkDoneProgressOptions::default(),
+                            legend: semantic::legend(),
+                            range: Some(false),
+                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                        },
+                    ),
+                ),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -148,6 +164,31 @@ impl LanguageServer for Backend {
 
     async fn shutdown(&self) -> RpcResult<()> {
         Ok(())
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> RpcResult<Option<SemanticTokensResult>> {
+        let uri = params.text_document.uri;
+        // Serve from the stored document text; nothing to highlight for an unknown document.
+        let Some(text) = self
+            .documents
+            .read()
+            .await
+            .get(&uri)
+            .map(|doc| doc.text.clone())
+        else {
+            return Ok(None);
+        };
+
+        let core_tokens = self.service.semantic_tokens(&text);
+        let data = semantic::encode(&text, &core_tokens, self.encoding());
+
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data,
+        })))
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
