@@ -70,6 +70,8 @@ name = "otui-core"
 version = "0.0.0"
 dependencies = [
  "lang-api",
+ "tree-sitter",
+ "tree-sitter-otui",
 ]
 
 [[package]]

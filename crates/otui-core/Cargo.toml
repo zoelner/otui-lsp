@@ -10,3 +10,5 @@ authors.workspace = true
 
 [dependencies]
 lang-api.workspace = true
+tree-sitter = "0.25"
+tree-sitter-otui = { path = "../tree-sitter-otui" }
