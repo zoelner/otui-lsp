@@ -181,9 +181,8 @@ pub struct DocumentSymbol {
 /// * [`Value`](CompletionKind::Value) — a magic anchor target keyword (`parent` / `next` / `prev`):
 ///   a literal that stands in the value slot of an anchor.
 /// * [`Event`](CompletionKind::Event) — an `@event` handler name.
-/// * [`Keyword`](CompletionKind::Keyword) — reserved for the property-name catalog a later node
-///   adds (spec §2.10); no closed set in this crate emits it yet, but it keeps the mapping seam in
-///   place so that catalog can slot in without touching the enum.
+/// * [`Keyword`](CompletionKind::Keyword) — an OTML property **name** from the generated catalog
+///   (spec §2.10), offered when the cursor is building an ordinary `key:`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionKind {
     /// A member of a fixed enumeration: a `$state` name or an anchor edge.
@@ -192,7 +191,7 @@ pub enum CompletionKind {
     Value,
     /// An `@event` handler name.
     Event,
-    /// A language keyword / property name (the deferred property-catalog seam).
+    /// An OTML property **name** (from the generated property catalog).
     Keyword,
 }
 

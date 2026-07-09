@@ -42,6 +42,7 @@
 //! Everything here is pure: byte offsets in, [`CompletionItem`]s out. No I/O, no `lsp-types`.
 
 use crate::catalog;
+use crate::diagnostics;
 use crate::schema;
 use crate::syntax::SyntaxTree;
 use lang_api::{CompletionItem, CompletionKind};
@@ -89,6 +90,14 @@ pub fn complete_at(source: &str, offset: usize) -> Vec<CompletionItem> {
     let prefix = &source[line_start..offset];
 
     match classify(prefix) {
+        // A property key additionally requires structurally valid indentation: an odd indent or a
+        // depth jump of more than one level is a hard OTML parse error (the `diagnostics` module
+        // flags `odd-indentation` / `invalid-indentation-depth`), so no key may be offered there.
+        // This needs the whole document (the preceding lines' depth), so it is gated here rather
+        // than in the line-prefix classifier. The closed-set contexts keep their own guards.
+        Some(Context::PropertyKey) if !diagnostics::line_indentation_is_valid(source, offset) => {
+            Vec::new()
+        }
         Some(context) => items_for(context, source, offset),
         None => Vec::new(),
     }
@@ -153,11 +162,14 @@ fn classify(prefix: &str) -> Option<Context> {
 /// Classify the ordinary property **key** slot from the line's `indent` and its `trimmed` content.
 ///
 /// Fires [`Context::PropertyKey`] only when the cursor is actively building a bare property-key
-/// token, mirroring the `property_key` grammar shape (`token(IDENT)` = a letter/`_` start, then
-/// letters/digits/`_`/`-`). Precision over recall — anything ambiguous yields `None`:
+/// token, mirroring the `property_key` grammar shape (`token(IDENT)`, then letters/digits/`_`/`-`).
+/// Precision over recall — anything ambiguous yields `None`:
 ///
 /// * unindented (`indent` empty) → a top-level word is a widget tag / style header, never a property;
 /// * empty word (just indentation, `  `) → ambiguous with a nested widget tag about to be typed;
+/// * an **uppercase-initial** word → a child-widget tag / style header (`Button`, `UIWidget`), not a
+///   property: OTML property names are all lowercase/kebab, so a leading uppercase letter marks a
+///   widget position (widget-name completion is a separate future node);
 /// * a `:` in the prefix → we are past the key, in **value** position (property-value/color
 ///   completion is deferred — see the module docs), so nothing;
 /// * a `.` → a dotted key (`foo.bar`) is neither a property nor an `anchors.` object;
@@ -165,7 +177,8 @@ fn classify(prefix: &str) -> Option<Context> {
 ///   header, or otherwise not a bare key.
 ///
 /// The `$` / `@` / `anchors.` / `&` / `!` / `-` forms are already handled or excluded upstream (or by
-/// the leading-char test), so they never reach here as a property key.
+/// the leading-char test), so they never reach here as a property key. Indentation-depth validity is
+/// enforced separately by the caller (it needs the whole document).
 fn classify_property_key(indent: &str, trimmed: &str) -> Option<Context> {
     // Properties are nested under a widget, so they always carry leading indentation. A top-level
     // (unindented) bare word is a widget/style header, not a property → offer nothing.
@@ -176,9 +189,12 @@ fn classify_property_key(indent: &str, trimmed: &str) -> Option<Context> {
     // a nested container tag about to be typed, so we stay silent (precision over recall).
     let mut chars = trimmed.chars();
     let first = chars.next()?;
-    // A property key starts with a letter or `_` (grammar `IDENT`); a leading digit/`&`/`!`/`-`/`.`
-    // or anything else is not a key we build here.
-    if !(first.is_ascii_alphabetic() || first == '_') {
+    // A property key starts with a LOWERCASE ASCII letter. OTML property names are all lowercase/kebab
+    // (`width`, `image-source`, `text-align`), whereas a child-widget tag / style header at the same
+    // indentation is CamelCase / uppercase-initial (`Button`, `Panel`, `UIWidget`) — the case
+    // convention is what tells the two apart (every `catalog::PROPERTIES` entry is lowercase-initial).
+    // A leading uppercase letter, digit, `_`, `&`, `!`, `-`, `.` or anything else is not a key here.
+    if !first.is_ascii_lowercase() {
         return None;
     }
     // The rest must stay within the IDENT charset. A `:` (value position — deferred), `.` (dotted
@@ -690,6 +706,47 @@ Panel
         // `Button` at column 0 is a widget/style-header, NOT a property → offer nothing.
         let src = "Butt\n";
         assert!(complete_at(src, at(src, "Butt") + "Butt".len()).is_empty());
+    }
+
+    #[test]
+    fn indented_uppercase_word_is_a_child_widget_not_a_property() {
+        // An indented CamelCase word is a nested widget/tag position, not a property key. Property
+        // names are all lowercase/kebab, so a leading uppercase letter marks a widget → offer
+        // nothing (widget-name completion is a separate future node).
+        let src = "Panel\n  Button\n";
+        assert!(complete_at(src, at(src, "Button") + "Button".len()).is_empty());
+        // ...but a lowercase-initial word at the very same indentation still offers the catalog.
+        let src = "Panel\n  wid\n";
+        assert_eq!(
+            labels(&complete_at(src, at(src, "wid") + "wid".len())),
+            catalog::PROPERTIES
+        );
+    }
+
+    #[test]
+    fn odd_indented_property_word_offers_nothing() {
+        // A 3-space (odd) indent is a hard OTML error (`odd-indentation`); the key context must
+        // honor the same indentation rule the diagnostics pass enforces → offer nothing.
+        let src = "Panel\n   wid\n";
+        assert!(complete_at(src, at(src, "wid") + "wid".len()).is_empty());
+    }
+
+    #[test]
+    fn invalid_depth_jump_property_word_offers_nothing() {
+        // `    wid` jumps from depth 0 (`Panel`) straight to depth 2 — an `invalid-indentation-depth`
+        // error — so no property key may be offered on it.
+        let src = "Panel\n    wid\n";
+        assert!(complete_at(src, at(src, "wid") + "wid".len()).is_empty());
+    }
+
+    #[test]
+    fn valid_plus_one_level_offers_the_catalog() {
+        // A correctly-indented +1 level under a nested widget is valid depth: offer the catalog.
+        let src = "Panel\n  Child\n    wid\n";
+        assert_eq!(
+            labels(&complete_at(src, at(src, "wid") + "wid".len())),
+            catalog::PROPERTIES
+        );
     }
 
     #[test]
