@@ -1,21 +1,18 @@
 //! The `otui-lsp` language server binary.
 //!
-//! This is the thin transport shell: it speaks LSP 3.17 over stdio (JSON-RPC 2.0) and delegates
-//! all language semantics to [`otui_core`] via the [`lang_api::LanguageService`] contract, doing
-//! only the byte-offset ↔ protocol-position conversion at the boundary.
-//!
-//! The full server lifecycle (`initialize` / `initialized` / `shutdown` / `exit`, capability
-//! negotiation) lands in M3. This M1 scaffold just proves the binary wires up against the core.
+//! Thin transport shell: it speaks LSP 3.17 over stdio (JSON-RPC 2.0) via `tower-lsp` and
+//! delegates all language semantics to [`otui_core`]. The lifecycle, document store and
+//! byte-offset ↔ position conversion live in the [`otui_lsp_server`] library; `main` only spins
+//! up the tokio runtime and serves the [`Backend`](otui_lsp_server::Backend) over stdin/stdout.
 
-use lang_api::LanguageService;
-use otui_core::OtuiService;
+use otui_lsp_server::Backend;
+use tower_lsp::{LspService, Server};
 
-fn main() {
-    let service = OtuiService::new();
-    // Placeholder until the tower-lsp stdio loop is wired in M3.
-    eprintln!(
-        "otui-lsp {} — language backend '{}' ready (LSP transport lands in M3)",
-        env!("CARGO_PKG_VERSION"),
-        service.language_id(),
-    );
+#[tokio::main(flavor = "multi_thread")]
+async fn main() {
+    let stdin = tokio::io::stdin();
+    let stdout = tokio::io::stdout();
+
+    let (service, socket) = LspService::new(Backend::new);
+    Server::new(stdin, stdout, socket).serve(service).await;
 }
