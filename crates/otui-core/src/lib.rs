@@ -14,6 +14,7 @@
 pub mod diagnostics;
 pub mod hover;
 pub mod navigation;
+pub mod schema;
 pub mod semantic;
 pub mod style_index;
 pub mod symbols;
