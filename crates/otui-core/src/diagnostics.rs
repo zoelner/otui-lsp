@@ -368,7 +368,9 @@ fn check_property(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
     let mut cursor = node.walk();
     let has_block = node
         .named_children(&mut cursor)
-        .any(|child| child.id() != key.id() && value.is_none_or(|v| child.id() != v.id()));
+        // `map_or(true, …)` rather than `Option::is_none_or` — the latter is only stable since Rust
+        // 1.82, but the workspace MSRV is 1.75.
+        .any(|child| child.id() != key.id() && value.map_or(true, |v| child.id() != v.id()));
     if has_block {
         return;
     }
