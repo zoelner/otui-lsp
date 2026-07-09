@@ -13,10 +13,13 @@
 
 pub mod diagnostics;
 pub mod semantic;
+pub mod style_index;
 pub mod symbols;
 pub mod syntax;
 
 use lang_api::{Diagnostic, DocumentSymbol, LanguageService, SemanticToken};
+use style_index::StyleDef;
+use syntax::SyntaxTree;
 
 /// The OTUI language backend. Constructed once per workspace/session.
 #[derive(Debug, Default)]
@@ -27,6 +30,20 @@ pub struct OtuiService {
 impl OtuiService {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Extract the top-level `Name < Base` style definitions declared in a single document
+    /// (spec §5.2). This is the per-document half of the workspace style index: the server calls
+    /// it on change and feeds the result into a [`style_index::StyleIndex`] keyed by URI. Returns
+    /// an empty vector if the source cannot be parsed.
+    ///
+    /// Kept as an inherent method (not on the [`LanguageService`] trait): the multi-document index
+    /// is owned by the server, and the protocol-agnostic trait stays minimal.
+    #[must_use]
+    pub fn style_defs(&self, source: &str) -> Vec<StyleDef> {
+        SyntaxTree::parse(source)
+            .map(|tree| style_index::extract_style_defs(&tree))
+            .unwrap_or_default()
     }
 }
 
