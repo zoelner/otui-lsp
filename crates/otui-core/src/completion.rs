@@ -1,18 +1,23 @@
 //! Closed-set completion (spec §6): what fixed vocabulary applies at a byte offset.
 //!
-//! This module answers "the cursor is here — which of OTML's small **closed sets** should the
-//! client offer?" It covers exactly the four sets the [`schema`](crate::schema) module owns:
+//! This module answers "the cursor is here — which fixed OTML vocabulary should the client offer?"
+//! It covers the four closed sets the [`schema`](crate::schema) module owns:
 //!
 //! * `$state` selector names ([`schema::STATES`]),
 //! * `anchors.<edge>` edges ([`schema::ANCHOR_EDGES`] + [`schema::SHORTHAND_ANCHORS`]),
 //! * anchor **target** keywords ([`schema::MAGIC_ANCHOR_TARGETS`]) plus the in-scope widget `id:`
 //!   values reachable in the current document, and target-side edges, and
-//! * `@event` handler names ([`schema::EVENTS`]).
+//! * `@event` handler names ([`schema::EVENTS`]),
 //!
-//! **Deliberately out of scope** (returns an empty vec): property names and color names. Those come
-//! from the large open-ish catalog the later `cargo xtask` extraction node produces, not from a
-//! hand-transcribed list here (spec §6, §2.10). Property-value enums are likewise deferred. When no
-//! closed set applies, this returns nothing — never a guess.
+//! plus one open-ish set from the generated catalog:
+//!
+//! * property **key** names ([`catalog::PROPERTIES`]) — offered while the cursor is building an
+//!   ordinary `key:` on an indented line (spec §6, §2.10).
+//!
+//! **Deliberately out of scope** (returns an empty vec): property **values** — color names/forms and
+//! per-property value enums. Color completion needs per-property color-type metadata the catalog does
+//! not carry, so it is deferred until that metadata exists; likewise value enums. When no set applies,
+//! this returns nothing — never a guess.
 //!
 //! ## How the context is classified
 //!
@@ -36,6 +41,7 @@
 //!
 //! Everything here is pure: byte offsets in, [`CompletionItem`]s out. No I/O, no `lsp-types`.
 
+use crate::catalog;
 use crate::schema;
 use crate::syntax::SyntaxTree;
 use lang_api::{CompletionItem, CompletionKind};
@@ -53,14 +59,18 @@ enum Context {
     AnchorTarget,
     /// On an `@event` key: offer the known event handler names.
     Events,
+    /// On an ordinary property **key** being typed (indented, no `:` yet): offer the catalog
+    /// property names.
+    PropertyKey,
 }
 
 /// Compute the completion candidates for the cursor at byte `offset` in `source` (spec §6).
 ///
-/// Returns the matching closed set — `$state` names, anchor edges/targets, or `@event` names — or an
-/// empty vec when the cursor is not in one of those contexts (a plain property value, a Lua body, an
-/// out-of-range offset, …). The client is expected to filter the returned set by the partial word it
-/// already has; we always return the whole set so the labels are deterministic (schema const order).
+/// Returns the matching set — `$state` names, anchor edges/targets, `@event` names, or (on an
+/// indented bare `key`) the catalog property names — or an empty vec when the cursor is not in one of
+/// those contexts (a property **value**, a Lua body, an out-of-range offset, …). The client is
+/// expected to filter the returned set by the partial word it already has; we always return the whole
+/// set so the labels are deterministic (schema/catalog const order).
 #[must_use]
 pub fn complete_at(source: &str, offset: usize) -> Vec<CompletionItem> {
     // Guard against an offset past the end or inside a multi-byte char: slicing the prefix below
@@ -87,9 +97,9 @@ pub fn complete_at(source: &str, offset: usize) -> Vec<CompletionItem> {
 /// Classify the closed-set context from the line `prefix` (line start up to the cursor).
 ///
 /// Precise by construction: it only returns a context when the prefix unambiguously matches one of
-/// the three grammar shapes AND the cursor is actively building the relevant token; anything else (a
-/// property `key: value`, a completed token followed by whitespace, a tab-indented line, …) yields
-/// `None`.
+/// the grammar shapes (a `$state` / `anchors.` / `@event` special form, or a bare property `key`) AND
+/// the cursor is actively building the relevant token; anything else (a property **value** after the
+/// `:`, a completed token followed by whitespace, a tab-indented line, …) yields `None`.
 fn classify(prefix: &str) -> Option<Context> {
     // Tab indentation is a hard OTML parse error (the engine rejects it — see the `tab-indentation`
     // diagnostic), so a tab-indented line is never valid markup: offer nothing on it.
@@ -136,7 +146,48 @@ fn classify(prefix: &str) -> Option<Context> {
         };
     }
 
-    None
+    // An ordinary `key:` property — offer the catalog property names while the KEY is being typed.
+    classify_property_key(indent, trimmed)
+}
+
+/// Classify the ordinary property **key** slot from the line's `indent` and its `trimmed` content.
+///
+/// Fires [`Context::PropertyKey`] only when the cursor is actively building a bare property-key
+/// token, mirroring the `property_key` grammar shape (`token(IDENT)` = a letter/`_` start, then
+/// letters/digits/`_`/`-`). Precision over recall — anything ambiguous yields `None`:
+///
+/// * unindented (`indent` empty) → a top-level word is a widget tag / style header, never a property;
+/// * empty word (just indentation, `  `) → ambiguous with a nested widget tag about to be typed;
+/// * a `:` in the prefix → we are past the key, in **value** position (property-value/color
+///   completion is deferred — see the module docs), so nothing;
+/// * a `.` → a dotted key (`foo.bar`) is neither a property nor an `anchors.` object;
+/// * whitespace, `<`, or any non-IDENT char → a completed word + trailing space, a `Name < Base`
+///   header, or otherwise not a bare key.
+///
+/// The `$` / `@` / `anchors.` / `&` / `!` / `-` forms are already handled or excluded upstream (or by
+/// the leading-char test), so they never reach here as a property key.
+fn classify_property_key(indent: &str, trimmed: &str) -> Option<Context> {
+    // Properties are nested under a widget, so they always carry leading indentation. A top-level
+    // (unindented) bare word is a widget/style header, not a property → offer nothing.
+    if indent.is_empty() {
+        return None;
+    }
+    // Require a non-empty word actively being built: an empty indented slot (`  `) is ambiguous with
+    // a nested container tag about to be typed, so we stay silent (precision over recall).
+    let mut chars = trimmed.chars();
+    let first = chars.next()?;
+    // A property key starts with a letter or `_` (grammar `IDENT`); a leading digit/`&`/`!`/`-`/`.`
+    // or anything else is not a key we build here.
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    // The rest must stay within the IDENT charset. A `:` (value position — deferred), `.` (dotted
+    // key), `<` (style header), whitespace (completed word / multi-word tag), or any other char
+    // means this is not a bare key still being typed.
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return None;
+    }
+    Some(Context::PropertyKey)
 }
 
 /// Classify the anchor **value** slot — the text after `anchors.<edge>:` up to the cursor.
@@ -185,6 +236,10 @@ fn items_for(context: Context, source: &str, offset: usize) -> Vec<CompletionIte
         ),
         Context::AnchorTarget => anchor_target_items(source, offset),
         Context::Events => set_items(schema::EVENTS, CompletionKind::Event, "event handler"),
+        // Property KEY names from the generated catalog, in its (sorted) order. Property VALUES —
+        // color names/forms and value enums — are deferred (no per-property type metadata yet), so
+        // the value position deliberately falls through to an empty result upstream.
+        Context::PropertyKey => set_items(catalog::PROPERTIES, CompletionKind::Keyword, "property"),
     }
 }
 
@@ -414,12 +469,16 @@ mod tests {
 
     #[test]
     fn plain_property_value_offers_nothing() {
-        // A `key: value` line is not a closed-set context — property names/colors are the deferred
-        // catalog node's job.
+        // After the `:` we are in VALUE position — property-value/color completion is deferred (no
+        // per-property color-type metadata), so nothing is offered there.
         let src = "Widget\n  color: red\n";
         assert!(complete_at(src, at(src, "red") + 1).is_empty());
-        // ...and the property-name position offers nothing either (no hand-transcribed catalog).
-        assert!(complete_at(src, at(src, "color") + 2).is_empty());
+        // The KEY position, by contrast, now offers the catalog property names (see the property-key
+        // tests below): `  co` is a bare property key being typed.
+        assert_eq!(
+            labels(&complete_at(src, at(src, "color") + 2)),
+            catalog::PROPERTIES
+        );
     }
 
     #[test]
@@ -573,6 +632,121 @@ Panel
         assert!(complete_at("", 0).is_empty());
         let src = "Button\n  $\n";
         assert!(complete_at(src, src.len() + 100).is_empty());
+    }
+
+    #[test]
+    fn indented_partial_property_word_offers_the_catalog() {
+        // `  wid` — a bare property key being typed on an indented line: offer all catalog
+        // property names (the client filters by `wid` → `width`). Deterministic, catalog order.
+        let src = "Button\n  wid\n";
+        let items = complete_at(src, at(src, "wid") + "wid".len());
+        assert_eq!(labels(&items), catalog::PROPERTIES);
+        assert!(items.iter().all(|i| i.kind == CompletionKind::Keyword));
+        assert!(items
+            .iter()
+            .all(|i| i.detail.as_deref() == Some("property")));
+    }
+
+    #[test]
+    fn property_key_context_is_deterministic() {
+        // The returned labels equal exactly the catalog set, in const (sorted) order.
+        let src = "Button\n  colo\n";
+        assert_eq!(
+            labels(&complete_at(src, at(src, "colo") + "colo".len())),
+            catalog::PROPERTIES
+        );
+    }
+
+    #[test]
+    fn empty_indented_position_offers_nothing() {
+        // DECISION (pinned): an empty indented slot (`  ` with no word yet) is ambiguous with a
+        // nested container tag about to be typed, so we require a non-empty word — precision over
+        // recall. Nothing is offered here.
+        let src = "Button\n  \n";
+        let offset = at(src, "  \n") + 2; // just past the two indent spaces
+        assert!(complete_at(src, offset).is_empty());
+    }
+
+    #[test]
+    fn completed_property_key_and_colon_offers_nothing() {
+        // `  width:` — past the `:` we are in VALUE position; property-value/color completion is
+        // deferred (needs per-property type metadata), so nothing is offered.
+        let src = "Button\n  width:\n";
+        let offset = at(src, "width:") + "width:".len();
+        assert!(complete_at(src, offset).is_empty());
+    }
+
+    #[test]
+    fn completed_property_word_followed_by_space_offers_nothing() {
+        // `  width ` — the key is complete and the cursor sits after a space (no `:` yet); the token
+        // is no longer being built, so nothing is offered.
+        let src = "Button\n  width \n";
+        let offset = at(src, "width ") + "width ".len();
+        assert!(complete_at(src, offset).is_empty());
+    }
+
+    #[test]
+    fn unindented_top_level_word_offers_nothing() {
+        // `Button` at column 0 is a widget/style-header, NOT a property → offer nothing.
+        let src = "Butt\n";
+        assert!(complete_at(src, at(src, "Butt") + "Butt".len()).is_empty());
+    }
+
+    #[test]
+    fn tab_indented_property_word_offers_nothing() {
+        // Tab indentation is a hard OTML parse error; no set may be offered on such a line — the key
+        // context honors the same guard as the closed sets.
+        let src = "Button\n\twid\n";
+        assert!(complete_at(src, at(src, "wid") + "wid".len()).is_empty());
+    }
+
+    #[test]
+    fn dotted_key_is_not_a_property_key() {
+        // A generic dotted key (`foo.bar`) is neither a property nor an `anchors.` object → nothing.
+        let src = "Button\n  foo.bar\n";
+        assert!(complete_at(src, at(src, "foo.bar") + "foo.bar".len()).is_empty());
+    }
+
+    #[test]
+    fn list_item_line_is_not_a_property_key() {
+        // A `- item` list line opens with `-`, which is not an IDENT start → nothing.
+        let src = "Button\n  - item\n";
+        assert!(complete_at(src, at(src, "- item") + "- item".len()).is_empty());
+        // ...even mid-word right after the dash.
+        assert!(complete_at(src, at(src, "- item") + "- ".len()).is_empty());
+    }
+
+    #[test]
+    fn special_form_keys_still_offer_their_own_sets_not_properties() {
+        // The property-key branch runs AFTER the special forms, so `$` / `@` / `anchors.` keep
+        // offering their own closed sets and never fall through to PROPERTIES.
+        let src = "Button\n  $\n";
+        assert_eq!(labels(&complete_at(src, at(src, "$") + 1)), schema::STATES);
+
+        let src = "Button\n  @onC\n";
+        assert_eq!(
+            labels(&complete_at(src, at(src, "@onC") + "@onC".len())),
+            schema::EVENTS
+        );
+
+        let src = "Widget\n  anchors.\n";
+        let mut edges: Vec<&str> = schema::ANCHOR_EDGES.to_vec();
+        edges.extend_from_slice(schema::SHORTHAND_ANCHORS);
+        assert_eq!(
+            labels(&complete_at(src, at(src, "anchors.") + "anchors.".len())),
+            edges
+        );
+    }
+
+    #[test]
+    fn property_key_suppressed_inside_block_scalar_and_comment() {
+        // A bare word inside a `|` block body is raw Lua, and one inside a full-line comment is
+        // prose — neither is a property key. The CST-suppression guard covers the key branch too.
+        let src = "Button\n  @onClick: |\n    width\n";
+        assert!(complete_at(src, at(src, "width\n") + "width".len()).is_empty());
+
+        let src = "Button\n  // width\n";
+        assert!(complete_at(src, at(src, "width\n") + "width".len()).is_empty());
     }
 
     #[test]
