@@ -1,0 +1,40 @@
+# CodeRabbit configuration — https://docs.coderabbit.ai/reference/configuration
+# Free for public/open-source repositories.
+language: en-US
+reviews:
+  # "chill" keeps the reviewer from being noisy; raise to "assertive" if you want
+  # more thorough (and chattier) reviews later.
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  auto_review:
+    enabled: true
+  # Don't review generated or lock files — they are machine-produced, not authored.
+  path_filters:
+    - "!crates/tree-sitter-otui/src/parser.c"
+    - "!crates/tree-sitter-otui/src/grammar.json"
+    - "!crates/tree-sitter-otui/src/node-types.json"
+    - "!crates/tree-sitter-otui/src/tree_sitter/**"
+    - "!Cargo.lock"
+  path_instructions:
+    - path: "crates/otui-core/**"
+      instructions: >
+        This is the pure, protocol-agnostic OTUI/OTML language engine. It must faithfully
+        mirror the OTClient engine, per docs/otui-language-service-spec.md. Flag any divergence
+        from these fidelity rules: an unknown/misspelled property name is a HINT, never an error
+        or warning (only border, display, layout and anchors.* validate their value and may
+        error); tab indentation and invalid depth jumps are hard errors; a $state name outside
+        the closed 14-name set is a HINT (never matches, but not an engine error); all spans are
+        byte offsets. Also flag any I/O or lsp-types dependency leaking into this crate — it must
+        stay pure.
+    - path: "crates/otui-lsp-server/**"
+      instructions: >
+        This is the thin LSP transport shell (tower-lsp + lsp-types). It must conform to LSP 3.17
+        (lifecycle, capability negotiation) and only convert between otui-core's byte offsets and
+        LSP positions (UTF-16 by default). Language semantics belong in otui-core, not here.
+    - path: "crates/tree-sitter-otui/grammar.js"
+      instructions: >
+        tree-sitter grammar for OTUI/OTML. When this changes, the committed generated files
+        (src/parser.c, src/grammar.json, src/node-types.json) must be regenerated and committed
+        together; CI enforces this. Review the grammar rules, not the generated output.
