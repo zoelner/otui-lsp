@@ -55,7 +55,10 @@
  (#any-of? @constant.builtin
   "active" "focus" "hover" "pressed" "checked" "disabled" "on"
   "first" "middle" "last" "alternate" "dragging" "hidden" "mobile"))
-(state_name) @variable.parameter
+((state_name) @variable.parameter
+ (#not-any-of? @variable.parameter
+  "active" "focus" "hover" "pressed" "checked" "disabled" "on"
+  "first" "middle" "last" "alternate" "dragging" "hidden" "mobile"))
 
 ; --- literals (§2.9, §2.1) --------------------------------------------------
 (color) @constant
