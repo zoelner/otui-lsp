@@ -130,6 +130,46 @@ pub struct SemanticToken {
     pub kind: SemanticTokenKind,
 }
 
+/// The category of a [`DocumentSymbol`] in the outline, protocol-agnostic.
+///
+/// Each variant is named after a standard LSP `SymbolKind` (the server crate is the only place
+/// that maps a variant to `lsp_types::SymbolKind`), but this enum knows nothing about LSP. The
+/// set is intentionally minimal — an OTUI outline is a tree of widgets, distinguished only by
+/// whether a widget carries an `id:`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolKind {
+    /// A widget with no `id:`: a bare container tag or a `Name < Base` style header, shown in
+    /// the outline under its type name.
+    Object,
+    /// A widget that declares an `id:`: the id names the widget, so it reads as a named field of
+    /// its parent in the outline.
+    Field,
+}
+
+/// One node of the widget-outline tree (spec §5.1): a widget and its nested widgets.
+///
+/// All spans are **byte offsets** into the source. `span` covers the whole widget node (used as
+/// the LSP `range`); `selection_span` covers just the name token — the `id:` value if the widget
+/// has one, else the container tag or the style `Name` — and is always contained within `span`
+/// (the LSP `selectionRange`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentSymbol {
+    /// Display name: the `id:` value if present, else the container tag / style `Name`.
+    pub name: String,
+    /// The widget's type, shown alongside the name: the container tag, or a style header's
+    /// `< Base`. `None` only if the type token is somehow absent.
+    pub detail: Option<String>,
+    /// Whether the widget is named by an id ([`SymbolKind::Field`]) or by its type
+    /// ([`SymbolKind::Object`]).
+    pub kind: SymbolKind,
+    /// Byte span of the whole widget node.
+    pub span: ByteSpan,
+    /// Byte span of the name token; always within [`span`](DocumentSymbol::span).
+    pub selection_span: ByteSpan,
+    /// Nested widgets, in source order.
+    pub children: Vec<DocumentSymbol>,
+}
+
 /// The contract every language backend implements. Kept intentionally minimal for now; symbols,
 /// completion and hover are added as the corresponding milestones land.
 pub trait LanguageService {
@@ -144,6 +184,12 @@ pub trait LanguageService {
     /// The returned tokens are leaf-level, sorted by span start, and non-overlapping — the
     /// invariants LSP semantic tokens require.
     fn semantic_tokens(&self, source: &str) -> Vec<SemanticToken>;
+
+    /// Build the document-symbol outline (the widget hierarchy) for a full source document.
+    ///
+    /// The result is a forest in source order: one [`DocumentSymbol`] per widget, with nested
+    /// widgets as children. Scalar properties are not symbols.
+    fn document_symbols(&self, source: &str) -> Vec<DocumentSymbol>;
 }
 
 #[cfg(test)]

@@ -13,9 +13,10 @@
 
 pub mod diagnostics;
 pub mod semantic;
+pub mod symbols;
 pub mod syntax;
 
-use lang_api::{Diagnostic, LanguageService, SemanticToken};
+use lang_api::{Diagnostic, DocumentSymbol, LanguageService, SemanticToken};
 
 /// The OTUI language backend. Constructed once per workspace/session.
 #[derive(Debug, Default)]
@@ -42,6 +43,11 @@ impl LanguageService for OtuiService {
     fn semantic_tokens(&self, source: &str) -> Vec<SemanticToken> {
         // Leaf-level highlight over the CST (spec §3 token taxonomy).
         semantic::tokens(source)
+    }
+
+    fn document_symbols(&self, source: &str) -> Vec<DocumentSymbol> {
+        // Widget-hierarchy outline over the CST (spec §5.1).
+        symbols::document_symbols(source)
     }
 }
 

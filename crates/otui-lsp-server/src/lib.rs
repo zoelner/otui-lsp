@@ -22,10 +22,11 @@ use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result as RpcResult;
 use tower_lsp::lsp_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    InitializeParams, InitializeResult, InitializedParams, MessageType, PositionEncodingKind,
-    SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
-    SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
-    TextDocumentSyncCapability, TextDocumentSyncKind, Url, WorkDoneProgressOptions,
+    DocumentSymbolParams, DocumentSymbolResponse, InitializeParams, InitializeResult,
+    InitializedParams, MessageType, OneOf, PositionEncodingKind, SemanticTokens,
+    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
+    TextDocumentSyncKind, Url, WorkDoneProgressOptions,
 };
 use tower_lsp::{Client, LanguageServer};
 
@@ -147,6 +148,8 @@ impl LanguageServer for Backend {
                         },
                     ),
                 ),
+                // Document symbols: the widget-hierarchy outline for a `.otui` document.
+                document_symbol_provider: Some(OneOf::Left(true)),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -189,6 +192,27 @@ impl LanguageServer for Backend {
             result_id: None,
             data,
         })))
+    }
+
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> RpcResult<Option<DocumentSymbolResponse>> {
+        let uri = params.text_document.uri;
+        // Serve from the stored document text; an unknown document has no outline.
+        let Some(text) = self
+            .documents
+            .read()
+            .await
+            .get(&uri)
+            .map(|doc| doc.text.clone())
+        else {
+            return Ok(None);
+        };
+
+        let core_syms = self.service.document_symbols(&text);
+        let lsp_syms = convert::symbols_to_lsp(&text, &core_syms, self.encoding());
+        Ok(Some(DocumentSymbolResponse::Nested(lsp_syms)))
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
