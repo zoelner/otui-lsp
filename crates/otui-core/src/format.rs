@@ -99,8 +99,33 @@ pub fn format(source: &str) -> Option<String> {
         out.push(line.text.to_owned());
     }
 
-    // Ensure exactly one trailing newline (rule 4), collapsing any trailing blank lines into it. An
-    // empty (or whitespace-only) document formats to the empty string rather than a lone newline.
+    // Ensure exactly one trailing newline (rule 4), collapsing any trailing blank lines into it —
+    // EXCEPT when the document ends inside a block-scalar body. A `|+` (keep-chomping) block scalar
+    // at EOF carries trailing blank lines that are semantically part of its body (spec §2.1); those
+    // trailing blanks fall *after* the `block_scalar_content` token but are still block-scalar body,
+    // so they must survive byte-for-byte like the rest of the body, never be collapsed.
+    let last_content = lines.iter().rposition(|l| !l.text.trim().is_empty());
+    let ends_in_block_scalar_tail = match last_content {
+        // The last non-blank line is a block-scalar body line AND at least one blank line follows it
+        // (a trailing blank the ordinary collapse would otherwise delete).
+        Some(idx) => {
+            idx + 1 < lines.len() && in_block_scalar(lines[idx].start, &block_scalar_spans)
+        }
+        None => false,
+    };
+
+    if ends_in_block_scalar_tail {
+        // Preserve the block scalar's trailing blank lines exactly. Re-render everything up to and
+        // including the last body line (`out[idx]` is that body line, emitted verbatim by rule 1),
+        // then append the original source bytes from the end of that line to EOF — its newline plus
+        // the trailing blank lines, byte-for-byte, including any final-newline state.
+        let idx = last_content.expect("a block-scalar tail implies a last content line");
+        let head = out[..=idx].join("\n");
+        let tail = &source[lines[idx].start + lines[idx].text.len()..];
+        return Some(format!("{head}{tail}"));
+    }
+
+    // An empty (or whitespace-only) document formats to the empty string rather than a lone newline.
     let joined = out.join("\n");
     let trimmed = joined.trim_end_matches('\n');
     if trimmed.is_empty() {
@@ -383,6 +408,39 @@ MainWindow < UIWindow
     }
 
     #[test]
+    fn ordinary_document_collapses_trailing_blank_lines() {
+        // Guard: with no trailing block scalar, trailing blank lines still collapse into a single
+        // final newline (scoping the block-scalar-tail exception correctly).
+        assert_eq!(fmt("Panel\n  id: a\n\n\n\n"), "Panel\n  id: a\n");
+        // The over-indented `id` is also normalized; only the trailing blanks are collapsed.
+        assert_eq!(fmt("Panel\n    id: a\n  \n\n"), "Panel\n  id: a\n");
+    }
+
+    #[test]
+    fn keep_chomped_block_scalar_trailing_blanks_at_eof_are_preserved() {
+        // A `|+` block scalar at EOF keeps its trailing blank lines as body content; they must
+        // survive byte-for-byte rather than collapse into a single final newline. The (over-indented)
+        // marker line is still normalized to depth 1, but the body and its trailing blanks are exact.
+        let src = "Panel\n    @onClick: |+\n        body()\n\n\n";
+        let out = fmt(src);
+        assert_eq!(out, "Panel\n  @onClick: |+\n        body()\n\n\n");
+        // The two trailing blank lines survive (three trailing newlines).
+        assert!(out.ends_with("body()\n\n\n"), "{out:?}");
+        // And re-formatting is a no-op (idempotent), never eroding the trailing blanks further.
+        assert_eq!(fmt(&out), out);
+    }
+
+    #[test]
+    fn plain_block_scalar_at_eof_keeps_its_trailing_blank_lines_verbatim() {
+        // The same protection applies to any block scalar whose body reaches EOF: the trailing blank
+        // lines are part of its (byte-for-byte) body, and a blank line carrying stray spaces is kept
+        // exactly as authored.
+        let src = "W\n  @x: |\n    a()\n   \n\n";
+        assert_eq!(fmt(src), src);
+        assert_eq!(fmt(src), fmt(&fmt(src)));
+    }
+
+    #[test]
     fn blank_lines_are_preserved_and_emptied() {
         // An interior blank line stays (blank), with any stray indentation removed.
         let src = "Panel\n  id: a\n   \n  id: b\n";
@@ -486,6 +544,7 @@ Panel
             "Button\n  $hover:\n      color:red\n  anchors.top:parent.top\n",
             "items:\n    - one\n\n    - two\n",
             "W\n  x:[a,\n     b, c]\n// note\n",
+            "Panel\n  @onClick: |+\n    body()\n\n\n",
             "",
             "   \n\n",
         ];
