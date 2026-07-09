@@ -12,9 +12,10 @@
 //! tree-sitter [`syntax`] substrate.
 
 pub mod diagnostics;
+pub mod semantic;
 pub mod syntax;
 
-use lang_api::{Diagnostic, LanguageService};
+use lang_api::{Diagnostic, LanguageService, SemanticToken};
 
 /// The OTUI language backend. Constructed once per workspace/session.
 #[derive(Debug, Default)]
@@ -36,6 +37,11 @@ impl LanguageService for OtuiService {
     fn diagnostics(&self, source: &str) -> Vec<Diagnostic> {
         // Parse-level category of spec §4: indentation faults plus structural parse errors.
         diagnostics::analyze(source)
+    }
+
+    fn semantic_tokens(&self, source: &str) -> Vec<SemanticToken> {
+        // Leaf-level highlight over the CST (spec §3 token taxonomy).
+        semantic::tokens(source)
     }
 }
 

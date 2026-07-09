@@ -85,6 +85,30 @@ impl<'a> LineIndex<'a> {
         }
     }
 
+    /// The length of the `[start, end)` byte span measured in `encoding` code units — the unit
+    /// LSP semantic-token `length` fields are counted in (UTF-16 code units by default, so a
+    /// multi-byte character contributes fewer units than its byte length).
+    ///
+    /// Offsets are clamped to the text and to char boundaries, mirroring [`position`](Self::position).
+    pub fn encoded_len(&self, start: usize, end: usize, encoding: PositionEncoding) -> u32 {
+        let mut start = start.min(self.text.len());
+        let mut end = end.min(self.text.len());
+        while !self.text.is_char_boundary(start) {
+            start -= 1;
+        }
+        while !self.text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if start >= end {
+            return 0;
+        }
+        let slice = &self.text[start..end];
+        match encoding {
+            PositionEncoding::Utf8 => slice.len() as u32,
+            PositionEncoding::Utf16 => slice.chars().map(|c| c.len_utf16() as u32).sum(),
+        }
+    }
+
     /// Convert a `[start, end)` byte span into an LSP [`Range`].
     pub fn range(&self, start: usize, end: usize, encoding: PositionEncoding) -> Range {
         Range {
@@ -174,6 +198,17 @@ mod tests {
             idx.position(4, PositionEncoding::Utf16),
             Position::new(0, 3)
         );
+    }
+
+    #[test]
+    fn encoded_len_counts_utf16_units_not_bytes() {
+        // "café" — 'é' is 2 UTF-8 bytes but 1 UTF-16 code unit, so byte span 0..5 is 4 UTF-16
+        // units and 5 UTF-8 bytes.
+        let idx = LineIndex::new("café");
+        assert_eq!(idx.encoded_len(0, 5, PositionEncoding::Utf16), 4);
+        assert_eq!(idx.encoded_len(0, 5, PositionEncoding::Utf8), 5);
+        // A char landing on a non-boundary end clamps down.
+        assert_eq!(idx.encoded_len(0, 4, PositionEncoding::Utf16), 3);
     }
 
     #[test]
