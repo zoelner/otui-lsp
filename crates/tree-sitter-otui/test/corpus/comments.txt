@@ -1,8 +1,22 @@
 ================================================================================
-line and hash comments
+line comment at document start
 ================================================================================
 
 // a full-line comment
+title: value
+
+--------------------------------------------------------------------------------
+
+(document
+  (comment)
+  (property
+    key: (property_key)
+    value: (identifier)))
+
+================================================================================
+hash comment at document start
+================================================================================
+
 # a hash comment
 title: value
 
@@ -10,7 +24,45 @@ title: value
 
 (document
   (comment)
-  (comment)
   (property
     key: (property_key)
     value: (identifier)))
+
+================================================================================
+hash comment is indentation-neutral (does not close a block)
+================================================================================
+
+Button
+  id: x
+# a dedented comment
+  color: red
+
+--------------------------------------------------------------------------------
+
+(document
+  (container
+    tag: (tag)
+    (id_property
+      key: (id_key)
+      value: (identifier))
+    (property
+      key: (property_key)
+      value: (identifier))))
+
+================================================================================
+hash freeze header is not a comment
+================================================================================
+
+#Panel < UIWidget
+  id: p
+
+--------------------------------------------------------------------------------
+
+(document
+  (style_header
+    freeze: (freeze_marker)
+    name: (style_name)
+    base: (style_base)
+    (id_property
+      key: (id_key)
+      value: (identifier))))

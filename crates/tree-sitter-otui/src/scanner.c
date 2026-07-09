@@ -151,6 +151,7 @@ bool tree_sitter_otui_external_scanner_scan(void *payload, TSLexer *lexer,
     } else if (lexer->eof(lexer)) {
       found_line_end = true;
       indent = 0;
+      lexer->mark_end(lexer);
       break;
     } else if (lexer->lookahead == '/') {
       // Possible `//` comment line: treat as blank for indentation purposes so
@@ -162,9 +163,29 @@ bool tree_sitter_otui_external_scanner_scan(void *payload, TSLexer *lexer,
         }
         // loop again; the trailing newline resets indent
       } else {
+        lexer->mark_end(lexer);
         break; // a lone '/', let the internal lexer handle it
       }
+    } else if (lexer->lookahead == '#') {
+      // Distinguish a `#` full-line comment (§2.1: indentation-neutral, like
+      // `//`) from a `#Name < Base` freeze header (real content). They differ
+      // only by the char after `#`, so peek past it. `mark_end` is set to the
+      // position of `#` *before* advancing, so on the freeze-header path the `#`
+      // is handed back to the internal lexer un-consumed.
+      lexer->mark_end(lexer);
+      advance(lexer);
+      if (lexer->lookahead == ' ' || lexer->lookahead == '\t') {
+        // A `# ` comment: skip the rest of the line, indentation-neutral. The
+        // stale `mark_end` set above is overwritten by whichever break follows.
+        while (lexer->lookahead != '\n' && !lexer->eof(lexer)) {
+          skip(lexer);
+        }
+        // loop again; the trailing newline resets indent
+      } else {
+        break; // `#Name` freeze header — re-lexed from the marked end
+      }
     } else {
+      lexer->mark_end(lexer);
       break; // real content
     }
   }

@@ -92,30 +92,46 @@ module.exports = grammar({
     ),
 
     // --- @tag: / &tag: / !tag: Lua-bearing properties (§2.5-2.7) ------------
+    // The post-colon value of these is raw Lua source. An inline (single-line)
+    // value is captured verbatim as ONE `lua_value` node — it may contain
+    // commas, parens, quotes, dots, `#` (Lua length operator), etc. — rather
+    // than being split into scalar atoms. Multi-line bodies keep using the
+    // `|` / `|-` / `|+` block-scalar form. Both are the injection targets for
+    // the embedded-Lua grammar (see queries/injections.scm).
     event_property: $ => seq(
       field('key', seq('@', alias(token.immediate(IDENT), $.event_name))),
       ':',
-      field('value', optional($._value)),
+      field('value', optional(choice($.block_scalar, $.lua_value))),
       choice($._newline, $._block),
     ),
 
+    // `&tag:` values are Lua too, EXCEPT the §2.6 carve-out: a value starting
+    // with a literal `#` is pushed as a plain string (a color/hex literal),
+    // never evaluated — so it becomes a `hash_literal` node and is NOT
+    // lua-injected. Everything else is inline Lua.
     alias_property: $ => seq(
       field('key', seq('&', alias(token.immediate(IDENT), $.alias_name))),
       ':',
-      field('value', optional($._value)),
+      field('value', optional(choice(
+        $.block_scalar,
+        $.hash_literal,
+        $.lua_value,
+      ))),
       choice($._newline, $._block),
     ),
 
     expr_property: $ => seq(
       field('key', seq('!', alias(token.immediate(IDENT), $.expr_name))),
       ':',
-      field('value', optional($._value)),
+      field('value', optional(choice($.block_scalar, $.lua_value))),
       choice($._newline, $._block),
     ),
 
     // --- anchors.<edge>: <target> (§2.4) ------------------------------------
+    // The object is specifically the literal keyword `anchors`; a generic
+    // dotted key (`foo.left:`) is NOT an anchor.
     anchor_property: $ => seq(
-      field('object', alias($.property_key, $.anchor_keyword)),
+      field('object', alias('anchors', $.anchor_keyword)),
       token.immediate('.'),
       field('edge', alias(token.immediate(IDENT), $.anchor_edge)),
       ':',
@@ -206,6 +222,17 @@ module.exports = grammar({
     ),
 
     block_scalar_marker: $ => token(choice('|', '|-', '|+')),
+
+    // A whole single-line inline Lua value (`@`/`!`/`&` bodies): everything from
+    // the first non-space after `:` up to end-of-line, as one raw token. Lowest
+    // precedence so a `|` block marker, a `#` carve-out literal, or the null `~`
+    // still win where they apply.
+    lua_value: $ => token(prec(-1, /[^ \t\r\n][^\r\n]*/)),
+
+    // A `&tag:` value beginning with `#` (§2.6 carve-out): a hex/color/string
+    // literal pushed verbatim, never Lua-evaluated. Higher precedence than
+    // `lua_value` so it claims any `#`-leading alias value.
+    hash_literal: $ => token(prec(1, /#[^\r\n]*/)),
 
     // color literals (§2.9): hex + functional forms
     color: $ => token(prec(3, choice(

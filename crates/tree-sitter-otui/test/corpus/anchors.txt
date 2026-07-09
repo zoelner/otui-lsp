@@ -31,3 +31,27 @@ Widget
       edge: (anchor_edge)
       value: (anchor_target
         target: (identifier)))))
+
+================================================================================
+anchor shorthands: centerIn and the none reset
+================================================================================
+
+Widget
+  anchors.centerIn: parent
+  anchors.top: none
+
+--------------------------------------------------------------------------------
+
+(document
+  (container
+    tag: (tag)
+    (anchor_property
+      object: (anchor_keyword)
+      edge: (anchor_edge)
+      value: (anchor_target
+        target: (identifier)))
+    (anchor_property
+      object: (anchor_keyword)
+      edge: (anchor_edge)
+      value: (anchor_target
+        target: (identifier)))))

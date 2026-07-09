@@ -10,10 +10,13 @@
 (style_header "<" @operator)
 (freeze_marker) @punctuation.special
 
-; A base beginning with "UI" resolves to a built-in native widget class.
+; A base beginning with "UI" resolves to a built-in native widget class;
+; anything else is a file-defined style. The two are mutually exclusive via
+; predicates so the distinction holds regardless of capture/match order.
 ((style_base) @type.builtin
  (#match? @type.builtin "^UI"))
-(style_base) @type
+((style_base) @type
+ (#not-match? @type "^UI"))
 
 ; --- widget / container tags (§2.1) -----------------------------------------
 (container tag: (tag) @type)
@@ -21,8 +24,9 @@
 ; --- property keys (§2.10) --------------------------------------------------
 (property key: (property_key) @property)
 
-; id: is a definition target (§2.3)
-(id_property key: (id_key) @property)
+; id: is a definition target (§2.3), distinct from a generic property. The
+; predicate makes the keyword classification order-independent (the `id_key`
+; node is only ever the literal "id").
 ((id_key) @keyword
  (#eq? @keyword "id"))
 
@@ -55,6 +59,8 @@
 
 ; --- literals (§2.9, §2.1) --------------------------------------------------
 (color) @constant
+; A `&tag:` `#`-carve-out value (§2.6): a hex/color/string literal, not Lua.
+(hash_literal) @constant
 (number) @number
 (boolean) @constant.builtin
 (null) @constant.builtin

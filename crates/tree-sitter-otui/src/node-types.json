@@ -18,7 +18,7 @@
         ]
       },
       "value": {
-        "multiple": true,
+        "multiple": false,
         "required": false,
         "types": [
           {
@@ -26,35 +26,11 @@
             "named": true
           },
           {
-            "type": "boolean",
+            "type": "hash_literal",
             "named": true
           },
           {
-            "type": "color",
-            "named": true
-          },
-          {
-            "type": "identifier",
-            "named": true
-          },
-          {
-            "type": "inline_array",
-            "named": true
-          },
-          {
-            "type": "null",
-            "named": true
-          },
-          {
-            "type": "number",
-            "named": true
-          },
-          {
-            "type": "string",
-            "named": true
-          },
-          {
-            "type": "variable",
+            "type": "lua_value",
             "named": true
           }
         ]
@@ -110,11 +86,6 @@
         }
       ]
     }
-  },
-  {
-    "type": "anchor_keyword",
-    "named": true,
-    "fields": {}
   },
   {
     "type": "anchor_property",
@@ -340,7 +311,7 @@
         ]
       },
       "value": {
-        "multiple": true,
+        "multiple": false,
         "required": false,
         "types": [
           {
@@ -348,35 +319,7 @@
             "named": true
           },
           {
-            "type": "boolean",
-            "named": true
-          },
-          {
-            "type": "color",
-            "named": true
-          },
-          {
-            "type": "identifier",
-            "named": true
-          },
-          {
-            "type": "inline_array",
-            "named": true
-          },
-          {
-            "type": "null",
-            "named": true
-          },
-          {
-            "type": "number",
-            "named": true
-          },
-          {
-            "type": "string",
-            "named": true
-          },
-          {
-            "type": "variable",
+            "type": "lua_value",
             "named": true
           }
         ]
@@ -452,7 +395,7 @@
         ]
       },
       "value": {
-        "multiple": true,
+        "multiple": false,
         "required": false,
         "types": [
           {
@@ -460,35 +403,7 @@
             "named": true
           },
           {
-            "type": "boolean",
-            "named": true
-          },
-          {
-            "type": "color",
-            "named": true
-          },
-          {
-            "type": "identifier",
-            "named": true
-          },
-          {
-            "type": "inline_array",
-            "named": true
-          },
-          {
-            "type": "null",
-            "named": true
-          },
-          {
-            "type": "number",
-            "named": true
-          },
-          {
-            "type": "string",
-            "named": true
-          },
-          {
-            "type": "variable",
+            "type": "lua_value",
             "named": true
           }
         ]
@@ -1038,6 +953,10 @@
     "named": true
   },
   {
+    "type": "anchor_keyword",
+    "named": true
+  },
+  {
     "type": "block_scalar_content",
     "named": true
   },
@@ -1066,11 +985,19 @@
     "named": true
   },
   {
+    "type": "hash_literal",
+    "named": true
+  },
+  {
     "type": "id_key",
     "named": true
   },
   {
     "type": "identifier",
+    "named": true
+  },
+  {
+    "type": "lua_value",
     "named": true
   },
   {

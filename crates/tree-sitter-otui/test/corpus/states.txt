@@ -36,3 +36,23 @@ Button
       (property
         key: (property_key)
         value: (color)))))
+
+================================================================================
+unknown state name parses structurally like a state selector
+================================================================================
+
+Button
+  $foo:
+    color: red
+
+--------------------------------------------------------------------------------
+
+(document
+  (container
+    tag: (tag)
+    (state_selector
+      (state
+        name: (state_name))
+      (property
+        key: (property_key)
+        value: (identifier)))))

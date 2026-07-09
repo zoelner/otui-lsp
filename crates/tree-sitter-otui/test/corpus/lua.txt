@@ -26,7 +26,7 @@ Button
         (block_scalar_content)))
     (alias_property
       key: (alias_name)
-      value: (color))
+      value: (hash_literal))
     (alias_property
       key: (alias_name)
       value: (block_scalar
@@ -34,7 +34,35 @@ Button
         (block_scalar_content)))
     (expr_property
       key: (expr_name)
-      value: (identifier))
+      value: (lua_value))
     (property
       key: (property_key)
       value: (variable))))
+
+================================================================================
+inline lua values with commas, parens and quotes
+================================================================================
+
+Button
+  @onClick: g_game.talk(1, 2)
+  !text: tr('Some label')
+  &handler: computeThing()
+  &color: #ff0000
+
+--------------------------------------------------------------------------------
+
+(document
+  (container
+    tag: (tag)
+    (event_property
+      key: (event_name)
+      value: (lua_value))
+    (expr_property
+      key: (expr_name)
+      value: (lua_value))
+    (alias_property
+      key: (alias_name)
+      value: (lua_value))
+    (alias_property
+      key: (alias_name)
+      value: (hash_literal))))
