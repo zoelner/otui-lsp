@@ -16,9 +16,10 @@
 //!    the two spec §4 checks those sets enable: an unknown `$state` selector name
 //!    ([`UNKNOWN_STATE`], a *hint* — the engine never errors on it, it just never matches) and an
 //!    invalid anchor edge ([`INVALID_ANCHOR_EDGE`], an *error* — `anchors.*` is one of the four
-//!    value-validating properties of spec §2.10), and an unknown ordinary property name
-//!    ([`UNKNOWN_PROPERTY`], a *hint* — the engine silently applies-or-ignores a tag it does not
-//!    recognize, so a misspelled/unknown property never errors, it just has no effect).
+//!    value-validating properties of spec §2.10: `border`, `display`, `layout`, `anchors.*`), and an
+//!    unknown ordinary property name ([`UNKNOWN_PROPERTY`], a *hint* — the engine silently *ignores*
+//!    a tag it does not recognize, so a misspelled/unknown property never errors, it just has no
+//!    effect).
 
 use crate::schema;
 use crate::syntax::SyntaxTree;
@@ -42,10 +43,11 @@ pub const UNKNOWN_STATE: &str = "unknown-state";
 /// four *value-validating* properties (spec §2.10), so the engine throws on a bad edge.
 pub const INVALID_ANCHOR_EDGE: &str = "invalid-anchor-edge";
 /// Diagnostic code: an ordinary property key that is not a known OTML property name (spec §2.10,
-/// §4). Severity [`Severity::Hint`]: the engine silently applies-or-ignores an unrecognized tag
+/// §4). Severity [`Severity::Hint`]: the engine silently *ignores* an unrecognized tag
 /// (`node->tag()` matches nothing), so a misspelled/unknown property is never an error or warning —
-/// only a gentle hint that the property will have no effect. Value validation (border/display/
-/// layout/color) is a separate concern; this check is the unknown-KEY hint only.
+/// only a gentle hint that the property will have no effect. Value validation of the four
+/// value-validating properties (`border`, `display`, `layout`, `anchors.*`) is a separate concern;
+/// this check is the unknown-KEY hint only.
 pub const UNKNOWN_PROPERTY: &str = "unknown-property";
 
 /// Computes all parse-level diagnostics for `source`.
@@ -347,8 +349,9 @@ fn check_anchor_property(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>
 /// unknown property: `anchors.<edge>` (`anchor_property`), `@event`/`&alias`/`!expr` Lua-bearing tags
 /// (`event_property`/`alias_property`/`expr_property`), `id:` (`id_property`), `$state` selectors
 /// (`state_selector`), list items (`list_item`), and a nested widget / style header
-/// (`container`/`style_header`). Property VALUES are intentionally not validated here (border/
-/// display/layout/color value validation is a separate node); this is the unknown-KEY hint only.
+/// (`container`/`style_header`). Property VALUES are intentionally not validated here (the
+/// `border`/`display`/`layout`/`anchors.*` value validation is a separate node); this is the
+/// unknown-KEY hint only.
 ///
 /// Membership is [`schema::is_known_property`], an exact case-sensitive compare (the engine
 /// dispatches on `node->tag() == "..."`), so a mis-cased `Width` is unknown → hint. That is faithful.
@@ -379,7 +382,7 @@ fn check_property(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
         out.push(Diagnostic {
             severity: Severity::Hint,
             code: UNKNOWN_PROPERTY,
-            message: format!("unknown property `{name}`: applied-or-ignored, has no effect"),
+            message: format!("unknown property `{name}`: ignored by the engine, has no effect"),
             span: SyntaxTree::span_of(key),
         });
     }
