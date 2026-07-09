@@ -41,10 +41,10 @@ label: BareWord
     value: (null))
   (property
     key: (property_key)
-    value: (identifier)))
+    value: (plain_value)))
 
 ================================================================================
-space-separated value atoms
+space-separated value atoms are one plain value to end-of-line
 ================================================================================
 
 pos: 10 20
@@ -55,13 +55,10 @@ border: 1 solid #ffffff
 (document
   (property
     key: (property_key)
-    value: (number)
-    value: (number))
+    value: (plain_value))
   (property
     key: (property_key)
-    value: (number)
-    value: (identifier)
-    value: (color)))
+    value: (plain_value)))
 
 ================================================================================
 inline arrays

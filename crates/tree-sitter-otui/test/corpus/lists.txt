@@ -10,8 +10,8 @@ list items
 
 (document
   (list_item
-    value: (identifier))
+    value: (plain_value))
   (list_item
-    value: (identifier))
+    value: (plain_value))
   (list_item
-    value: (identifier)))
+    value: (plain_value)))

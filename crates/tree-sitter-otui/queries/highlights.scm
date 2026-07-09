@@ -8,7 +8,6 @@
 ; --- Name < Base style headers (§2.2) ---------------------------------------
 (style_header name: (style_name) @type)
 (style_header "<" @operator)
-(freeze_marker) @punctuation.special
 
 ; A base beginning with "UI" resolves to a built-in native widget class;
 ; anything else is a file-defined style. The two are mutually exclusive via
@@ -70,6 +69,8 @@
 (string) @string
 (variable) @variable
 (identifier) @string
+; An untyped scalar value spanning to end-of-line (§ faithful to parseNode).
+(plain_value) @string
 
 ; --- structural punctuation -------------------------------------------------
 (block_scalar_marker) @punctuation.special

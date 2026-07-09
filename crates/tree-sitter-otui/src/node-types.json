@@ -450,7 +450,7 @@
         ]
       },
       "value": {
-        "multiple": true,
+        "multiple": false,
         "required": false,
         "types": [
           {
@@ -466,10 +466,6 @@
             "named": true
           },
           {
-            "type": "identifier",
-            "named": true
-          },
-          {
             "type": "inline_array",
             "named": true
           },
@@ -479,6 +475,10 @@
           },
           {
             "type": "number",
+            "named": true
+          },
+          {
+            "type": "plain_value",
             "named": true
           },
           {
@@ -533,7 +533,7 @@
     "named": true,
     "fields": {
       "value": {
-        "multiple": true,
+        "multiple": false,
         "required": false,
         "types": [
           {
@@ -549,10 +549,6 @@
             "named": true
           },
           {
-            "type": "identifier",
-            "named": true
-          },
-          {
             "type": "inline_array",
             "named": true
           },
@@ -562,6 +558,10 @@
           },
           {
             "type": "number",
+            "named": true
+          },
+          {
+            "type": "plain_value",
             "named": true
           },
           {
@@ -591,7 +591,7 @@
         ]
       },
       "value": {
-        "multiple": true,
+        "multiple": false,
         "required": false,
         "types": [
           {
@@ -607,10 +607,6 @@
             "named": true
           },
           {
-            "type": "identifier",
-            "named": true
-          },
-          {
             "type": "inline_array",
             "named": true
           },
@@ -620,6 +616,10 @@
           },
           {
             "type": "number",
+            "named": true
+          },
+          {
+            "type": "plain_value",
             "named": true
           },
           {
@@ -785,16 +785,6 @@
           }
         ]
       },
-      "freeze": {
-        "multiple": false,
-        "required": false,
-        "types": [
-          {
-            "type": "freeze_marker",
-            "named": true
-          }
-        ]
-      },
       "name": {
         "multiple": false,
         "required": true,
@@ -949,10 +939,6 @@
     "named": true
   },
   {
-    "type": "freeze_marker",
-    "named": true
-  },
-  {
     "type": "hash_literal",
     "named": true
   },
@@ -974,6 +960,10 @@
   },
   {
     "type": "number",
+    "named": true
+  },
+  {
+    "type": "plain_value",
     "named": true
   },
   {

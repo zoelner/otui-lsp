@@ -55,4 +55,4 @@ Button
         name: (state_name))
       (property
         key: (property_key)
-        value: (identifier)))))
+        value: (plain_value)))))

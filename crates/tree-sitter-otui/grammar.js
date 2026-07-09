@@ -25,6 +25,15 @@ module.exports = grammar({
     $._indent,
     $._dedent,
     $.block_scalar_content,
+    // A plain (untyped, unquoted) scalar value: the whole rest of the line
+    // after the first `:`, trimmed. Emitted by the external scanner, which
+    // reads the value and declines (so the internal lexer produces the typed
+    // node instead) only when the value is EXACTLY one typed literal
+    // (number / color / boolean / `~` / `$var` / quoted string) or begins a
+    // `[` array / `|` block scalar. This is the lexical "anchor to newline"
+    // that makes a typed literal win only when it is the whole value — token
+    // precedence alone cannot express it (precedence outranks match length).
+    $.plain_value,
     $._error_sentinel,
   ],
 
@@ -62,18 +71,23 @@ module.exports = grammar({
     ),
 
     // --- comments (full line only) ------------------------------------------
-    // `//` starts a comment anywhere; `#` only starts a comment when followed
-    // by whitespace, which keeps `#Name < Base` freeze headers unambiguous.
-    // Declared in `extras` (see above): a single token with no trailing
-    // `_newline`, so it can float between statements at any indentation.
+    // Faithful to the OTClient OTML parser (`parseLine`): after trimming
+    // leading whitespace, a line that starts with `//` or `#` is a comment —
+    // UNCONDITIONALLY. There is no "`#` only when followed by whitespace" rule
+    // and no freeze/`#Name < Base` exception; `#Panel < UIWidget` is a comment.
+    // A mid-line / trailing `//` or `#` is NOT a comment (it is value data,
+    // handled by `plain_value` below). Declared in `extras`: a single token
+    // with no trailing `_newline`, so it can float between statements at any
+    // indentation.
     comment: $ => token(choice(
       seq('//', /[^\n]*/),
-      seq('#', /[ \t]/, /[^\n]*/),
+      seq('#', /[^\n]*/),
     )),
 
     // --- Name < Base style header (§2.2) ------------------------------------
+    // Just `Name < Base` — inheritance only (`importStyleFromOTML` splits on
+    // `<`). There is no freeze marker: a leading `#` makes the line a comment.
     style_header: $ => seq(
-      optional(field('freeze', alias('#', $.freeze_marker))),
       field('name', $.style_name),
       '<',
       field('base', $.style_base),
@@ -182,25 +196,29 @@ module.exports = grammar({
     ),
 
     // --- values -------------------------------------------------------------
+    // Faithful to `parseNode`: the value is the ENTIRE remainder of the line
+    // after the first `:`, trimmed (`line.substr(dotsPos + 1)`). So an
+    // unquoted, untyped scalar is one `plain_value` node spanning to
+    // end-of-line — `text: Hello World` is the single value `Hello World`, and
+    // `width: 10 // x` is the single value `10 // x` (the `//` is data).
+    //
+    // A typed literal wins only when it is the WHOLE value: color, number,
+    // boolean, `~` null, `$var`, quoted string, `[..]` inline array, or a
+    // `|`/`|-`/`|+` block scalar. Otherwise the value is the external
+    // `plain_value` (the greedy rest-of-line, decided by the scanner).
     _value: $ => choice(
       $.null,
       $.inline_array,
       $.block_scalar,
-      $._scalar_sequence,
-    ),
-
-    _scalar_sequence: $ => prec.left(repeat1($._scalar)),
-
-    _scalar: $ => choice(
       $.color,
       $.number,
       $.boolean,
       $.variable,
       $.string,
-      $.identifier,
+      $.plain_value,
     ),
 
-    null: $ => '~',
+    null: $ => token(prec(2, '~')),
 
     inline_array: $ => seq(
       '[',
@@ -255,10 +273,10 @@ module.exports = grammar({
     // $name variable reference (resolved from a matching &tag:)
     variable: $ => token(prec(2, /\$[A-Za-z_][A-Za-z0-9_.\-]*/)),
 
-    string: $ => token(choice(
+    string: $ => token(prec(2, choice(
       /"([^"\\\n]|\\.)*"/,
       /'([^'\\\n]|\\.)*'/,
-    )),
+    ))),
 
     // A bare unquoted word inside a value: anything up to whitespace/comma or a
     // bracket (so inline-array delimiters are never swallowed).

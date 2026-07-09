@@ -11,7 +11,7 @@ title: value
   (comment)
   (property
     key: (property_key)
-    value: (identifier)))
+    value: (plain_value)))
 
 ================================================================================
 hash comment at document start
@@ -26,7 +26,39 @@ title: value
   (comment)
   (property
     key: (property_key)
-    value: (identifier)))
+    value: (plain_value)))
+
+================================================================================
+a comment marker with no following space is still a comment
+================================================================================
+
+#nospace
+//nospace
+title: value
+
+--------------------------------------------------------------------------------
+
+(document
+  (comment)
+  (comment)
+  (property
+    key: (property_key)
+    value: (plain_value)))
+
+================================================================================
+a leading # is a comment, not a style header
+================================================================================
+
+#Panel < UIWidget
+title: value
+
+--------------------------------------------------------------------------------
+
+(document
+  (comment)
+  (property
+    key: (property_key)
+    value: (plain_value)))
 
 ================================================================================
 hash comment is indentation-neutral (does not close a block)
@@ -44,11 +76,11 @@ Button
     tag: (tag)
     (id_property
       key: (id_key)
-      value: (identifier))
+      value: (plain_value))
     (comment)
     (property
       key: (property_key)
-      value: (identifier))))
+      value: (plain_value))))
 
 ================================================================================
 slash comment at block indentation yields a comment node inside the block
@@ -66,7 +98,7 @@ Panel
     (comment)
     (id_property
       key: (id_key)
-      value: (identifier))))
+      value: (plain_value))))
 
 ================================================================================
 hash comment at block indentation yields a comment node inside the block
@@ -84,7 +116,7 @@ Panel
     (comment)
     (id_property
       key: (id_key)
-      value: (identifier))))
+      value: (plain_value))))
 
 ================================================================================
 comment indented deeper than the block is neutral (no spurious indent/dedent)
@@ -102,26 +134,25 @@ Panel
     tag: (tag)
     (id_property
       key: (id_key)
-      value: (identifier))
+      value: (plain_value))
     (comment)
     (property
       key: (property_key)
-      value: (identifier))))
+      value: (plain_value))))
 
 ================================================================================
-hash freeze header is not a comment
+a trailing // or # is value data, not a comment
 ================================================================================
 
-#Panel < UIWidget
-  id: p
+width: 10 // trailing
+text: Press # go
 
 --------------------------------------------------------------------------------
 
 (document
-  (style_header
-    freeze: (freeze_marker)
-    name: (style_name)
-    base: (style_base)
-    (id_property
-      key: (id_key)
-      value: (identifier))))
+  (property
+    key: (property_key)
+    value: (plain_value))
+  (property
+    key: (property_key)
+    value: (plain_value)))

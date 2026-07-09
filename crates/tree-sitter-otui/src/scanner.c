@@ -23,6 +23,7 @@ enum TokenType {
   INDENT,
   DEDENT,
   BLOCK_SCALAR_CONTENT,
+  PLAIN_VALUE,
   ERROR_SENTINEL,
 };
 
@@ -145,14 +146,171 @@ static uint32_t peek_next_real_indent(TSLexer *lexer) {
       return indent; // lone `/`: real content
     }
     if (lexer->lookahead == '#') {
-      advance(lexer);
-      if (lexer->lookahead == ' ' || lexer->lookahead == '\t') {
-        continue; // another `# ` comment: skip
-      }
-      return indent; // `#Name` freeze header: real content
+      continue; // another full-line `#` comment: skip (unconditional)
     }
     return indent; // real content
   }
+}
+
+// --- plain-value scanning ---------------------------------------------------
+//
+// A regular property/id/list value is the whole rest of the line after the
+// first `:`, trimmed (faithful to otmlparser `parseNode`: `line.substr(dotsPos
+// + 1)`). It is emitted as a single PLAIN_VALUE token — UNLESS the trimmed
+// value is exactly one typed literal, in which case the scanner declines and
+// the internal lexer produces the typed node (color/number/boolean/`~`/`$var`/
+// string) or the grammar parses the `[` array / `|` block scalar. This lexical
+// decision is what makes a typed literal win only when it is the WHOLE value.
+
+static bool is_hex(char c) {
+  return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+         (c >= 'A' && c <= 'F');
+}
+static bool is_digit(char c) { return c >= '0' && c <= '9'; }
+
+// number: -?\d+(\.\d+)?%?
+static bool is_number(const char *b, uint32_t n) {
+  uint32_t i = 0;
+  if (i < n && b[i] == '-') i++;
+  uint32_t d = 0;
+  while (i < n && is_digit(b[i])) { i++; d++; }
+  if (d == 0) return false;
+  if (i < n && b[i] == '.') {
+    i++;
+    uint32_t f = 0;
+    while (i < n && is_digit(b[i])) { i++; f++; }
+    if (f == 0) return false;
+  }
+  if (i < n && b[i] == '%') i++;
+  return i == n;
+}
+
+// hex color: #[0-9a-fA-F]{3,4,6,8}
+static bool is_hex_color(const char *b, uint32_t n) {
+  if (n < 4 || b[0] != '#') return false;
+  uint32_t h = n - 1;
+  if (h != 3 && h != 4 && h != 6 && h != 8) return false;
+  for (uint32_t i = 1; i < n; i++) {
+    if (!is_hex(b[i])) return false;
+  }
+  return true;
+}
+
+static bool starts_with(const char *b, uint32_t n, const char *p) {
+  uint32_t i = 0;
+  for (; p[i]; i++) {
+    if (i >= n || b[i] != p[i]) return false;
+  }
+  return true;
+}
+
+// functional color: (rgb|rgba|hsl|hsla)\([^)]*\) spanning the whole value.
+static bool is_func_color(const char *b, uint32_t n) {
+  uint32_t open;
+  if (starts_with(b, n, "rgba(") || starts_with(b, n, "hsla(")) {
+    open = 5;
+  } else if (starts_with(b, n, "rgb(") || starts_with(b, n, "hsl(")) {
+    open = 4;
+  } else {
+    return false;
+  }
+  if (b[n - 1] != ')') return false;
+  // No `)` before the final one (grammar uses [^)]*).
+  for (uint32_t i = open; i < n - 1; i++) {
+    if (b[i] == ')') return false;
+  }
+  return true;
+}
+
+// $name variable: \$[A-Za-z_][A-Za-z0-9_.\-]*
+static bool is_variable(const char *b, uint32_t n) {
+  if (n < 2 || b[0] != '$') return false;
+  char c = b[1];
+  if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_'))
+    return false;
+  for (uint32_t i = 2; i < n; i++) {
+    c = b[i];
+    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+          (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-'))
+      return false;
+  }
+  return true;
+}
+
+// quoted string spanning the whole value: "..." or '...' with \-escapes and no
+// unescaped closing quote before the end (grammar: ([^q\\\n]|\\.)*).
+static bool is_string(const char *b, uint32_t n) {
+  if (n < 2) return false;
+  char q = b[0];
+  if (q != '"' && q != '\'') return false;
+  uint32_t i = 1;
+  while (i < n) {
+    if (b[i] == '\\') {
+      i += 2;
+      continue;
+    }
+    if (b[i] == q) return i == n - 1;
+    i++;
+  }
+  return false;
+}
+
+static bool is_typed_literal(const char *b, uint32_t n) {
+  if (n == 1 && b[0] == '~') return true;                 // null
+  if (n == 4 && starts_with(b, n, "true")) return true;   // boolean
+  if (n == 5 && starts_with(b, n, "false")) return true;  // boolean
+  return is_number(b, n) || is_hex_color(b, n) || is_func_color(b, n) ||
+         is_variable(b, n) || is_string(b, n);
+}
+
+// Outcome of a plain-value scan.
+enum PlainResult {
+  PLAIN_EMITTED,  // PLAIN_VALUE produced; the scanner should return true
+  PLAIN_INTERNAL, // typed literal / `[` / `|`: let the internal lexer handle it
+                  //   (the scanner must return false so the lexer resets)
+  PLAIN_EMPTY,    // no value: fall through to the newline/indent scan
+};
+
+// Read the trimmed rest-of-line value (faithful to `parseNode`).
+static enum PlainResult scan_plain_value(TSLexer *lexer) {
+  while (lexer->lookahead == ' ' || lexer->lookahead == '\t') {
+    skip(lexer);
+  }
+  if (lexer->lookahead == '\n' || lexer->lookahead == '\r' ||
+      lexer->eof(lexer)) {
+    return PLAIN_EMPTY;
+  }
+  if (lexer->lookahead == '[' || lexer->lookahead == '|') {
+    return PLAIN_INTERNAL; // inline array / block scalar
+  }
+
+  char buf[512];
+  uint32_t n = 0;         // bytes buffered
+  uint32_t content = 0;   // buffer length up to the last non-space char
+  bool overflow = false;
+  for (;;) {
+    int32_t c = lexer->lookahead;
+    if (c == '\n' || c == '\r' || lexer->eof(lexer)) {
+      break;
+    }
+    if (n < sizeof(buf)) {
+      buf[n] = (char)c;
+    } else {
+      overflow = true;
+    }
+    n++;
+    advance(lexer);
+    if (c != ' ' && c != '\t') {
+      content = n;             // last non-space extends the trimmed content
+      lexer->mark_end(lexer);  // token ends after the last non-space char
+    }
+  }
+
+  if (!overflow && content <= sizeof(buf) && is_typed_literal(buf, content)) {
+    return PLAIN_INTERNAL; // the whole value is a single typed literal
+  }
+  lexer->result_symbol = PLAIN_VALUE;
+  return PLAIN_EMITTED;
 }
 
 bool tree_sitter_otui_external_scanner_scan(void *payload, TSLexer *lexer,
@@ -182,6 +340,21 @@ bool tree_sitter_otui_external_scanner_scan(void *payload, TSLexer *lexer,
       return true;
     }
     // fall through to normal indentation handling
+  }
+
+  // A plain value is valid only in value position; try it before the
+  // indentation scan.
+  if (valid_symbols[PLAIN_VALUE]) {
+    enum PlainResult r = scan_plain_value(lexer);
+    if (r == PLAIN_EMITTED) {
+      return true;
+    }
+    if (r == PLAIN_INTERNAL) {
+      // A `[` array, `|` block scalar, or a lone typed literal: return false so
+      // tree-sitter resets the lexer and the internal lexer produces the node.
+      return false;
+    }
+    // PLAIN_EMPTY: fall through to the newline/indent scan below.
   }
 
   bool found_line_end = false;
@@ -219,18 +392,15 @@ bool tree_sitter_otui_external_scanner_scan(void *payload, TSLexer *lexer,
       }
       break; // a lone '/', let the internal lexer handle it (mark_end at '/')
     } else if (lexer->lookahead == '#') {
-      // Distinguish a `#` full-line comment (§2.1: indentation-neutral, like
-      // `//`) from a `#Name < Base` freeze header (real content). They differ
-      // only by the char after `#`, so peek past it. `mark_end` is set to the
-      // position of `#` *before* advancing, so both paths hand the `#` back to
-      // the internal lexer un-consumed.
+      // A `#` at line start is ALWAYS a full-line comment, unconditionally
+      // (faithful to otmlparser `parseLine`: `line.starts_with("#")`). Like
+      // `//`, it is indentation-neutral: mark the structural token's end at the
+      // `#` (zero-width) so the comment's bytes are handed back to the internal
+      // lexer, and let the next real line decide the block structure.
       lexer->mark_end(lexer);
       advance(lexer);
-      if (lexer->lookahead == ' ' || lexer->lookahead == '\t') {
-        indent = peek_next_real_indent(lexer);
-        break; // emit the structural token here; internal lexer gets the comment
-      }
-      break; // `#Name` freeze header — re-lexed from the marked end
+      indent = peek_next_real_indent(lexer);
+      break; // emit the structural token here; internal lexer gets the comment
     } else {
       lexer->mark_end(lexer);
       break; // real content

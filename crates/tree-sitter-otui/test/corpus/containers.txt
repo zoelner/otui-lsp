@@ -17,17 +17,17 @@ Panel
     tag: (tag)
     (id_property
       key: (id_key)
-      value: (identifier))
+      value: (plain_value))
     (container
       tag: (tag)
       (id_property
         key: (id_key)
-        value: (identifier))
+        value: (plain_value))
       (property
         key: (property_key)
-        value: (identifier)))
+        value: (plain_value)))
     (container
       tag: (tag)
       (id_property
         key: (id_key)
-        value: (identifier)))))
+        value: (plain_value)))))

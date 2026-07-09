@@ -105,10 +105,6 @@
               },
               {
                 "type": "PATTERN",
-                "value": "[ \\t]"
-              },
-              {
-                "type": "PATTERN",
                 "value": "[^\\n]*"
               }
             ]
@@ -119,27 +115,6 @@
     "style_header": {
       "type": "SEQ",
       "members": [
-        {
-          "type": "CHOICE",
-          "members": [
-            {
-              "type": "FIELD",
-              "name": "freeze",
-              "content": {
-                "type": "ALIAS",
-                "content": {
-                  "type": "STRING",
-                  "value": "#"
-                },
-                "named": true,
-                "value": "freeze_marker"
-              }
-            },
-            {
-              "type": "BLANK"
-            }
-          ]
-        },
         {
           "type": "FIELD",
           "name": "name",
@@ -744,26 +719,6 @@
         },
         {
           "type": "SYMBOL",
-          "name": "_scalar_sequence"
-        }
-      ]
-    },
-    "_scalar_sequence": {
-      "type": "PREC_LEFT",
-      "value": 0,
-      "content": {
-        "type": "REPEAT1",
-        "content": {
-          "type": "SYMBOL",
-          "name": "_scalar"
-        }
-      }
-    },
-    "_scalar": {
-      "type": "CHOICE",
-      "members": [
-        {
-          "type": "SYMBOL",
           "name": "color"
         },
         {
@@ -784,13 +739,20 @@
         },
         {
           "type": "SYMBOL",
-          "name": "identifier"
+          "name": "plain_value"
         }
       ]
     },
     "null": {
-      "type": "STRING",
-      "value": "~"
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 2,
+        "content": {
+          "type": "STRING",
+          "value": "~"
+        }
+      }
     },
     "inline_array": {
       "type": "SEQ",
@@ -1023,17 +985,21 @@
     "string": {
       "type": "TOKEN",
       "content": {
-        "type": "CHOICE",
-        "members": [
-          {
-            "type": "PATTERN",
-            "value": "\"([^\"\\\\\\n]|\\\\.)*\""
-          },
-          {
-            "type": "PATTERN",
-            "value": "'([^'\\\\\\n]|\\\\.)*'"
-          }
-        ]
+        "type": "PREC",
+        "value": 2,
+        "content": {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "PATTERN",
+              "value": "\"([^\"\\\\\\n]|\\\\.)*\""
+            },
+            {
+              "type": "PATTERN",
+              "value": "'([^'\\\\\\n]|\\\\.)*'"
+            }
+          ]
+        }
       }
     },
     "identifier": {
@@ -1076,6 +1042,10 @@
     {
       "type": "SYMBOL",
       "name": "block_scalar_content"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "plain_value"
     },
     {
       "type": "SYMBOL",

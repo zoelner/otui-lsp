@@ -15,7 +15,7 @@ Widget
     tag: (tag)
     (id_property
       key: (id_key)
-      value: (identifier))
+      value: (plain_value))
     (anchor_property
       object: (anchor_keyword)
       edge: (anchor_edge)

@@ -12,7 +12,23 @@ Widget
     tag: (tag)
     (property
       key: (property_key)
-      value: (identifier))))
+      value: (plain_value))))
+
+================================================================================
+an unquoted multi-word value is a single plain value
+================================================================================
+
+Widget
+  text: Hello World
+
+--------------------------------------------------------------------------------
+
+(document
+  (container
+    tag: (tag)
+    (property
+      key: (property_key)
+      value: (plain_value))))
 
 ================================================================================
 key with no value
