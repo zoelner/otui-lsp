@@ -5,7 +5,10 @@ reviews:
   # "chill" keeps the reviewer from being noisy; raise to "assertive" if you want
   # more thorough (and chattier) reviews later.
   profile: chill
-  request_changes_workflow: false
+  # Request Changes (blocking) when there are actionable findings, and approve only once they're
+  # resolved — pairs with the branch-protection "require conversation resolution" rule so merges
+  # are blocked until CodeRabbit's findings are addressed.
+  request_changes_workflow: true
   high_level_summary: true
   poem: false
   auto_review:
