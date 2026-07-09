@@ -23,14 +23,15 @@ use otui_core::OtuiService;
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result as RpcResult;
 use tower_lsp::lsp_types::{
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
-    Hover, HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
-    InitializedParams, Location, MarkupContent, MarkupKind, MessageType, OneOf,
-    PositionEncodingKind, SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions,
-    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, ServerInfo, SymbolInformation, SymbolKind, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Url, WorkDoneProgressOptions, WorkspaceSymbolParams,
+    CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentSymbolParams,
+    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
+    HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
+    Location, MarkupContent, MarkupKind, MessageType, OneOf, PositionEncodingKind, SemanticTokens,
+    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SymbolInformation,
+    SymbolKind, TextDocumentSyncCapability, TextDocumentSyncKind, Url, WorkDoneProgressOptions,
+    WorkspaceSymbolParams,
 };
 use tower_lsp::{Client, LanguageServer};
 
@@ -361,6 +362,19 @@ impl LanguageServer for Backend {
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 // Hover: style names and `Name < Base` bases (spec §5.5).
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                // Completion: the OTML closed sets (spec §6). `$` / `@` / `.` / `!` re-trigger
+                // completion as those characters open a `$state` selector, an `@event` key, an
+                // `anchors.<edge>` / `<target>.<edge>` dotted position, or a `!`-negated state in a
+                // multi-state selector (`$hover !…`).
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![
+                        "$".to_owned(),
+                        "@".to_owned(),
+                        ".".to_owned(),
+                        "!".to_owned(),
+                    ]),
+                    ..CompletionOptions::default()
+                }),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -518,6 +532,30 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         Ok(Some(render_hover(&desc, &line_index, encoding)))
+    }
+
+    async fn completion(&self, params: CompletionParams) -> RpcResult<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let encoding = self.encoding();
+
+        // Serve from the stored document text; an unknown document has nothing to complete.
+        let Some(text) = self
+            .documents
+            .read()
+            .await
+            .get(&uri)
+            .map(|doc| doc.text.clone())
+        else {
+            return Ok(None);
+        };
+
+        // Map the cursor Position to a byte offset, then ask the engine for the closed set that
+        // applies. An empty list is a valid answer (no closed-set context here); return it as such
+        // rather than `None`, which some clients treat as "retry".
+        let offset = LineIndex::new(&text).offset_at(position, encoding);
+        let items = convert::completions_to_lsp(&self.service.complete_at(&text, offset));
+        Ok(Some(CompletionResponse::Array(items)))
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {

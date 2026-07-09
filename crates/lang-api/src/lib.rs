@@ -170,6 +170,48 @@ pub struct DocumentSymbol {
     pub children: Vec<DocumentSymbol>,
 }
 
+/// The category of a [`CompletionItem`], protocol-agnostic.
+///
+/// Each variant is named after a standard LSP `CompletionItemKind` (the server crate is the only
+/// place that maps a variant to `lsp_types::CompletionItemKind`), but this enum knows nothing about
+/// LSP. The set is intentionally minimal — just the categories the OTML **closed sets** need:
+///
+/// * [`EnumMember`](CompletionKind::EnumMember) — a `$state` name or an `anchors.<edge>` edge:
+///   members of a fixed enumeration the engine recognizes.
+/// * [`Value`](CompletionKind::Value) — a magic anchor target keyword (`parent` / `next` / `prev`):
+///   a literal that stands in the value slot of an anchor.
+/// * [`Event`](CompletionKind::Event) — an `@event` handler name.
+/// * [`Keyword`](CompletionKind::Keyword) — reserved for the property-name catalog a later node
+///   adds (spec §2.10); no closed set in this crate emits it yet, but it keeps the mapping seam in
+///   place so that catalog can slot in without touching the enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionKind {
+    /// A member of a fixed enumeration: a `$state` name or an anchor edge.
+    EnumMember,
+    /// A literal value keyword: a magic anchor target (`parent` / `next` / `prev`).
+    Value,
+    /// An `@event` handler name.
+    Event,
+    /// A language keyword / property name (the deferred property-catalog seam).
+    Keyword,
+}
+
+/// One completion candidate, protocol-agnostic (spec §6).
+///
+/// The engine emits these for the OTML **closed sets** it knows exhaustively (`$state` names, anchor
+/// edges, magic anchor targets, `@event` names). `label` is the canonical spelling to insert (from
+/// the schema consts — camelCase edges, lowercase states), `kind` classifies it for the client's
+/// icon, and `detail` is a short one-line hint. The server maps this onto `lsp_types::CompletionItem`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionItem {
+    /// The text to insert, in its canonical schema spelling.
+    pub label: String,
+    /// The candidate's category, for the client's completion icon.
+    pub kind: CompletionKind,
+    /// A short human-readable hint (e.g. `"anchor edge"`), or `None`.
+    pub detail: Option<String>,
+}
+
 /// The contract every language backend implements. Kept intentionally minimal for now; symbols,
 /// completion and hover are added as the corresponding milestones land.
 pub trait LanguageService {
