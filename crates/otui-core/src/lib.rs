@@ -19,7 +19,7 @@ pub mod symbols;
 pub mod syntax;
 
 use lang_api::{Diagnostic, DocumentSymbol, LanguageService, SemanticToken};
-use navigation::BaseRef;
+use navigation::{BaseRef, StyleHeaderRef};
 use style_index::StyleDef;
 use syntax::SyntaxTree;
 
@@ -60,6 +60,19 @@ impl OtuiService {
     #[must_use]
     pub fn base_reference_at(&self, source: &str, offset: usize) -> Option<BaseRef> {
         navigation::base_reference_at(source, offset)
+    }
+
+    /// Locate the top-level `Name < Base` header under `offset`, if the cursor sits on the declared
+    /// name token or the base token (spec §5.5 hover). Returns the whole header descriptor so the
+    /// server can tell which part was hovered by comparing `offset` to the returned spans; `None`
+    /// for nested widgets, property values, or non-header positions.
+    ///
+    /// Inherent (not on the [`LanguageService`] trait) for the same reason as
+    /// [`base_reference_at`](Self::base_reference_at): rendering the hover consumes server-owned
+    /// state (the workspace [`style_index::StyleIndex`]).
+    #[must_use]
+    pub fn style_header_at(&self, source: &str, offset: usize) -> Option<StyleHeaderRef> {
+        navigation::style_header_at(source, offset)
     }
 }
 
