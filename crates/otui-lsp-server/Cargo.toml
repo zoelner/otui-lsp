@@ -8,6 +8,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[lib]
+name = "otui_lsp_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "otui-lsp"
 path = "src/main.rs"
@@ -15,4 +19,5 @@ path = "src/main.rs"
 [dependencies]
 otui-core.workspace = true
 lang-api.workspace = true
-# tower-lsp / lsp-types / tokio are added in M3 when the server lifecycle lands.
+tower-lsp = "0.20.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
