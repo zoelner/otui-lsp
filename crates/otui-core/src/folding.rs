@@ -47,13 +47,20 @@ pub struct FoldRange {
 
 /// Compute the folding ranges for `source` (see the module docs).
 ///
-/// Returns an empty vector when the source cannot be parsed, or when it holds no multi-line
-/// construct (a flat document folds nowhere).
+/// Returns an empty vector when the source cannot be parsed, when the parse tree contains any
+/// `ERROR`/`MISSING` node, or when it holds no multi-line construct (a flat document folds nowhere).
+///
+/// Folding is gated on a clean parse — matching the formatter's safety check — because tree-sitter's
+/// error recovery can reparent nodes to the wrong depth, which would yield folds spanning the wrong
+/// lines. Rather than fold a misrecovered tree, we fold nothing until the document parses cleanly.
 #[must_use]
 pub fn folding_ranges(source: &str) -> Vec<FoldRange> {
     let Some(tree) = SyntaxTree::parse(source) else {
         return Vec::new();
     };
+    if tree.has_error() {
+        return Vec::new();
+    }
     let line_starts = line_starts(source);
     let mut out = Vec::new();
     let mut comment_lines: Vec<u32> = Vec::new();
@@ -260,5 +267,14 @@ MainWindow < UIWindow
     #[test]
     fn empty_source_has_no_folds() {
         assert!(folding_ranges("").is_empty());
+    }
+
+    #[test]
+    fn a_document_with_a_parse_error_yields_no_folds() {
+        // An unterminated inline array produces an ERROR node; folding is gated on a clean parse
+        // (matching the formatter) so error-recovered, possibly-misplaced folds are never emitted —
+        // even though the widget block above it would otherwise fold.
+        let src = "Panel\n  id: main\n  items: [1, 2\n";
+        assert!(folding_ranges(src).is_empty());
     }
 }
