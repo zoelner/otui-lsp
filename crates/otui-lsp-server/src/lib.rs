@@ -51,6 +51,10 @@ pub struct Backend {
     /// Chosen during `initialize`; UTF-16 until then. Guarded by a std [`Mutex`] because it is
     /// only ever read/written for a fleeting moment, never across an `.await`.
     encoding: Mutex<PositionEncoding>,
+    /// Whether the client negotiated `hierarchicalDocumentSymbolSupport` during `initialize`;
+    /// decides the `textDocument/documentSymbol` response shape (nested vs. flat). Defaults to
+    /// `false` (the LSP default when the capability is absent). Guarded like [`encoding`].
+    hierarchical_symbols: Mutex<bool>,
     /// Open documents by URL, full text (text document sync = FULL) plus sync version.
     documents: RwLock<HashMap<Url, Document>>,
 }
@@ -62,12 +66,20 @@ impl Backend {
             client,
             service: OtuiService::new(),
             encoding: Mutex::new(PositionEncoding::Utf16),
+            hierarchical_symbols: Mutex::new(false),
             documents: RwLock::new(HashMap::new()),
         }
     }
 
     fn encoding(&self) -> PositionEncoding {
         *self.encoding.lock().expect("encoding mutex poisoned")
+    }
+
+    fn hierarchical_symbols(&self) -> bool {
+        *self
+            .hierarchical_symbols
+            .lock()
+            .expect("hierarchical_symbols mutex poisoned")
     }
 
     /// Run the engine over `text` and push the resulting diagnostics for `uri`, unless a newer
@@ -122,11 +134,30 @@ fn negotiate_encoding(params: &InitializeParams) -> PositionEncoding {
     PositionEncoding::Utf16
 }
 
+/// Whether the client can consume the hierarchical (nested) `documentSymbol` response. Per LSP
+/// 3.17, a client signals this via `textDocument.documentSymbol.hierarchicalDocumentSymbolSupport`;
+/// when the capability is absent the default is `false`, and the server must fall back to the flat
+/// `SymbolInformation[]` shape.
+fn client_supports_hierarchical_symbols(params: &InitializeParams) -> bool {
+    params
+        .capabilities
+        .text_document
+        .as_ref()
+        .and_then(|td| td.document_symbol.as_ref())
+        .and_then(|ds| ds.hierarchical_document_symbol_support)
+        .unwrap_or(false)
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> RpcResult<InitializeResult> {
         let encoding = negotiate_encoding(&params);
         *self.encoding.lock().expect("encoding mutex poisoned") = encoding;
+        *self
+            .hierarchical_symbols
+            .lock()
+            .expect("hierarchical_symbols mutex poisoned") =
+            client_supports_hierarchical_symbols(&params);
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -211,8 +242,23 @@ impl LanguageServer for Backend {
         };
 
         let core_syms = self.service.document_symbols(&text);
-        let lsp_syms = convert::symbols_to_lsp(&text, &core_syms, self.encoding());
-        Ok(Some(DocumentSymbolResponse::Nested(lsp_syms)))
+        // Honor the client's negotiated shape: hierarchical clients get the nested outline;
+        // others must receive the flat `SymbolInformation[]` form (LSP 3.17).
+        let response = if self.hierarchical_symbols() {
+            DocumentSymbolResponse::Nested(convert::symbols_to_lsp(
+                &text,
+                &core_syms,
+                self.encoding(),
+            ))
+        } else {
+            DocumentSymbolResponse::Flat(convert::symbols_to_flat(
+                &uri,
+                &text,
+                &core_syms,
+                self.encoding(),
+            ))
+        };
+        Ok(Some(response))
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -267,7 +313,10 @@ impl LanguageServer for Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tower_lsp::lsp_types::{ClientCapabilities, GeneralClientCapabilities};
+    use tower_lsp::lsp_types::{
+        ClientCapabilities, DocumentSymbolClientCapabilities, GeneralClientCapabilities,
+        TextDocumentClientCapabilities,
+    };
 
     #[test]
     fn defaults_to_utf16_when_client_offers_nothing() {
@@ -358,5 +407,43 @@ mod tests {
     #[test]
     fn is_current_version_false_when_document_is_unknown() {
         assert!(!is_current_version(None, 1));
+    }
+
+    fn params_with_hierarchical(support: Option<bool>) -> InitializeParams {
+        InitializeParams {
+            capabilities: ClientCapabilities {
+                text_document: Some(TextDocumentClientCapabilities {
+                    document_symbol: Some(DocumentSymbolClientCapabilities {
+                        hierarchical_document_symbol_support: support,
+                        ..DocumentSymbolClientCapabilities::default()
+                    }),
+                    ..TextDocumentClientCapabilities::default()
+                }),
+                ..ClientCapabilities::default()
+            },
+            ..InitializeParams::default()
+        }
+    }
+
+    #[test]
+    fn hierarchical_symbols_default_false_when_client_is_silent() {
+        // No textDocument capabilities at all → the LSP default (flat) applies.
+        assert!(!client_supports_hierarchical_symbols(
+            &InitializeParams::default()
+        ));
+        // documentSymbol present but the flag omitted → still the default.
+        assert!(!client_supports_hierarchical_symbols(
+            &params_with_hierarchical(None)
+        ));
+    }
+
+    #[test]
+    fn hierarchical_symbols_true_only_when_client_opts_in() {
+        assert!(client_supports_hierarchical_symbols(
+            &params_with_hierarchical(Some(true))
+        ));
+        assert!(!client_supports_hierarchical_symbols(
+            &params_with_hierarchical(Some(false))
+        ));
     }
 }

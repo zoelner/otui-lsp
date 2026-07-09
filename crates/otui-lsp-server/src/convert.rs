@@ -8,8 +8,8 @@ use lang_api::{
     SymbolKind as CoreSymbolKind,
 };
 use tower_lsp::lsp_types::{
-    Diagnostic as LspDiagnostic, DiagnosticSeverity, DocumentSymbol as LspSymbol, NumberOrString,
-    Range, SymbolKind as LspSymbolKind,
+    Diagnostic as LspDiagnostic, DiagnosticSeverity, DocumentSymbol as LspSymbol, Location,
+    NumberOrString, Range, SymbolInformation, SymbolKind as LspSymbolKind, Url,
 };
 
 use crate::position::{LineIndex, PositionEncoding};
@@ -113,6 +113,55 @@ pub fn symbols_to_lsp(
     syms.iter()
         .map(|s| symbol_to_lsp(s, &index, encoding))
         .collect()
+}
+
+/// Flatten the symbol forest into LSP [`SymbolInformation`] for clients that did **not** negotiate
+/// `hierarchicalDocumentSymbolSupport` (LSP 3.17 §textDocument/documentSymbol): such a client can
+/// only consume the flat `SymbolInformation[]` shape. The nesting that [`symbols_to_lsp`] carries
+/// in `children` is preserved here only via `container_name` (the enclosing widget's name); each
+/// symbol's `location` uses its full span, and every symbol at every depth is emitted (depth-first,
+/// source order).
+#[allow(deprecated)] // `SymbolInformation` (and its `deprecated` field) are deprecated but are the
+                     // only shape a non-hierarchical client accepts.
+pub fn symbols_to_flat(
+    uri: &Url,
+    text: &str,
+    syms: &[CoreSymbol],
+    encoding: PositionEncoding,
+) -> Vec<SymbolInformation> {
+    let index = LineIndex::new(text);
+    let mut out = Vec::new();
+    for sym in syms {
+        flatten_symbol(uri, sym, None, &index, encoding, &mut out);
+    }
+    out
+}
+
+/// Push `sym` and, recursively, all its descendants into `out` as flat [`SymbolInformation`],
+/// tagging each with its parent's name as `container_name`.
+#[allow(deprecated)] // See `symbols_to_flat`.
+fn flatten_symbol(
+    uri: &Url,
+    sym: &CoreSymbol,
+    container: Option<&str>,
+    index: &LineIndex<'_>,
+    encoding: PositionEncoding,
+    out: &mut Vec<SymbolInformation>,
+) {
+    out.push(SymbolInformation {
+        name: sym.name.clone(),
+        kind: symbol_kind_to_lsp(sym.kind),
+        tags: None,
+        deprecated: None,
+        location: Location {
+            uri: uri.clone(),
+            range: index.range(sym.span.start, sym.span.end, encoding),
+        },
+        container_name: container.map(str::to_owned),
+    });
+    for child in &sym.children {
+        flatten_symbol(uri, child, Some(&sym.name), index, encoding, out);
+    }
 }
 
 #[cfg(test)]
@@ -227,5 +276,58 @@ mod tests {
         assert_eq!(label.selection_range.end, Position::new(2, 7));
         // A leaf's children collapse to `None`, not an empty vec.
         assert!(label.children.is_none());
+    }
+
+    #[test]
+    #[allow(deprecated)] // reading `SymbolInformation`'s fields in assertions
+    fn flattens_symbol_tree_with_container_names() {
+        let text = "Panel\n  id: root\n  Label\n";
+        let root_span = ByteSpan::new(0, text.len());
+        let root_selection = ByteSpan::new(12, 16);
+        let label_span = ByteSpan::new(17, text.len());
+        let label_selection = ByteSpan::new(19, 24);
+
+        let tree = CoreSymbol {
+            name: "root".to_owned(),
+            detail: Some("Panel".to_owned()),
+            kind: CoreSymbolKind::Field,
+            span: root_span,
+            selection_span: root_selection,
+            children: vec![CoreSymbol {
+                name: "Label".to_owned(),
+                detail: Some("Label".to_owned()),
+                kind: CoreSymbolKind::Object,
+                span: label_span,
+                selection_span: label_selection,
+                children: Vec::new(),
+            }],
+        };
+
+        let uri = Url::parse("file:///x.otui").unwrap();
+        let flat = symbols_to_flat(
+            &uri,
+            text,
+            std::slice::from_ref(&tree),
+            PositionEncoding::Utf16,
+        );
+
+        // Both the parent and its nested child are emitted, depth-first.
+        assert_eq!(flat.len(), 2);
+        let root = &flat[0];
+        assert_eq!(root.name, "root");
+        assert_eq!(root.kind, LspSymbolKind::FIELD);
+        assert_eq!(root.location.uri, uri);
+        // The flat location uses the symbol's full span, starting at line 0.
+        assert_eq!(root.location.range.start, Position::new(0, 0));
+        // A top-level symbol has no container.
+        assert!(root.container_name.is_none());
+
+        let label = &flat[1];
+        assert_eq!(label.name, "Label");
+        assert_eq!(label.kind, LspSymbolKind::OBJECT);
+        // The child carries its parent's name as the container.
+        assert_eq!(label.container_name.as_deref(), Some("root"));
+        // The flat location uses the full span, which begins at the widget's indentation (col 0).
+        assert_eq!(label.location.range.start, Position::new(2, 0));
     }
 }
