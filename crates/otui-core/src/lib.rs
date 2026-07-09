@@ -12,12 +12,14 @@
 //! tree-sitter [`syntax`] substrate.
 
 pub mod diagnostics;
+pub mod navigation;
 pub mod semantic;
 pub mod style_index;
 pub mod symbols;
 pub mod syntax;
 
 use lang_api::{Diagnostic, DocumentSymbol, LanguageService, SemanticToken};
+use navigation::BaseRef;
 use style_index::StyleDef;
 use syntax::SyntaxTree;
 
@@ -44,6 +46,20 @@ impl OtuiService {
         SyntaxTree::parse(source)
             .map(|tree| style_index::extract_style_defs(&tree))
             .unwrap_or_default()
+    }
+
+    /// Locate the top-level `Name < Base` base reference under `offset`, if any (spec §5.3).
+    ///
+    /// Returns the base token's name + span when the cursor sits on the `Base` of a top-level
+    /// inheritance header; `None` otherwise (including when the cursor is on the declared name, a
+    /// property, or a nested widget). Resolving the returned name against the workspace
+    /// [`style_index::StyleIndex`] — and dropping native `UI*` bases — is the server's job.
+    ///
+    /// Inherent (not on the [`LanguageService`] trait) for the same reason as
+    /// [`style_defs`](Self::style_defs): navigation is driven by server-owned state.
+    #[must_use]
+    pub fn base_reference_at(&self, source: &str, offset: usize) -> Option<BaseRef> {
+        navigation::base_reference_at(source, offset)
     }
 }
 

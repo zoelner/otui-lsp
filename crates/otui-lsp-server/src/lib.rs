@@ -17,20 +17,22 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use lang_api::LanguageService;
+use otui_core::style_index::{DocId, StyleIndex};
 use otui_core::OtuiService;
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result as RpcResult;
 use tower_lsp::lsp_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DocumentSymbolParams, DocumentSymbolResponse, InitializeParams, InitializeResult,
-    InitializedParams, MessageType, OneOf, PositionEncodingKind, SemanticTokens,
-    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Url, WorkDoneProgressOptions,
+    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
+    InitializeParams, InitializeResult, InitializedParams, MessageType, OneOf,
+    PositionEncodingKind, SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions,
+    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
+    ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    WorkDoneProgressOptions,
 };
 use tower_lsp::{Client, LanguageServer};
 
-use crate::position::PositionEncoding;
+use crate::position::{LineIndex, PositionEncoding};
 
 /// An open document's full text plus the version it was last synced at.
 #[derive(Debug, Clone)]
@@ -57,6 +59,12 @@ pub struct Backend {
     hierarchical_symbols: Mutex<bool>,
     /// Open documents by URL, full text (text document sync = FULL) plus sync version.
     documents: RwLock<HashMap<Url, Document>>,
+    /// The workspace-wide `Name < Base` style index (spec §5.2), keyed by document URL string.
+    /// Kept in sync with the document lifecycle (open/change re-index, close removes) and consumed
+    /// by go-to-definition (spec §5.3). Guarded independently of [`documents`](Self::documents):
+    /// the two locks are never held nested in a way that could deadlock — each is taken and released
+    /// cleanly around its critical section.
+    style_index: RwLock<StyleIndex>,
 }
 
 impl Backend {
@@ -68,6 +76,7 @@ impl Backend {
             encoding: Mutex::new(PositionEncoding::Utf16),
             hierarchical_symbols: Mutex::new(false),
             documents: RwLock::new(HashMap::new()),
+            style_index: RwLock::new(StyleIndex::new()),
         }
     }
 
@@ -102,6 +111,62 @@ impl Backend {
         self.client
             .publish_diagnostics(uri, lsp_diags, Some(version))
             .await;
+    }
+
+    /// Re-index `uri`'s style definitions from `text` into the workspace [`StyleIndex`].
+    ///
+    /// Run on open/change; extraction is pure and cheap. The index lock is taken only for the
+    /// insert, never while any document lock is held (see the [`style_index`](Self::style_index)
+    /// note), so the two locks cannot deadlock.
+    async fn reindex_styles(&self, uri: &Url, text: &str) {
+        let defs = self.service.style_defs(text);
+        self.style_index
+            .write()
+            .await
+            .set_document(DocId::from(uri.to_string()), defs);
+    }
+}
+
+/// Resolve a `Name < Base` base name to its definition site(s) (spec §5.3).
+///
+/// Fans the name out across the whole workspace index (the namespace is global), building an LSP
+/// [`Location`] per hit against **that** target document's own text. A native `UI*` base has no
+/// def in the index and so resolves to `None`. Duplicate defs (legal in the engine) each become a
+/// location — one hit is a `Scalar`, several are an `Array`, zero is `None`.
+///
+/// Kept as a free function over borrowed state so it can be unit-tested without a live `Client`.
+fn resolve_base_definition(
+    index: &StyleIndex,
+    documents: &HashMap<Url, Document>,
+    base_name: &str,
+    encoding: PositionEncoding,
+) -> Option<GotoDefinitionResponse> {
+    let mut locations = Vec::new();
+    for (doc_id, def) in index.lookup(base_name) {
+        let Ok(target_uri) = Url::parse(doc_id.as_str()) else {
+            continue;
+        };
+        // The target's `name_span` is a byte span into the target document's text, so its range must
+        // be built against that text. If the defining document is not currently open we cannot map
+        // the span to a range, so we skip it (a workspace file-scan for closed files is a later
+        // node; the index still tracks only open documents today).
+        let Some(target_doc) = documents.get(&target_uri) else {
+            continue;
+        };
+        locations.push(convert::location_of(
+            target_uri,
+            &target_doc.text,
+            def.name_span,
+            encoding,
+        ));
+    }
+
+    match locations.len() {
+        0 => None,
+        1 => Some(GotoDefinitionResponse::Scalar(
+            locations.pop().expect("len 1"),
+        )),
+        _ => Some(GotoDefinitionResponse::Array(locations)),
     }
 }
 
@@ -181,6 +246,8 @@ impl LanguageServer for Backend {
                 ),
                 // Document symbols: the widget-hierarchy outline for a `.otui` document.
                 document_symbol_provider: Some(OneOf::Left(true)),
+                // Go-to-definition: `Name < Base` inheritance references (spec §5.3).
+                definition_provider: Some(OneOf::Left(true)),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -261,6 +328,43 @@ impl LanguageServer for Backend {
         Ok(Some(response))
     }
 
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> RpcResult<Option<GotoDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let encoding = self.encoding();
+
+        // Read the request document's text (unknown document → nothing to resolve). Cloned so the
+        // documents lock is released before we take the index lock, keeping the two locks unnested.
+        let Some(text) = self
+            .documents
+            .read()
+            .await
+            .get(&uri)
+            .map(|doc| doc.text.clone())
+        else {
+            return Ok(None);
+        };
+
+        // Map the cursor Position to a byte offset, then classify the token under it.
+        let offset = LineIndex::new(&text).offset_at(position, encoding);
+        let Some(base_ref) = self.service.base_reference_at(&text, offset) else {
+            return Ok(None);
+        };
+
+        // Resolve against the workspace index, building each target range from its own document.
+        let index = self.style_index.read().await;
+        let documents = self.documents.read().await;
+        Ok(resolve_base_definition(
+            &index,
+            &documents,
+            &base_ref.name,
+            encoding,
+        ))
+    }
+
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let doc = params.text_document;
         let uri = doc.uri;
@@ -275,6 +379,7 @@ impl LanguageServer for Backend {
                 },
             );
         }
+        self.reindex_styles(&uri, &doc.text).await;
         self.publish(uri, &doc.text, version).await;
     }
 
@@ -296,6 +401,7 @@ impl LanguageServer for Backend {
                 },
             );
         }
+        self.reindex_styles(&uri, &text).await;
         self.publish(uri, &text, version).await;
     }
 
@@ -305,6 +411,11 @@ impl LanguageServer for Backend {
             let mut docs = self.documents.write().await;
             docs.remove(&uri);
         }
+        // Drop the closed document's style defs from the workspace index.
+        self.style_index
+            .write()
+            .await
+            .remove_document(&DocId::from(uri.to_string()));
         // Clear diagnostics for the closed document.
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
@@ -314,7 +425,7 @@ impl LanguageServer for Backend {
 mod tests {
     use super::*;
     use tower_lsp::lsp_types::{
-        ClientCapabilities, DocumentSymbolClientCapabilities, GeneralClientCapabilities,
+        ClientCapabilities, DocumentSymbolClientCapabilities, GeneralClientCapabilities, Position,
         TextDocumentClientCapabilities,
     };
 
@@ -445,5 +556,124 @@ mod tests {
         assert!(!client_supports_hierarchical_symbols(
             &params_with_hierarchical(Some(false))
         ));
+    }
+
+    /// Build a `(StyleIndex, documents)` pair from `(uri, text)` entries, indexing each document's
+    /// style defs exactly the way the backend does on open/change.
+    fn workspace(entries: &[(&str, &str)]) -> (StyleIndex, HashMap<Url, Document>) {
+        let svc = OtuiService::new();
+        let mut index = StyleIndex::new();
+        let mut documents = HashMap::new();
+        for (uri_str, text) in entries {
+            let uri = Url::parse(uri_str).expect("valid uri");
+            index.set_document(DocId::from(uri.to_string()), svc.style_defs(text));
+            documents.insert(
+                uri,
+                Document {
+                    text: (*text).to_owned(),
+                    version: 1,
+                },
+            );
+        }
+        (index, documents)
+    }
+
+    #[test]
+    fn base_in_one_doc_resolves_to_the_definition_span_in_another() {
+        let (index, docs) = workspace(&[
+            ("file:///defs.otui", "MyPanel < UIWidget\n"),
+            ("file:///use.otui", "Child < MyPanel\n"),
+        ]);
+        let resp = resolve_base_definition(&index, &docs, "MyPanel", PositionEncoding::Utf16)
+            .expect("resolves");
+        match resp {
+            GotoDefinitionResponse::Scalar(loc) => {
+                assert_eq!(loc.uri.as_str(), "file:///defs.otui");
+                // The name span of `MyPanel` is line 0, columns 0..7 of the *defining* document.
+                assert_eq!(loc.range.start, Position::new(0, 0));
+                assert_eq!(loc.range.end, Position::new(0, 7));
+            }
+            other => panic!("expected a scalar location, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn base_and_reference_in_the_same_document_resolve_within_it() {
+        // A base declared and referenced in the *same* open document — the self-referencing path
+        // `goto_definition` hits when a file inherits from a style it also defines.
+        let (index, docs) = workspace(&[("file:///self.otui", "Base < UIWidget\nChild < Base\n")]);
+        let resp = resolve_base_definition(&index, &docs, "Base", PositionEncoding::Utf16)
+            .expect("resolves");
+        match resp {
+            GotoDefinitionResponse::Scalar(loc) => {
+                assert_eq!(loc.uri.as_str(), "file:///self.otui");
+                // `Base`'s defining name span is line 0, columns 0..4 of the same document.
+                assert_eq!(loc.range.start, Position::new(0, 0));
+                assert_eq!(loc.range.end, Position::new(0, 4));
+            }
+            other => panic!("expected a scalar location, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn native_base_resolves_to_nothing() {
+        // `UIWidget` is a native built-in with no defining file, so it is absent from the index and
+        // resolves to `None` (the locator still returns a `BaseRef`; the index drops it).
+        let (index, docs) = workspace(&[("file:///a.otui", "MyPanel < UIWidget\n")]);
+        assert!(
+            resolve_base_definition(&index, &docs, "UIWidget", PositionEncoding::Utf16).is_none()
+        );
+    }
+
+    #[test]
+    fn duplicate_definitions_resolve_to_an_array_of_all_sites() {
+        // The same style name declared in two files is legal; every def surfaces as a location.
+        let (index, docs) = workspace(&[
+            ("file:///a.otui", "Dup < UIWidget\n"),
+            ("file:///b.otui", "Dup < UIWindow\n"),
+        ]);
+        let resp = resolve_base_definition(&index, &docs, "Dup", PositionEncoding::Utf16)
+            .expect("resolves");
+        match resp {
+            GotoDefinitionResponse::Array(locs) => assert_eq!(locs.len(), 2),
+            other => panic!("expected an array of locations, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn definition_span_of_a_closed_target_is_skipped() {
+        // A def whose document is not open cannot have its span mapped to a range, so it is dropped.
+        let svc = OtuiService::new();
+        let mut index = StyleIndex::new();
+        index.set_document(
+            DocId::from("file:///closed.otui".to_owned()),
+            svc.style_defs("MyPanel < UIWidget\n"),
+        );
+        let documents = HashMap::new(); // nothing open
+        assert!(
+            resolve_base_definition(&index, &documents, "MyPanel", PositionEncoding::Utf16)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn full_flow_from_cursor_position_to_resolved_definition() {
+        // End to end over the pure pieces: cursor Position → byte offset → base locator → resolve.
+        let (index, docs) = workspace(&[
+            ("file:///defs.otui", "MyPanel < UIWidget\n"),
+            ("file:///use.otui", "Child < MyPanel\n"),
+        ]);
+        let request_text = "Child < MyPanel\n";
+        // Cursor on the `M` of `MyPanel` (line 0, column 8).
+        let position = Position::new(0, 8);
+        let offset = LineIndex::new(request_text).offset_at(position, PositionEncoding::Utf16);
+        let base_ref = OtuiService::new()
+            .base_reference_at(request_text, offset)
+            .expect("cursor is on the base");
+        assert_eq!(base_ref.name, "MyPanel");
+
+        let resp = resolve_base_definition(&index, &docs, &base_ref.name, PositionEncoding::Utf16)
+            .expect("resolves");
+        assert!(matches!(resp, GotoDefinitionResponse::Scalar(_)));
     }
 }
