@@ -16,9 +16,9 @@
 //!    the two spec §4 checks those sets enable: an unknown `$state` selector name
 //!    ([`UNKNOWN_STATE`], a *hint* — the engine never errors on it, it just never matches) and an
 //!    invalid anchor edge ([`INVALID_ANCHOR_EDGE`], an *error* — `anchors.*` is one of the four
-//!    value-validating properties of spec §2.10). Unknown ordinary property names are deliberately
-//!    **not** flagged here: they are a silent apply-or-ignore and belong to a later node that owns
-//!    the property catalog.
+//!    value-validating properties of spec §2.10), and an unknown ordinary property name
+//!    ([`UNKNOWN_PROPERTY`], a *hint* — the engine silently applies-or-ignores a tag it does not
+//!    recognize, so a misspelled/unknown property never errors, it just has no effect).
 
 use crate::schema;
 use crate::syntax::SyntaxTree;
@@ -41,6 +41,12 @@ pub const UNKNOWN_STATE: &str = "unknown-state";
 /// of the six anchor edges (spec §2.4). Severity [`Severity::Error`]: `anchors.*` is one of the
 /// four *value-validating* properties (spec §2.10), so the engine throws on a bad edge.
 pub const INVALID_ANCHOR_EDGE: &str = "invalid-anchor-edge";
+/// Diagnostic code: an ordinary property key that is not a known OTML property name (spec §2.10,
+/// §4). Severity [`Severity::Hint`]: the engine silently applies-or-ignores an unrecognized tag
+/// (`node->tag()` matches nothing), so a misspelled/unknown property is never an error or warning —
+/// only a gentle hint that the property will have no effect. Value validation (border/display/
+/// layout/color) is a separate concern; this check is the unknown-KEY hint only.
+pub const UNKNOWN_PROPERTY: &str = "unknown-property";
 
 /// Computes all parse-level diagnostics for `source`.
 ///
@@ -236,12 +242,14 @@ fn collect_structural_errors(node: Node<'_>, out: &mut Vec<Diagnostic>) {
 
 /// Depth-first semantic validation over the CST. Recurses through every node so that anchors and
 /// `$state` blocks are validated wherever they appear (anchors are per-widget and both may sit on
-/// arbitrarily nested widgets). Only two node kinds carry a finding; every other kind is transparent
-/// and simply recursed through.
+/// arbitrarily nested widgets). Ordinary `property` nodes are validated the same way, since a
+/// property may appear on any widget at any depth. Only these node kinds carry a finding; every
+/// other kind is transparent and simply recursed through.
 fn collect_semantic_diagnostics(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
     match node.kind() {
         "state_selector" => check_state_selector(node, source, out),
         "anchor_property" => check_anchor_property(node, source, out),
+        "property" => check_property(node, source, out),
         _ => {}
     }
     let mut cursor = node.walk();
@@ -330,6 +338,51 @@ fn check_anchor_property(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>
     });
 }
 
+/// Validate an ordinary `key: value` property (grammar: `property` with a `key` field of kind
+/// `property_key`). A key that is not a known OTML property name is a [`Severity::Hint`]; the span
+/// is the key token only.
+///
+/// Only the plain `property` kind reaches here. The grammar routes the non-catalog forms to their
+/// own node kinds, which are therefore *not* matched by this function and never flagged as an
+/// unknown property: `anchors.<edge>` (`anchor_property`), `@event`/`&alias`/`!expr` Lua-bearing tags
+/// (`event_property`/`alias_property`/`expr_property`), `id:` (`id_property`), `$state` selectors
+/// (`state_selector`), list items (`list_item`), and a nested widget / style header
+/// (`container`/`style_header`). Property VALUES are intentionally not validated here (border/
+/// display/layout/color value validation is a separate node); this is the unknown-KEY hint only.
+///
+/// Membership is [`schema::is_known_property`], an exact case-sensitive compare (the engine
+/// dispatches on `node->tag() == "..."`), so a mis-cased `Width` is unknown → hint. That is faithful.
+///
+/// A `property` that carries a nested block (`key:` with indented children) is *not* flagged: the
+/// grammar spells a colon-keyed group as a `property` with a `_block`, but such a node acts as a
+/// container/subtree (a child widget group, or a `key:`/`- item` list parent), not a leaf style
+/// property. Per the "prefer false negatives over false positives" rule, we only flag leaf
+/// properties (a bare `key:` or `key: value` with no nested statements).
+fn check_property(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+    let Some(key) = node.child_by_field_name("key") else {
+        return;
+    };
+    // Detect a nested block: any *named* child that is neither the `key` field nor the `value` field
+    // is a statement inside a `_block`, so the node is a container form — skip it.
+    let value = node.child_by_field_name("value");
+    let mut cursor = node.walk();
+    let has_block = node
+        .named_children(&mut cursor)
+        .any(|child| child.id() != key.id() && value.is_none_or(|v| child.id() != v.id()));
+    if has_block {
+        return;
+    }
+    let name = slice(source, key);
+    if !schema::is_known_property(name) {
+        out.push(Diagnostic {
+            severity: Severity::Hint,
+            code: UNKNOWN_PROPERTY,
+            message: format!("unknown property `{name}`: applied-or-ignored, has no effect"),
+            span: SyntaxTree::span_of(key),
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,13 +453,16 @@ MainWindow < UIWindow
 
     #[test]
     fn deep_but_valid_nesting_is_not_flagged() {
+        // `a`/`b`/`c` carry nested blocks (container form, not leaf style properties) so they are
+        // not unknown-property candidates; `width` is a known leaf property. The test exercises
+        // depth-4 nesting producing no indentation-depth diagnostics.
         let src = "\
 a:
   b:
     c:
-      d: 1
+      width: 1
 ";
-        assert!(analyze(src).is_empty());
+        assert!(analyze(src).is_empty(), "{:?}", analyze(src));
     }
 
     #[test]
@@ -633,5 +689,101 @@ Widget
             "parse level intact: {diags:?}"
         );
         assert!(cs.contains(&UNKNOWN_STATE), "semantic present: {diags:?}");
+    }
+
+    // --- semantic pass: unknown property (hint) -----------------------------------------------
+
+    #[test]
+    fn known_property_produces_no_hint() {
+        let src = "\
+Panel
+  width: 10
+";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != UNKNOWN_PROPERTY),
+            "known property must not be flagged: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_property_is_a_hint_on_the_key_token() {
+        // `widht` is a typo for `width`.
+        let src = "\
+Panel
+  widht: 10
+";
+        let diags = analyze(src);
+        let d = only(&diags, UNKNOWN_PROPERTY);
+        assert_eq!(d.severity, Severity::Hint);
+        assert_eq!(&src[d.span.start..d.span.end], "widht");
+    }
+
+    #[test]
+    fn miscased_known_property_is_a_hint() {
+        // `is_known_property` is an exact byte compare (`node->tag() == "width"`), so `Width` is
+        // unknown at runtime — a faithful hint.
+        let src = "\
+Panel
+  Width: 10
+";
+        let diags = analyze(src);
+        let d = only(&diags, UNKNOWN_PROPERTY);
+        assert_eq!(d.severity, Severity::Hint);
+        assert_eq!(&src[d.span.start..d.span.end], "Width");
+    }
+
+    #[test]
+    fn non_property_kinds_are_never_flagged_as_unknown_property() {
+        // id:, anchors.top:, @onClick:, a $state block, a list item, and a nested widget header are
+        // all their own grammar nodes — none is an ordinary catalog `property`, so none is flagged.
+        let src = "\
+Panel
+  id: main
+  anchors.top: parent.top
+  @onClick: |
+    self:hide()
+  $hover:
+    color: red
+  items:
+    - one
+    - two
+  Button
+    id: ok
+  Label < UILabel
+    id: title
+";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != UNKNOWN_PROPERTY),
+            "no unknown-property should fire here: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_property_nested_in_child_widget_is_flagged() {
+        // A property may sit on a widget at any depth; the child's typo must still be flagged.
+        let src = "\
+Panel
+  id: main
+  Button
+    id: ok
+    widht: 10
+";
+        let diags = analyze(src);
+        let d = only(&diags, UNKNOWN_PROPERTY);
+        assert_eq!(d.severity, Severity::Hint);
+        assert_eq!(&src[d.span.start..d.span.end], "widht");
+    }
+
+    #[test]
+    fn unknown_property_never_error_or_warning() {
+        // Hard fidelity rule: an unknown property is a hint, never an error or warning.
+        let src = "Panel\n  not-a-real-prop: 1\n";
+        let diags = analyze(src);
+        let d = only(&diags, UNKNOWN_PROPERTY);
+        assert_ne!(d.severity, Severity::Error);
+        assert_ne!(d.severity, Severity::Warning);
+        assert_eq!(d.severity, Severity::Hint);
     }
 }
