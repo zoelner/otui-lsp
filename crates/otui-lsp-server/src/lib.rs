@@ -16,7 +16,7 @@ pub mod semantic;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use lang_api::LanguageService;
+use lang_api::{ByteSpan, LanguageService};
 use otui_core::style_index::{DocId, StyleIndex};
 use otui_core::OtuiService;
 use tokio::sync::RwLock;
@@ -24,7 +24,7 @@ use tower_lsp::jsonrpc::Result as RpcResult;
 use tower_lsp::lsp_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
-    InitializeParams, InitializeResult, InitializedParams, MessageType, OneOf,
+    InitializeParams, InitializeResult, InitializedParams, Location, MessageType, OneOf,
     PositionEncodingKind, SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions,
     SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
     ServerCapabilities, ServerInfo, SymbolInformation, SymbolKind, TextDocumentSyncCapability,
@@ -127,6 +127,30 @@ impl Backend {
     }
 }
 
+/// Build an LSP [`Location`] for `span` in the document identified by `doc_id`.
+///
+/// A style def's spans are byte offsets into **its own** document's text, so the range must be
+/// mapped against that text. Returns `None` — and the caller skips the entry — when `doc_id` is not
+/// a parseable URL or its document is not currently open (its span cannot be mapped to a range; the
+/// index only holds open documents today, so a workspace file-scan for closed files is a later node).
+/// Shared by [`resolve_base_definition`] (go-to-definition) and [`collect_workspace_symbols`]
+/// (workspace symbols).
+fn resolve_location(
+    doc_id: &DocId,
+    span: ByteSpan,
+    documents: &HashMap<Url, Document>,
+    encoding: PositionEncoding,
+) -> Option<Location> {
+    let target_uri = Url::parse(doc_id.as_str()).ok()?;
+    let target_doc = documents.get(&target_uri)?;
+    Some(convert::location_of(
+        target_uri,
+        &target_doc.text,
+        span,
+        encoding,
+    ))
+}
+
 /// Resolve a `Name < Base` base name to its definition site(s) (spec §5.3).
 ///
 /// Fans the name out across the whole workspace index (the namespace is global), building an LSP
@@ -143,22 +167,9 @@ fn resolve_base_definition(
 ) -> Option<GotoDefinitionResponse> {
     let mut locations = Vec::new();
     for (doc_id, def) in index.lookup(base_name) {
-        let Ok(target_uri) = Url::parse(doc_id.as_str()) else {
-            continue;
-        };
-        // The target's `name_span` is a byte span into the target document's text, so its range must
-        // be built against that text. If the defining document is not currently open we cannot map
-        // the span to a range, so we skip it (a workspace file-scan for closed files is a later
-        // node; the index still tracks only open documents today).
-        let Some(target_doc) = documents.get(&target_uri) else {
-            continue;
-        };
-        locations.push(convert::location_of(
-            target_uri,
-            &target_doc.text,
-            def.name_span,
-            encoding,
-        ));
+        if let Some(loc) = resolve_location(doc_id, def.name_span, documents, encoding) {
+            locations.push(loc);
+        }
     }
 
     match locations.len() {
@@ -199,12 +210,9 @@ fn collect_workspace_symbols(
         if !def.name.to_lowercase().contains(&needle) {
             continue;
         }
-        let Ok(target_uri) = Url::parse(doc_id.as_str()) else {
-            continue;
-        };
-        // `name_span` is a byte span into the defining document's text, so its range must be built
-        // against that text. A def whose document is not open cannot be mapped and is skipped.
-        let Some(target_doc) = documents.get(&target_uri) else {
+        // `name_span` is a byte span into the defining document's text; a def whose document is not
+        // open (or whose id is not a URL) cannot be mapped to a range and is skipped.
+        let Some(location) = resolve_location(doc_id, def.name_span, documents, encoding) else {
             continue;
         };
         out.push(SymbolInformation {
@@ -212,7 +220,7 @@ fn collect_workspace_symbols(
             kind: SymbolKind::CLASS,
             tags: None,
             deprecated: None,
-            location: convert::location_of(target_uri, &target_doc.text, def.name_span, encoding),
+            location,
             container_name: def.base.clone(),
         });
     }
