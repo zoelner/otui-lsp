@@ -6,13 +6,21 @@
 //! (unknown properties, unknown `$state`, style-resolution warnings) are *hints/warnings* handled
 //! by later milestones and are intentionally **not** produced here.
 //!
-//! Two independent passes contribute:
+//! Three passes contribute:
 //!
 //! 1. A **line-based indentation** pass mirroring `OTMLParser::getLineDepth` / `parseLine`:
 //!    tabs in leading whitespace, odd (non-multiple-of-2) indentation, and invalid depth jumps.
 //! 2. A **structural** pass harvesting tree-sitter `ERROR` / `MISSING` nodes for malformed
 //!    constructs (e.g. an unterminated inline array).
+//! 3. A **semantic** pass over the CST that consumes the closed sets in [`crate::schema`] to flag
+//!    the two spec §4 checks those sets enable: an unknown `$state` selector name
+//!    ([`UNKNOWN_STATE`], a *hint* — the engine never errors on it, it just never matches) and an
+//!    invalid anchor edge ([`INVALID_ANCHOR_EDGE`], an *error* — `anchors.*` is one of the four
+//!    value-validating properties of spec §2.10). Unknown ordinary property names are deliberately
+//!    **not** flagged here: they are a silent apply-or-ignore and belong to a later node that owns
+//!    the property catalog.
 
+use crate::schema;
 use crate::syntax::SyntaxTree;
 use lang_api::{ByteSpan, Diagnostic, Severity};
 use tree_sitter::Node;
@@ -25,6 +33,14 @@ pub const ODD_INDENTATION: &str = "odd-indentation";
 pub const INVALID_INDENTATION_DEPTH: &str = "invalid-indentation-depth";
 /// Diagnostic code: a structural (`ERROR`/`MISSING`) parse node.
 pub const SYNTAX_ERROR: &str = "syntax-error";
+/// Diagnostic code: a `$state` selector name outside the closed 14-name set (spec §2.8). Severity
+/// [`Severity::Hint`]: the engine's `translateState` returns `InvalidState`, so the block simply
+/// never matches — a probable authoring bug, not an engine error.
+pub const UNKNOWN_STATE: &str = "unknown-state";
+/// Diagnostic code: an `anchors.<edge>` key edge or a `<target>.<edge>` value edge that is not one
+/// of the six anchor edges (spec §2.4). Severity [`Severity::Error`]: `anchors.*` is one of the
+/// four *value-validating* properties (spec §2.10), so the engine throws on a bad edge.
+pub const INVALID_ANCHOR_EDGE: &str = "invalid-anchor-edge";
 
 /// Computes all parse-level diagnostics for `source`.
 ///
@@ -33,8 +49,10 @@ pub const SYNTAX_ERROR: &str = "syntax-error";
 #[must_use]
 pub fn analyze(source: &str) -> Vec<Diagnostic> {
     let mut out = indentation_pass(source);
+    // The tree is parsed once and shared by the structural and semantic passes.
     if let Some(tree) = SyntaxTree::parse(source) {
         collect_structural_errors(tree.root(), &mut out);
+        collect_semantic_diagnostics(tree.root(), source, &mut out);
     }
     out.sort_by_key(|d| (d.span.start, d.span.end));
     out
@@ -216,6 +234,102 @@ fn collect_structural_errors(node: Node<'_>, out: &mut Vec<Diagnostic>) {
     }
 }
 
+/// Depth-first semantic validation over the CST. Recurses through every node so that anchors and
+/// `$state` blocks are validated wherever they appear (anchors are per-widget and both may sit on
+/// arbitrarily nested widgets). Only two node kinds carry a finding; every other kind is transparent
+/// and simply recursed through.
+fn collect_semantic_diagnostics(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+    match node.kind() {
+        "state_selector" => check_state_selector(node, source, out),
+        "anchor_property" => check_anchor_property(node, source, out),
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_semantic_diagnostics(child, source, out);
+    }
+}
+
+/// Slice `source` by a node's byte span.
+fn slice<'a>(source: &'a str, node: Node<'_>) -> &'a str {
+    &source[node.start_byte()..node.end_byte()]
+}
+
+/// Validate each state name in a `$state[ !state...]:` selector (grammar: `state_selector` holds one
+/// or more `state` children, each with a `name` field aliased to `state_name` and an optional
+/// `!`-negation). A name outside the closed 14-name set is a [`Severity::Hint`]; the span is the
+/// name token only, so a `$valid !bogus:` selector yields exactly one hint on `bogus`. Membership is
+/// case-insensitive (per `schema::is_known_state`), so a mis-cased known state produces nothing.
+fn check_state_selector(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "state" {
+            continue;
+        }
+        let Some(name) = child.child_by_field_name("name") else {
+            continue;
+        };
+        if !schema::is_known_state(slice(source, name)) {
+            out.push(Diagnostic {
+                severity: Severity::Hint,
+                code: UNKNOWN_STATE,
+                message: format!(
+                    "unknown state `{}`: never matches at runtime",
+                    slice(source, name)
+                ),
+                span: SyntaxTree::span_of(name),
+            });
+        }
+    }
+}
+
+/// Validate an `anchors.<edge>: <target>` node (grammar: `anchor_property` with an `edge` field
+/// aliased to `anchor_edge` and an optional `value` field of kind `anchor_target` whose `target`
+/// field is a dotted `identifier`). Two edge tokens are checked; the target *id* is intentionally
+/// not resolved here (cross-file id existence is a later node).
+fn check_anchor_property(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+    // Property-side edge: must be one of the six edges OR a shorthand key (`fill`/`centerIn`, which
+    // the grammar spells as the edge of `anchors.fill:` / `anchors.centerIn:`).
+    if let Some(edge) = node.child_by_field_name("edge") {
+        let text = slice(source, edge);
+        if !schema::is_anchor_edge(text) && !schema::is_shorthand_anchor(text) {
+            out.push(Diagnostic {
+                severity: Severity::Error,
+                code: INVALID_ANCHOR_EDGE,
+                message: format!("`{text}` is not a valid anchor edge"),
+                span: SyntaxTree::span_of(edge),
+            });
+        }
+    }
+
+    // Target-side edge: in `<targetId>.<targetEdge>` the suffix after the last `.` must be an edge.
+    // A dot-less value (`parent`, `next`, `prev`, `none`, or the shorthand `anchors.fill: parent`
+    // form) carries no target edge and is intentionally left unvalidated here — we do not resolve
+    // the target id. A trailing-dot / empty suffix is also skipped (prefer a false negative to a
+    // false positive on a shape the grammar does not cleanly delimit).
+    let Some(value) = node.child_by_field_name("value") else {
+        return;
+    };
+    let Some(target) = value.child_by_field_name("target") else {
+        return;
+    };
+    let text = slice(source, target);
+    let Some(dot) = text.rfind('.') else {
+        return;
+    };
+    let edge = &text[dot + 1..];
+    if edge.is_empty() || schema::is_anchor_edge(edge) {
+        return;
+    }
+    let start = target.start_byte() + dot + 1;
+    out.push(Diagnostic {
+        severity: Severity::Error,
+        code: INVALID_ANCHOR_EDGE,
+        message: format!("`{edge}` is not a valid anchor edge"),
+        span: ByteSpan::new(start, target.end_byte()),
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +493,145 @@ Panel
         for w in diags.windows(2) {
             assert!(w[0].span.start <= w[1].span.start);
         }
+    }
+
+    // --- semantic pass: unknown $state (hint) -------------------------------------------------
+
+    fn only<'a>(diags: &'a [Diagnostic], code: &str) -> &'a Diagnostic {
+        let matches: Vec<_> = diags.iter().filter(|d| d.code == code).collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one {code}, got {diags:?}"
+        );
+        matches[0]
+    }
+
+    #[test]
+    fn unknown_state_is_a_hint_on_the_name_token() {
+        let src = "\
+Button
+  $foo:
+    color: red
+";
+        let diags = analyze(src);
+        let d = only(&diags, UNKNOWN_STATE);
+        assert_eq!(d.severity, Severity::Hint);
+        assert_eq!(&src[d.span.start..d.span.end], "foo");
+    }
+
+    #[test]
+    fn known_states_produce_no_hint_including_miscased() {
+        // Every known state, plus a deliberately mis-cased one, must be silent (case-insensitive).
+        for state in [
+            "active",
+            "focus",
+            "hover",
+            "pressed",
+            "checked",
+            "disabled",
+            "on",
+            "first",
+            "middle",
+            "last",
+            "alternate",
+            "dragging",
+            "hidden",
+            "mobile",
+            "Hover",
+            "PRESSED",
+        ] {
+            let src = format!("Button\n  ${state}:\n    color: red\n");
+            let diags = analyze(&src);
+            assert!(
+                diags.iter().all(|d| d.code != UNKNOWN_STATE),
+                "state `{state}` must not be flagged: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn state_selector_with_valid_and_invalid_yields_one_hint() {
+        // `$hover !bogus:` — one valid, one unknown (negated) — exactly one hint, on `bogus`.
+        let src = "\
+Button
+  $hover !bogus:
+    color: red
+";
+        let diags = analyze(src);
+        let d = only(&diags, UNKNOWN_STATE);
+        assert_eq!(&src[d.span.start..d.span.end], "bogus");
+    }
+
+    // --- semantic pass: invalid anchor edge (error) -------------------------------------------
+
+    #[test]
+    fn invalid_property_side_anchor_edge_is_an_error() {
+        let src = "\
+Widget
+  anchors.middle: parent.top
+";
+        let diags = analyze(src);
+        let d = only(&diags, INVALID_ANCHOR_EDGE);
+        assert_eq!(d.severity, Severity::Error);
+        // Span is the property-side edge token `middle`, not the valid target edge `top`.
+        assert_eq!(&src[d.span.start..d.span.end], "middle");
+    }
+
+    #[test]
+    fn invalid_target_side_anchor_edge_is_an_error() {
+        let src = "\
+Widget
+  anchors.top: parent.bogus
+";
+        let diags = analyze(src);
+        let d = only(&diags, INVALID_ANCHOR_EDGE);
+        assert_eq!(d.severity, Severity::Error);
+        // Only the offending target-edge token is spanned, not the whole `parent.bogus`.
+        assert_eq!(&src[d.span.start..d.span.end], "bogus");
+    }
+
+    #[test]
+    fn valid_anchors_with_magic_targets_and_shorthands_are_silent() {
+        let src = "\
+Widget
+  anchors.top: parent.top
+  anchors.left: sibling.right
+  anchors.fill: parent
+  anchors.centerIn: parent
+  anchors.bottom: none
+";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != INVALID_ANCHOR_EDGE),
+            "valid anchors must not be flagged: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_edge_check_is_case_insensitive() {
+        // The engine lowercases the token before matching, so a mis-cased edge is still valid.
+        let src = "\
+Widget
+  anchors.HorizontalCenter: parent.VerticalCenter
+";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != INVALID_ANCHOR_EDGE),
+            "case-insensitive edges must not be flagged: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn parse_level_and_semantic_diagnostics_coexist() {
+        // A tab-indented line (parse level) alongside an unknown state (semantic) — both fire.
+        let src = "Panel\n\tid: main\n$foo:\n  color: red\n";
+        let diags = analyze(src);
+        let cs = codes(&diags);
+        assert!(
+            cs.contains(&TAB_INDENTATION),
+            "parse level intact: {diags:?}"
+        );
+        assert!(cs.contains(&UNKNOWN_STATE), "semantic present: {diags:?}");
     }
 }
