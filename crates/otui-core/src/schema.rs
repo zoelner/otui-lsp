@@ -257,6 +257,12 @@ fn is_valid_hex_body(body: &str) -> bool {
 /// whitespace is stripped first; the function name is matched case-sensitively in lowercase; the
 /// argument count must be exactly 3 (`rgb`/`hsl`) or 4 (`rgba`/`hsla`); each argument must be a
 /// numeric component (optionally a percentage).
+///
+/// A percentage suffix is accepted for **every** form, `rgb`/`rgba` included — this is deliberate
+/// fidelity, not a CSS habit. The engine's color parser reads each `rgb`/`rgba` channel through a
+/// byte-or-percent helper that explicitly handles a trailing `%` (scaling `p% -> p*255/100`), so
+/// `rgb(50%, 50%, 50%)` is a value the engine accepts. Rejecting `%` here to match web-CSS rules
+/// would diverge from the real parser, which is our source of truth.
 fn is_valid_functional(value: &str) -> bool {
     // Engine strips ALL whitespace from the token before parsing.
     let stripped: String = value.chars().filter(|c| !c.is_whitespace()).collect();
@@ -422,7 +428,10 @@ mod tests {
             parse_color("hsla(120, 50%, 50%, 50%)"),
             Some(ColorForm::Functional)
         );
-        // Percentages and whitespace are tolerated (engine strips all whitespace).
+        // Percent components are valid even for `rgb`/`rgba` (NOT just `hsl`): the engine reads every
+        // channel through a byte-or-percent helper that handles a trailing `%`. Whitespace is
+        // tolerated too (the engine strips it all). Keeping this accepted is engine fidelity, not a
+        // CSS convention — see `is_valid_functional`.
         assert_eq!(
             parse_color("rgb( 50% , 50% , 50% )"),
             Some(ColorForm::Functional)
