@@ -14,6 +14,7 @@
 pub mod catalog;
 pub mod completion;
 pub mod diagnostics;
+pub mod fixes;
 pub mod hover;
 pub mod navigation;
 pub mod schema;
@@ -22,8 +23,11 @@ pub mod style_index;
 pub mod symbols;
 pub mod syntax;
 
+use fixes::Fix;
 use hover::StyleHover;
-use lang_api::{CompletionItem, Diagnostic, DocumentSymbol, LanguageService, SemanticToken};
+use lang_api::{
+    ByteSpan, CompletionItem, Diagnostic, DocumentSymbol, LanguageService, SemanticToken,
+};
 use navigation::{BaseRef, StyleHeaderRef};
 use style_index::{StyleDef, StyleIndex};
 use syntax::SyntaxTree;
@@ -109,6 +113,21 @@ impl OtuiService {
     #[must_use]
     pub fn complete_at(&self, source: &str, offset: usize) -> Vec<CompletionItem> {
         completion::complete_at(source, offset)
+    }
+
+    /// Compute the quick-fixes offered for the byte `range` in `source` (spec §7). Recomputes the
+    /// parse-level diagnostics internally and derives a conservative correction for each fixable
+    /// finding that overlaps `range` — tabs→spaces and indentation rounding for the indentation
+    /// codes, and "did you mean" suggestions (bounded edit distance) for the unknown
+    /// property/state/anchor-edge and invalid `display`/`layout` value codes. Returns an empty vec
+    /// when nothing in `range` is fixable.
+    ///
+    /// Inherent (not on the [`LanguageService`] trait) so the protocol-agnostic trait stays minimal,
+    /// mirroring [`complete_at`](Self::complete_at); the server maps each [`Fix`] onto an
+    /// `lsp_types::CodeAction`.
+    #[must_use]
+    pub fn quick_fixes(&self, source: &str, range: ByteSpan) -> Vec<Fix> {
+        fixes::quick_fixes(source, range)
     }
 }
 

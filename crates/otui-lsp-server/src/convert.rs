@@ -11,7 +11,7 @@ use lang_api::{
 use tower_lsp::lsp_types::{
     CompletionItem as LspCompletionItem, CompletionItemKind as LspCompletionItemKind,
     Diagnostic as LspDiagnostic, DiagnosticSeverity, DocumentSymbol as LspSymbol, Location,
-    NumberOrString, Range, SymbolInformation, SymbolKind as LspSymbolKind, Url,
+    NumberOrString, Range, SymbolInformation, SymbolKind as LspSymbolKind, TextEdit, Url,
 };
 
 use crate::position::{LineIndex, PositionEncoding};
@@ -176,6 +176,21 @@ fn flatten_symbol(
     });
     for child in &sym.children {
         flatten_symbol(uri, child, Some(&sym.name), index, encoding, out);
+    }
+}
+
+/// Convert a single core quick-fix edit — a `(byte span, replacement)` pair — into an LSP
+/// [`TextEdit`], resolving the span against `index` under `encoding`. This is the byte-offset →
+/// protocol seam for [`code_action`](crate::Backend); the replacement text is carried verbatim.
+pub fn text_edit_of(
+    span: ByteSpan,
+    new_text: &str,
+    index: &LineIndex<'_>,
+    encoding: PositionEncoding,
+) -> TextEdit {
+    TextEdit {
+        range: index.range(span.start, span.end, encoding),
+        new_text: new_text.to_owned(),
     }
 }
 
@@ -355,6 +370,28 @@ mod tests {
         assert_eq!(lsp.label, "hover");
         assert_eq!(lsp.kind, Some(LspCompletionItemKind::ENUM_MEMBER));
         assert_eq!(lsp.detail.as_deref(), Some("state"));
+    }
+
+    #[test]
+    fn maps_a_byte_span_edit_to_an_lsp_text_edit() {
+        // A tab on line 1 (bytes 6..7) replaced with two spaces.
+        let text = "Panel\n\tid: main\n";
+        let index = LineIndex::new(text);
+        let edit = text_edit_of(ByteSpan::new(6, 7), "  ", &index, PositionEncoding::Utf16);
+        assert_eq!(edit.range.start, Position::new(1, 0));
+        assert_eq!(edit.range.end, Position::new(1, 1));
+        assert_eq!(edit.new_text, "  ");
+    }
+
+    #[test]
+    fn text_edit_span_counts_utf16_units() {
+        // "café" — 'é' is one UTF-16 unit; a span ending after it maps to column 4, not byte 5.
+        let text = "café";
+        let index = LineIndex::new(text);
+        let edit = text_edit_of(ByteSpan::new(0, 5), "x", &index, PositionEncoding::Utf16);
+        assert_eq!(edit.range.start, Position::new(0, 0));
+        assert_eq!(edit.range.end, Position::new(0, 4));
+        assert_eq!(edit.new_text, "x");
     }
 
     #[test]

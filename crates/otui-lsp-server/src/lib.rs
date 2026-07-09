@@ -17,21 +17,24 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use lang_api::{ByteSpan, LanguageService};
+use otui_core::fixes::Fix;
 use otui_core::hover::{Inheritance, StyleHover, StyleHoverKind};
 use otui_core::style_index::{DocId, StyleIndex};
 use otui_core::OtuiService;
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result as RpcResult;
 use tower_lsp::lsp_types::{
-    CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
+    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
+    CodeActionProviderCapability, CodeActionResponse, CompletionOptions, CompletionParams,
+    CompletionResponse, Diagnostic as LspDiagnostic, DidChangeTextDocumentParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentSymbolParams,
     DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
     HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
-    Location, MarkupContent, MarkupKind, MessageType, OneOf, PositionEncodingKind, SemanticTokens,
-    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SymbolInformation,
-    SymbolKind, TextDocumentSyncCapability, TextDocumentSyncKind, Url, WorkDoneProgressOptions,
-    WorkspaceSymbolParams,
+    Location, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf, PositionEncodingKind,
+    SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
+    SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
+    SymbolInformation, SymbolKind, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Url,
+    WorkDoneProgressOptions, WorkspaceEdit, WorkspaceSymbolParams,
 };
 use tower_lsp::{Client, LanguageServer};
 
@@ -280,6 +283,77 @@ fn append_inherits(value: &mut String, inherits: Option<&Inheritance>) {
     }
 }
 
+/// Build the LSP quick-fix [`CodeAction`]s for the byte `range` in `text` (spec §7).
+///
+/// The engine computes the protocol-agnostic [`Fix`]es; here each becomes a `quickfix` `CodeAction`
+/// whose [`WorkspaceEdit`] carries the fix's [`TextEdit`]s for `uri` (byte spans mapped through a
+/// single [`LineIndex`] under `encoding`). Each action is linked to the client diagnostics it fixes
+/// by matching the fix's diagnostic code against the codes carried in the request's
+/// `context.diagnostics` — so the editor associates the fix with the right squiggle.
+///
+/// Kept as a free function over borrowed state (mirroring [`resolve_base_definition`]) so it is
+/// unit-testable without a live `Client`.
+fn build_code_actions(
+    service: &OtuiService,
+    uri: &Url,
+    text: &str,
+    range: ByteSpan,
+    context: &[LspDiagnostic],
+    encoding: PositionEncoding,
+) -> Vec<CodeActionOrCommand> {
+    let line_index = LineIndex::new(text);
+    service
+        .quick_fixes(text, range)
+        .into_iter()
+        .map(|fix| {
+            let edits: Vec<TextEdit> = fix
+                .edits
+                .iter()
+                .map(|(span, replacement)| {
+                    convert::text_edit_of(*span, replacement, &line_index, encoding)
+                })
+                .collect();
+            let mut changes = HashMap::new();
+            changes.insert(uri.clone(), edits);
+            CodeActionOrCommand::CodeAction(CodeAction {
+                title: fix.title.clone(),
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: matching_diagnostics(&fix, context),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(changes),
+                    document_changes: None,
+                    change_annotations: None,
+                }),
+                command: None,
+                is_preferred: None,
+                disabled: None,
+                data: None,
+            })
+        })
+        .collect()
+}
+
+/// The client diagnostics from the request context that a [`Fix`] addresses — those whose LSP `code`
+/// equals the fix's [`fixes_code`](Fix::fixes_code). `None` when none match (an empty `diagnostics`
+/// array and an absent one both read as "unlinked" to clients, so `None` is the tidy choice).
+fn matching_diagnostics(fix: &Fix, context: &[LspDiagnostic]) -> Option<Vec<LspDiagnostic>> {
+    let matched: Vec<LspDiagnostic> = context
+        .iter()
+        .filter(|d| diagnostic_code(d) == Some(fix.fixes_code))
+        .cloned()
+        .collect();
+    (!matched.is_empty()).then_some(matched)
+}
+
+/// The string diagnostic code of an LSP diagnostic, if it carries one as a string (the shape this
+/// server always emits — see [`convert::to_lsp`]).
+fn diagnostic_code(diag: &LspDiagnostic) -> Option<&str> {
+    match &diag.code {
+        Some(NumberOrString::String(s)) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
 /// True if `version` is still the latest known version for a document (per `latest`, typically
 /// read from the document store) — i.e. diagnostics computed for it are not stale.
 fn is_current_version(latest: Option<i32>, version: i32) -> bool {
@@ -375,6 +449,9 @@ impl LanguageServer for Backend {
                     ]),
                     ..CompletionOptions::default()
                 }),
+                // Code actions: quick-fixes for the parse-level diagnostics (spec §7). A plain
+                // boolean provider — the fixes are computed on demand per request range.
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -556,6 +633,39 @@ impl LanguageServer for Backend {
         let offset = LineIndex::new(&text).offset_at(position, encoding);
         let items = convert::completions_to_lsp(&self.service.complete_at(&text, offset));
         Ok(Some(CompletionResponse::Array(items)))
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> RpcResult<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri;
+        let encoding = self.encoding();
+
+        // Serve from the stored document text; an unknown document has nothing to fix.
+        let Some(text) = self
+            .documents
+            .read()
+            .await
+            .get(&uri)
+            .map(|doc| doc.text.clone())
+        else {
+            return Ok(None);
+        };
+
+        // Map the requested LSP range to a byte span, then let the engine compute the fixes that
+        // overlap it. An empty list is a valid answer (nothing fixable here); return it as such.
+        let line_index = LineIndex::new(&text);
+        let range = ByteSpan::new(
+            line_index.offset_at(params.range.start, encoding),
+            line_index.offset_at(params.range.end, encoding),
+        );
+        let actions = build_code_actions(
+            &self.service,
+            &uri,
+            &text,
+            range,
+            &params.context.diagnostics,
+            encoding,
+        );
+        Ok(Some(actions))
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -1072,6 +1182,105 @@ mod tests {
         assert!(OtuiService::new()
             .style_hover_at(src, offset, &index)
             .is_none());
+    }
+
+    /// The [`CodeAction`] inside a [`CodeActionOrCommand`] (panics if it is a bare command).
+    fn as_action(item: &CodeActionOrCommand) -> &CodeAction {
+        match item {
+            CodeActionOrCommand::CodeAction(a) => a,
+            other => panic!("expected a CodeAction, got {other:?}"),
+        }
+    }
+
+    /// The single `(Url, Vec<TextEdit>)` change set of an action's workspace edit.
+    fn only_change(action: &CodeAction) -> (&Url, &Vec<TextEdit>) {
+        let changes = action
+            .edit
+            .as_ref()
+            .expect("has a workspace edit")
+            .changes
+            .as_ref()
+            .expect("has changes");
+        assert_eq!(changes.len(), 1, "one document is edited");
+        changes.iter().next().expect("one entry")
+    }
+
+    #[test]
+    fn code_action_offers_tabs_to_spaces_fix_with_a_workspace_edit() {
+        let uri = Url::parse("file:///a.otui").expect("uri");
+        let text = "Panel\n\tid: main\n";
+        // A range over the tab-indented line, no client-supplied context diagnostics.
+        let range = ByteSpan::new(6, 15);
+        let actions = build_code_actions(
+            &OtuiService::new(),
+            &uri,
+            text,
+            range,
+            &[],
+            PositionEncoding::Utf16,
+        );
+        assert_eq!(actions.len(), 1);
+        let action = as_action(&actions[0]);
+        assert_eq!(action.title, "Convert tabs to spaces");
+        assert_eq!(action.kind, Some(CodeActionKind::QUICKFIX));
+        let (edited_uri, edits) = only_change(action);
+        assert_eq!(*edited_uri, uri);
+        assert_eq!(edits.len(), 1);
+        // The tab at line 1, column 0 becomes two spaces.
+        assert_eq!(edits[0].range.start, Position::new(1, 0));
+        assert_eq!(edits[0].range.end, Position::new(1, 1));
+        assert_eq!(edits[0].new_text, "  ");
+        // No context diagnostic was supplied to link to.
+        assert!(action.diagnostics.is_none());
+    }
+
+    #[test]
+    fn code_action_links_the_matching_context_diagnostic() {
+        let uri = Url::parse("file:///a.otui").expect("uri");
+        let text = "Panel\n  widht: 10\n";
+        // The client sends back the unknown-property diagnostic it received for `widht`.
+        let widht = text.find("widht").expect("present");
+        let diag = LspDiagnostic {
+            range: LineIndex::new(text).range(widht, widht + 5, PositionEncoding::Utf16),
+            code: Some(NumberOrString::String("unknown-property".to_owned())),
+            source: Some("otui".to_owned()),
+            message: "unknown property".to_owned(),
+            ..LspDiagnostic::default()
+        };
+        let range = ByteSpan::new(widht, widht + 5);
+        let actions = build_code_actions(
+            &OtuiService::new(),
+            &uri,
+            text,
+            range,
+            std::slice::from_ref(&diag),
+            PositionEncoding::Utf16,
+        );
+        // The best suggestion is `width`; it must be linked to the supplied diagnostic.
+        let action = as_action(&actions[0]);
+        assert_eq!(action.title, "Did you mean `width`?");
+        assert_eq!(
+            action.diagnostics.as_deref(),
+            Some(std::slice::from_ref(&diag))
+        );
+        let (_, edits) = only_change(action);
+        assert_eq!(edits[0].new_text, "width");
+    }
+
+    #[test]
+    fn code_action_returns_empty_when_nothing_in_range_is_fixable() {
+        let uri = Url::parse("file:///a.otui").expect("uri");
+        // A clean document: no diagnostics, so no fixes anywhere.
+        let text = "MainWindow < UIWindow\n  id: main\n";
+        let actions = build_code_actions(
+            &OtuiService::new(),
+            &uri,
+            text,
+            ByteSpan::new(0, text.len()),
+            &[],
+            PositionEncoding::Utf16,
+        );
+        assert!(actions.is_empty());
     }
 
     #[test]
