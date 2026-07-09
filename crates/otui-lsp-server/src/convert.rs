@@ -4,7 +4,7 @@
 //! code and span are translated; `source` is stamped as `"otui"` so clients can group findings.
 
 use lang_api::{
-    Diagnostic as CoreDiagnostic, DocumentSymbol as CoreSymbol, Severity,
+    ByteSpan, Diagnostic as CoreDiagnostic, DocumentSymbol as CoreSymbol, Severity,
     SymbolKind as CoreSymbolKind,
 };
 use tower_lsp::lsp_types::{
@@ -54,6 +54,19 @@ pub fn all_to_lsp(
 ) -> Vec<LspDiagnostic> {
     let index = LineIndex::new(text);
     diags.iter().map(|d| to_lsp(d, &index, encoding)).collect()
+}
+
+/// Build an LSP [`Location`] for a byte `span` inside `text`, under `encoding`.
+///
+/// Used by go-to-definition (spec §5.3): a resolved target's `name_span` is a byte span into **its
+/// own** document's text, so this must be called with that target document's text (not the request
+/// document's), building a fresh [`LineIndex`] over it.
+pub fn location_of(uri: Url, text: &str, span: ByteSpan, encoding: PositionEncoding) -> Location {
+    let index = LineIndex::new(text);
+    Location {
+        uri,
+        range: index.range(span.start, span.end, encoding),
+    }
 }
 
 /// Map a protocol-agnostic [`CoreSymbolKind`] onto its LSP `SymbolKind`.

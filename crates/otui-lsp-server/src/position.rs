@@ -109,6 +109,55 @@ impl<'a> LineIndex<'a> {
         }
     }
 
+    /// Convert an LSP [`Position`] into a byte offset under `encoding` — the inverse of
+    /// [`position`](Self::position).
+    ///
+    /// Clamping rules mirror `position`'s tolerance so the two round-trip:
+    /// * a `line` past the last line clamps to the end of the document;
+    /// * a `character` past the end of its line's content clamps to the line end (just before the
+    ///   trailing newline, or the document end for the last line);
+    /// * a `character` that would land inside a multi-byte UTF-8 sequence clamps down to that
+    ///   character's start, so the returned offset is always on a char boundary.
+    pub fn offset_at(&self, position: Position, encoding: PositionEncoding) -> usize {
+        let line = position.line as usize;
+        // A line past the end clamps to the document end.
+        let Some(&line_start) = self.line_starts.get(line) else {
+            return self.text.len();
+        };
+        // The byte at which the next line begins (or the document end for the last line). The line's
+        // own content excludes a trailing `\n`, so the column never crosses onto the next line.
+        let next_line_start = self
+            .line_starts
+            .get(line + 1)
+            .copied()
+            .unwrap_or(self.text.len());
+        let mut content_end = next_line_start;
+        if content_end > line_start && self.text.as_bytes()[content_end - 1] == b'\n' {
+            content_end -= 1;
+        }
+        let line_text = &self.text[line_start..content_end];
+
+        let target = position.character as usize;
+        let mut units = 0usize;
+        for (byte_idx, ch) in line_text.char_indices() {
+            if units >= target {
+                return line_start + byte_idx;
+            }
+            let width = match encoding {
+                PositionEncoding::Utf8 => ch.len_utf8(),
+                PositionEncoding::Utf16 => ch.len_utf16(),
+            };
+            // The target lands inside this character's code units: clamp to the character start so
+            // the offset stays on a char boundary rather than splitting a UTF-8 sequence.
+            if units + width > target {
+                return line_start + byte_idx;
+            }
+            units += width;
+        }
+        // The character ran past the line's content: clamp to the line end.
+        content_end
+    }
+
     /// Convert a `[start, end)` byte span into an LSP [`Range`].
     pub fn range(&self, start: usize, end: usize, encoding: PositionEncoding) -> Range {
         Range {
@@ -209,6 +258,79 @@ mod tests {
         assert_eq!(idx.encoded_len(0, 5, PositionEncoding::Utf8), 5);
         // A char landing on a non-boundary end clamps down.
         assert_eq!(idx.encoded_len(0, 4, PositionEncoding::Utf16), 3);
+    }
+
+    #[test]
+    fn offset_at_inverts_position_on_ascii() {
+        let text = "Panel\n  id: main\n";
+        let idx = LineIndex::new(text);
+        for enc in [PositionEncoding::Utf16, PositionEncoding::Utf8] {
+            // Every char-boundary offset round-trips: offset → Position → offset.
+            for offset in 0..=text.len() {
+                if !text.is_char_boundary(offset) {
+                    continue;
+                }
+                let pos = idx.position(offset, enc);
+                assert_eq!(
+                    idx.offset_at(pos, enc),
+                    offset,
+                    "offset {offset} enc {enc:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn offset_at_round_trips_a_multibyte_line() {
+        // 'é' is 2 UTF-8 bytes / 1 UTF-16 unit; 'ä' likewise. Round-trip every boundary offset.
+        let text = "café < ä\n  id: x\n";
+        let idx = LineIndex::new(text);
+        for enc in [PositionEncoding::Utf16, PositionEncoding::Utf8] {
+            for offset in 0..=text.len() {
+                if !text.is_char_boundary(offset) {
+                    continue;
+                }
+                let pos = idx.position(offset, enc);
+                assert_eq!(
+                    idx.offset_at(pos, enc),
+                    offset,
+                    "offset {offset} enc {enc:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn offset_at_clamps_out_of_range_line_to_document_end() {
+        let text = "Panel\n";
+        let idx = LineIndex::new(text);
+        let pos = Position::new(99, 0);
+        assert_eq!(idx.offset_at(pos, PositionEncoding::Utf16), text.len());
+    }
+
+    #[test]
+    fn offset_at_clamps_out_of_range_character_to_line_end() {
+        // Character past the line content clamps to just before the newline (line end), never onto
+        // the next line.
+        let text = "Panel\nHi\n";
+        let idx = LineIndex::new(text);
+        // Line 0 content is "Panel" (bytes 0..5); a huge column clamps to byte 5, not into line 1.
+        assert_eq!(
+            idx.offset_at(Position::new(0, 99), PositionEncoding::Utf16),
+            5
+        );
+    }
+
+    #[test]
+    fn offset_at_clamps_character_inside_multibyte_to_char_start() {
+        // Under UTF-8, 'é' spans byte columns 3..5. A target column of 4 lands inside it and must
+        // clamp down to the character start (byte offset 3), staying on a char boundary.
+        let text = "café";
+        let idx = LineIndex::new(text);
+        assert_eq!(
+            idx.offset_at(Position::new(0, 4), PositionEncoding::Utf8),
+            3
+        );
     }
 
     #[test]
