@@ -74,6 +74,57 @@ pub const MAGIC_ANCHOR_TARGETS: &[&str] = &["parent", "next", "prev"];
 /// kept as their own small set rather than folded into [`ANCHOR_EDGES`].
 pub const SHORTHAND_ANCHORS: &[&str] = &["fill", "centerIn"];
 
+/// The closed set of accepted `display` values (spec §2.10), from the engine's `display`-style
+/// dispatch. Validated against the engine source: the parser lowercases the value and compares it
+/// against this fixed list; any value outside it makes the parser **throw** (`Invalid display value`),
+/// so an unknown `display` value is a hard error. Membership is therefore case-insensitive (see
+/// [`is_display_value`]); the canonical authored spelling is lowercase/kebab.
+pub const DISPLAY_VALUES: &[&str] = &[
+    "none",
+    "block",
+    "inline",
+    "inline-block",
+    "flex",
+    "inline-flex",
+    "grid",
+    "inline-grid",
+    "table",
+    "table-row-group",
+    "table-header-group",
+    "table-footer-group",
+    "table-row",
+    "table-cell",
+    "table-column-group",
+    "table-column",
+    "table-caption",
+    "list-item",
+    "run-in",
+    "contents",
+    "initial",
+    "inherit",
+];
+
+/// The closed set of accepted `layout` **type** values (spec §2.10). Validated against the engine
+/// source: the `layout` style resolves a type either from the leaf value (`layout: <type>`) or from a
+/// nested `type:` child (`layout:` block), then compares it against this fixed list; a **non-empty**
+/// value outside it makes the parser **throw** (`cannot determine layout type`), so an unknown layout
+/// type is a hard error. The comparison is an exact, **case-sensitive** match (the engine does not
+/// lowercase the type), so the canonical camelCase spelling is required (see [`is_layout_type`]).
+pub const LAYOUT_TYPES: &[&str] = &["horizontalBox", "verticalBox", "grid", "anchor"];
+
+/// The `border` shorthand **style** keywords, consumed (and ignored) by the engine's `border` parser
+/// while it scans for a width and a color. Validated against the engine source: each is matched
+/// case-insensitively and skipped, contributing neither a width nor a color. (`none`/`hidden` are
+/// also the single-token "no border" spelling — see [`is_valid_border`].)
+pub const BORDER_STYLE_KEYWORDS: &[&str] = &[
+    "solid", "dashed", "dotted", "double", "groove", "ridge", "inset", "outset", "hidden", "none",
+];
+
+/// The `border` shorthand **named width** keywords (CSS `thin`/`medium`/`thick`), matched
+/// case-insensitively by the engine's `border` parser and counting as a width. Validated against the
+/// engine source.
+pub const BORDER_WIDTH_KEYWORDS: &[&str] = &["thin", "medium", "thick"];
+
 /// The known `@event` handler names (spec §2.5), completion-worthy at the `@`-key position.
 ///
 /// Unlike the other sets in this module, this one is **fork-dependent**: it comes from the spec's
@@ -158,6 +209,82 @@ pub fn is_magic_anchor_target(name: &str) -> bool {
 #[must_use]
 pub fn is_shorthand_anchor(name: &str) -> bool {
     SHORTHAND_ANCHORS.contains(&name)
+}
+
+/// True if `value` is an accepted `display` value ([`DISPLAY_VALUES`]). Case-insensitive and trimmed,
+/// mirroring the engine, which lowercases the value before comparing. A `false` here is an engine
+/// error: an unknown `display` value makes the style parser throw.
+#[must_use]
+pub fn is_display_value(value: &str) -> bool {
+    contains_ascii_ci(DISPLAY_VALUES, value.trim())
+}
+
+/// True if `value` is an accepted `layout` type ([`LAYOUT_TYPES`]). **Exact**, case-sensitive match
+/// (trimmed): the engine compares the resolved type verbatim, so a mis-cased `verticalbox` is not a
+/// layout type and makes the parser throw.
+#[must_use]
+pub fn is_layout_type(value: &str) -> bool {
+    LAYOUT_TYPES.contains(&value.trim())
+}
+
+/// True if `value` is a well-formed `border` shorthand, faithful to the engine's `border` parser.
+///
+/// The engine splits the value on spaces (dropping empty tokens) and then:
+/// * a single `none`/`hidden` token (case-insensitive) is the "no border" spelling — accepted;
+/// * otherwise every token is classified in order: a style keyword ([`BORDER_STYLE_KEYWORDS`]) is
+///   skipped; the first token that parses as a color (hex/functional/named) supplies the color; a
+///   `thin`/`medium`/`thick` keyword or any token containing a digit supplies the width;
+/// * the value is valid **iff** both a width and a color were found — the engine throws
+///   (`border param must include width and color`) when either is missing.
+///
+/// Color detection reuses the same color grammar the engine's `safe_cast<Color>` uses
+/// ([`is_valid_color`]/[`is_named_color`]), so this stays consistent with the engine's own token
+/// classification. An empty value yields no width and no color, so it is invalid (the engine throws).
+#[must_use]
+pub fn is_valid_border(value: &str) -> bool {
+    let tokens: Vec<&str> = value.split_whitespace().collect();
+    if tokens.is_empty() {
+        return false;
+    }
+    if tokens.len() == 1 {
+        let lower = tokens[0].to_ascii_lowercase();
+        if lower == "none" || lower == "hidden" {
+            return true;
+        }
+    }
+    let mut has_width = false;
+    let mut has_color = false;
+    for token in tokens {
+        let lower = token.to_ascii_lowercase();
+        if BORDER_STYLE_KEYWORDS.contains(&lower.as_str()) {
+            continue;
+        }
+        // The engine tries the color cast before the width, so a token that parses as a color is a
+        // color even if it also happens to contain a digit (e.g. a `#123` hex literal).
+        if !has_color && (is_valid_color(token) || is_named_color(token)) {
+            has_color = true;
+            continue;
+        }
+        if !has_width {
+            if BORDER_WIDTH_KEYWORDS.contains(&lower.as_str()) {
+                has_width = true;
+                continue;
+            }
+            if token.bytes().any(|b| b.is_ascii_digit()) {
+                has_width = true;
+            }
+        }
+    }
+    has_width && has_color
+}
+
+/// True if `value` is a valid color for a `border-color*` sub-property: a hex/functional literal
+/// ([`is_valid_color`]) or a named color ([`is_named_color`]). The engine reads these through
+/// `value<Color>`, which **throws** on a value it cannot parse, so a `false` here is an engine error.
+#[must_use]
+pub fn is_border_color_value(value: &str) -> bool {
+    let v = value.trim();
+    is_valid_color(v) || is_named_color(v)
 }
 
 /// True if `name` is one of the enumerated known `@event` handler names ([`EVENTS`]). Exact match:
@@ -466,6 +593,73 @@ mod tests {
         assert!(!is_known_property("not-a-property"));
         assert!(!is_known_property("Width")); // exact (case-sensitive) tag compare
         assert!(!is_known_property(""));
+    }
+
+    #[test]
+    fn display_values_are_recognized_case_insensitively() {
+        for v in DISPLAY_VALUES {
+            assert!(is_display_value(v), "{v} should be a display value");
+        }
+        // The engine lowercases before matching, so a mis-cased value is still accepted.
+        assert!(is_display_value("Flex"));
+        assert!(is_display_value("TABLE-CELL"));
+        assert!(is_display_value("  block  "));
+    }
+
+    #[test]
+    fn unknown_display_value_is_rejected() {
+        assert!(!is_display_value("blocky"));
+        assert!(!is_display_value("row")); // a flex-direction value, not a display value
+        assert!(!is_display_value(""));
+    }
+
+    #[test]
+    fn layout_types_are_recognized_case_sensitively() {
+        for v in LAYOUT_TYPES {
+            assert!(is_layout_type(v), "{v} should be a layout type");
+        }
+        assert!(is_layout_type("  verticalBox  ")); // trimmed
+                                                    // Exact, case-sensitive: the engine compares the type verbatim.
+        assert!(!is_layout_type("verticalbox"));
+        assert!(!is_layout_type("VerticalBox"));
+    }
+
+    #[test]
+    fn unknown_layout_type_is_rejected() {
+        assert!(!is_layout_type("box"));
+        assert!(!is_layout_type("flex"));
+        assert!(!is_layout_type(""));
+    }
+
+    #[test]
+    fn valid_border_shorthands_are_accepted() {
+        assert!(is_valid_border("1 red")); // width + named color
+        assert!(is_valid_border("red 1")); // order-independent
+        assert!(is_valid_border("2 solid #ff0000")); // style keyword skipped
+        assert!(is_valid_border("thick dashed blue")); // named width + style + color
+        assert!(is_valid_border("none")); // single "no border" keyword
+        assert!(is_valid_border("hidden"));
+        assert!(is_valid_border("HIDDEN")); // case-insensitive keyword
+        assert!(is_valid_border("#abc 3")); // hex color counts as color, digit as width
+    }
+
+    #[test]
+    fn invalid_border_shorthands_are_rejected() {
+        assert!(!is_valid_border("red")); // color only, no width
+        assert!(!is_valid_border("1")); // width only, no color
+        assert!(!is_valid_border("solid")); // style keyword only
+        assert!(!is_valid_border("bogus stuff")); // neither width nor color
+        assert!(!is_valid_border("")); // empty -> engine throws
+    }
+
+    #[test]
+    fn border_color_values_follow_the_color_grammar() {
+        assert!(is_border_color_value("red"));
+        assert!(is_border_color_value("#ff0000"));
+        assert!(is_border_color_value("rgba(1,2,3,0.5)"));
+        assert!(!is_border_color_value("notacolor"));
+        assert!(!is_border_color_value("1"));
+        assert!(!is_border_color_value(""));
     }
 
     #[test]
