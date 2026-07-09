@@ -11,6 +11,7 @@
 //! wires the [`LanguageService`] entry point to the parse-level [`diagnostics`] pass over the
 //! tree-sitter [`syntax`] substrate.
 
+pub mod completion;
 pub mod diagnostics;
 pub mod hover;
 pub mod navigation;
@@ -21,7 +22,7 @@ pub mod symbols;
 pub mod syntax;
 
 use hover::StyleHover;
-use lang_api::{Diagnostic, DocumentSymbol, LanguageService, SemanticToken};
+use lang_api::{CompletionItem, Diagnostic, DocumentSymbol, LanguageService, SemanticToken};
 use navigation::{BaseRef, StyleHeaderRef};
 use style_index::{StyleDef, StyleIndex};
 use syntax::SyntaxTree;
@@ -94,6 +95,19 @@ impl OtuiService {
         index: &StyleIndex,
     ) -> Option<StyleHover> {
         hover::style_hover_at(source, offset, index)
+    }
+
+    /// Compute completion candidates for the cursor at byte `offset` (spec §6). Returns the OTML
+    /// **closed set** that applies — `$state` names, `anchors.<edge>` edges, magic anchor targets,
+    /// or `@event` names — or an empty vec when the cursor is not in one of those contexts. Property
+    /// names and colors are deliberately not offered (that catalog is a later node); see
+    /// [`completion`].
+    ///
+    /// Inherent (not on the [`LanguageService`] trait) so the protocol-agnostic trait stays minimal
+    /// and mirrors [`base_reference_at`](Self::base_reference_at) / [`style_header_at`](Self::style_header_at).
+    #[must_use]
+    pub fn complete_at(&self, source: &str, offset: usize) -> Vec<CompletionItem> {
+        completion::complete_at(source, offset)
     }
 }
 

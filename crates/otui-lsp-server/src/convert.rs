@@ -4,10 +4,12 @@
 //! code and span are translated; `source` is stamped as `"otui"` so clients can group findings.
 
 use lang_api::{
-    ByteSpan, Diagnostic as CoreDiagnostic, DocumentSymbol as CoreSymbol, Severity,
+    ByteSpan, CompletionItem as CoreCompletionItem, CompletionKind as CoreCompletionKind,
+    Diagnostic as CoreDiagnostic, DocumentSymbol as CoreSymbol, Severity,
     SymbolKind as CoreSymbolKind,
 };
 use tower_lsp::lsp_types::{
+    CompletionItem as LspCompletionItem, CompletionItemKind as LspCompletionItemKind,
     Diagnostic as LspDiagnostic, DiagnosticSeverity, DocumentSymbol as LspSymbol, Location,
     NumberOrString, Range, SymbolInformation, SymbolKind as LspSymbolKind, Url,
 };
@@ -177,10 +179,41 @@ fn flatten_symbol(
     }
 }
 
+/// Map a protocol-agnostic [`CoreCompletionKind`] onto its LSP `CompletionItemKind`.
+///
+/// The enum-member kinds (`$state` names, anchor edges) surface as `ENUM_MEMBER`; a magic anchor
+/// target keyword as `VALUE`; an `@event` name as `EVENT`; the deferred property-name seam as
+/// `KEYWORD`.
+fn completion_kind_to_lsp(kind: CoreCompletionKind) -> LspCompletionItemKind {
+    match kind {
+        CoreCompletionKind::EnumMember => LspCompletionItemKind::ENUM_MEMBER,
+        CoreCompletionKind::Value => LspCompletionItemKind::VALUE,
+        CoreCompletionKind::Event => LspCompletionItemKind::EVENT,
+        CoreCompletionKind::Keyword => LspCompletionItemKind::KEYWORD,
+    }
+}
+
+/// Convert a single core [`CompletionItem`](CoreCompletionItem) into an `lsp_types::CompletionItem`,
+/// carrying its label, kind and detail. Completion labels are already the value to insert (no span
+/// remapping needed — the client applies them at the cursor).
+pub fn completion_item_to_lsp(item: &CoreCompletionItem) -> LspCompletionItem {
+    LspCompletionItem {
+        label: item.label.clone(),
+        kind: Some(completion_kind_to_lsp(item.kind)),
+        detail: item.detail.clone(),
+        ..LspCompletionItem::default()
+    }
+}
+
+/// Convert every core completion item into its LSP form, preserving order.
+pub fn completions_to_lsp(items: &[CoreCompletionItem]) -> Vec<LspCompletionItem> {
+    items.iter().map(completion_item_to_lsp).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lang_api::{ByteSpan, LanguageService};
+    use lang_api::{ByteSpan, CompletionKind as CoreCompletionKind, LanguageService};
     use otui_core::OtuiService;
     use tower_lsp::lsp_types::Position;
 
@@ -289,6 +322,56 @@ mod tests {
         assert_eq!(label.selection_range.end, Position::new(2, 7));
         // A leaf's children collapse to `None`, not an empty vec.
         assert!(label.children.is_none());
+    }
+
+    #[test]
+    fn maps_completion_kinds_to_lsp() {
+        assert_eq!(
+            completion_kind_to_lsp(CoreCompletionKind::EnumMember),
+            LspCompletionItemKind::ENUM_MEMBER
+        );
+        assert_eq!(
+            completion_kind_to_lsp(CoreCompletionKind::Value),
+            LspCompletionItemKind::VALUE
+        );
+        assert_eq!(
+            completion_kind_to_lsp(CoreCompletionKind::Event),
+            LspCompletionItemKind::EVENT
+        );
+        assert_eq!(
+            completion_kind_to_lsp(CoreCompletionKind::Keyword),
+            LspCompletionItemKind::KEYWORD
+        );
+    }
+
+    #[test]
+    fn completion_item_carries_label_kind_and_detail() {
+        let core = CoreCompletionItem {
+            label: "hover".to_owned(),
+            kind: CoreCompletionKind::EnumMember,
+            detail: Some("state".to_owned()),
+        };
+        let lsp = completion_item_to_lsp(&core);
+        assert_eq!(lsp.label, "hover");
+        assert_eq!(lsp.kind, Some(LspCompletionItemKind::ENUM_MEMBER));
+        assert_eq!(lsp.detail.as_deref(), Some("state"));
+    }
+
+    #[test]
+    fn end_to_end_from_cursor_position_to_completion_items() {
+        // Position → byte offset → engine completion → LSP items, the same path the handler drives.
+        let text = "Button\n  $\n";
+        // Cursor just past the `$` on line 1 (column 3).
+        let position = Position::new(1, 3);
+        let offset = LineIndex::new(text).offset_at(position, PositionEncoding::Utf16);
+        let core = OtuiService::new().complete_at(text, offset);
+        let lsp = completions_to_lsp(&core);
+        // Every state name comes back, as ENUM_MEMBER, in schema order.
+        let labels: Vec<&str> = lsp.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, otui_core::schema::STATES);
+        assert!(lsp
+            .iter()
+            .all(|i| i.kind == Some(LspCompletionItemKind::ENUM_MEMBER)));
     }
 
     #[test]
