@@ -15,6 +15,7 @@ pub mod catalog;
 pub mod completion;
 pub mod diagnostics;
 pub mod fixes;
+pub mod folding;
 pub mod format;
 pub mod hover;
 pub mod navigation;
@@ -146,6 +147,19 @@ impl OtuiService {
     #[must_use]
     pub fn format(&self, source: &str) -> Option<String> {
         format::format(source)
+    }
+
+    /// Compute the folding ranges for `source` (spec §2): one collapsible region per multi-line
+    /// widget block (`container` / `style_header`) and per multi-line block-scalar body, plus one
+    /// per run of consecutive full-line comments. Line numbers are 0-based; a single-line construct
+    /// yields no fold. Returns an empty vec when the source cannot be parsed.
+    ///
+    /// Inherent (not on the [`LanguageService`] trait) so the protocol-agnostic trait stays minimal,
+    /// mirroring [`format`](Self::format); the server maps each [`FoldRange`](folding::FoldRange)
+    /// onto an `lsp_types::FoldingRange`.
+    #[must_use]
+    pub fn folding_ranges(&self, source: &str) -> Vec<folding::FoldRange> {
+        folding::folding_ranges(source)
     }
 }
 

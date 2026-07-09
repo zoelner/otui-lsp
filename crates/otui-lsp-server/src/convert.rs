@@ -8,10 +8,12 @@ use lang_api::{
     Diagnostic as CoreDiagnostic, DocumentSymbol as CoreSymbol, Severity,
     SymbolKind as CoreSymbolKind,
 };
+use otui_core::folding::{FoldKind as CoreFoldKind, FoldRange as CoreFoldRange};
 use tower_lsp::lsp_types::{
     CompletionItem as LspCompletionItem, CompletionItemKind as LspCompletionItemKind,
-    Diagnostic as LspDiagnostic, DiagnosticSeverity, DocumentSymbol as LspSymbol, Location,
-    NumberOrString, Position, Range, SymbolInformation, SymbolKind as LspSymbolKind, TextEdit, Url,
+    Diagnostic as LspDiagnostic, DiagnosticSeverity, DocumentSymbol as LspSymbol, FoldingRange,
+    FoldingRangeKind, Location, NumberOrString, Position, Range, SymbolInformation,
+    SymbolKind as LspSymbolKind, TextEdit, Url,
 };
 
 use crate::position::{LineIndex, PositionEncoding};
@@ -241,6 +243,32 @@ pub fn full_document_edit(text: &str, new_text: String, encoding: PositionEncodi
     }
 }
 
+/// Map a protocol-agnostic [`CoreFoldKind`] onto its LSP `FoldingRangeKind`. A widget block or
+/// block-scalar body is a `Region`; a run of comments is a `Comment`.
+fn fold_kind_to_lsp(kind: CoreFoldKind) -> FoldingRangeKind {
+    match kind {
+        CoreFoldKind::Region => FoldingRangeKind::Region,
+        CoreFoldKind::Comment => FoldingRangeKind::Comment,
+    }
+}
+
+/// Convert a single core [`FoldRange`](CoreFoldRange) into an `lsp_types::FoldingRange`. The line
+/// numbers are already 0-based and carried verbatim (no character offsets — this server folds whole
+/// lines); the kind is mapped through [`fold_kind_to_lsp`].
+pub fn fold_to_lsp(fold: &CoreFoldRange) -> FoldingRange {
+    FoldingRange {
+        start_line: fold.start_line,
+        end_line: fold.end_line,
+        kind: Some(fold_kind_to_lsp(fold.kind)),
+        ..FoldingRange::default()
+    }
+}
+
+/// Convert every core fold range into its LSP form, preserving order.
+pub fn folds_to_lsp(folds: &[CoreFoldRange]) -> Vec<FoldingRange> {
+    folds.iter().map(fold_to_lsp).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,6 +474,54 @@ mod tests {
         // unterminated inline array → `ERROR` node) yields `None` from the engine, so the server
         // returns no edits rather than a spurious whole-document replace.
         assert!(OtuiService::new().format("x: [a, b\n").is_none());
+    }
+
+    #[test]
+    fn maps_fold_range_kinds_and_lines_to_lsp() {
+        // A structural region maps to `Region`, carrying its 0-based lines verbatim.
+        let region = CoreFoldRange {
+            start_line: 0,
+            end_line: 3,
+            kind: CoreFoldKind::Region,
+        };
+        let lsp = fold_to_lsp(&region);
+        assert_eq!(lsp.start_line, 0);
+        assert_eq!(lsp.end_line, 3);
+        assert_eq!(lsp.kind, Some(FoldingRangeKind::Region));
+        // Whole-line folds carry no character offsets.
+        assert!(lsp.start_character.is_none());
+        assert!(lsp.end_character.is_none());
+
+        // A comment run maps to `Comment`.
+        let comment = CoreFoldRange {
+            start_line: 5,
+            end_line: 7,
+            kind: CoreFoldKind::Comment,
+        };
+        let lsp = fold_to_lsp(&comment);
+        assert_eq!(lsp.start_line, 5);
+        assert_eq!(lsp.end_line, 7);
+        assert_eq!(lsp.kind, Some(FoldingRangeKind::Comment));
+    }
+
+    #[test]
+    fn converts_a_batch_of_fold_ranges_preserving_order() {
+        let folds = [
+            CoreFoldRange {
+                start_line: 0,
+                end_line: 4,
+                kind: CoreFoldKind::Region,
+            },
+            CoreFoldRange {
+                start_line: 2,
+                end_line: 4,
+                kind: CoreFoldKind::Region,
+            },
+        ];
+        let lsp = folds_to_lsp(&folds);
+        assert_eq!(lsp.len(), 2);
+        assert_eq!(lsp[0].start_line, 0);
+        assert_eq!(lsp[1].start_line, 2);
     }
 
     #[test]

@@ -28,8 +28,9 @@ use tower_lsp::lsp_types::{
     CodeActionProviderCapability, CodeActionResponse, CompletionOptions, CompletionParams,
     CompletionResponse, Diagnostic as LspDiagnostic, DidChangeTextDocumentParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
-    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
-    Hover, HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
+    DocumentSymbolParams, DocumentSymbolResponse, FoldingRange, FoldingRangeParams,
+    FoldingRangeProviderCapability, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
     InitializedParams, Location, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf,
     PositionEncodingKind, SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions,
     SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
@@ -431,6 +432,9 @@ impl LanguageServer for Backend {
                 ),
                 // Document symbols: the widget-hierarchy outline for a `.otui` document.
                 document_symbol_provider: Some(OneOf::Left(true)),
+                // Folding ranges: collapsible widget blocks, block-scalar bodies and comment runs
+                // (spec §2).
+                folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 // Go-to-definition: `Name < Base` inheritance references (spec §5.3).
                 definition_provider: Some(OneOf::Left(true)),
                 // Workspace symbols: the global `Name < Base` style namespace (spec §5.2).
@@ -533,6 +537,26 @@ impl LanguageServer for Backend {
             ))
         };
         Ok(Some(response))
+    }
+
+    async fn folding_range(
+        &self,
+        params: FoldingRangeParams,
+    ) -> RpcResult<Option<Vec<FoldingRange>>> {
+        let uri = params.text_document.uri;
+        // Serve from the stored document text; an unknown document has nothing to fold.
+        let Some(text) = self
+            .documents
+            .read()
+            .await
+            .get(&uri)
+            .map(|doc| doc.text.clone())
+        else {
+            return Ok(None);
+        };
+
+        let folds = self.service.folding_ranges(&text);
+        Ok(Some(convert::folds_to_lsp(&folds)))
     }
 
     async fn goto_definition(
