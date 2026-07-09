@@ -15,9 +15,11 @@
 //! The `@event` handler names are taken from the spec's enumerated list (§2.5); that set is
 //! fork-dependent and may later be refined directly against the engine (see [`EVENTS`]).
 //!
-//! Everything is pure: no I/O, no `lsp-types`, ASCII/byte world only. The ~100 property names are
-//! deliberately **not** here — that large open-ish catalog belongs to the xtask extraction node;
-//! this module is only the small closed sets plus the color grammar forms.
+//! Everything is pure: no I/O, no `lsp-types`, ASCII/byte world only. The larger, open-ish catalogs
+//! — the ~150 property names and the ~150 named colors — are **not** hand-written here: they live in
+//! the generated [`crate::catalog`] module (produced by `cargo xtask gen-catalog` from the engine
+//! source) and this module exposes membership helpers over them ([`is_known_property`],
+//! [`is_named_color`]). This module still owns the small closed sets plus the color grammar forms.
 
 /// The closed set of `$state` selector names (spec §2.8), exactly as recognized by the engine's
 /// `Fw::translateState`. Verified against the source: **14** names, and this list is their
@@ -118,54 +120,11 @@ pub const EVENTS: &[&str] = &[
     "onTextAreaUpdate",
 ];
 
-/// A **partial**, explicitly-incomplete set of named colors (lowercase), covering the legacy
-/// engine-specific names (`alpha`, `darkRed`, `lightGray`, …) plus the most common CSS names.
-///
-// TODO(xtask): full named-color table extracted from color.cpp (the ~150-entry CSS table plus the
-// `transparent` alias). This partial set is only the obvious/legacy names the spec calls out; the
-// xtask catalog node replaces it with the complete list. Keep [`is_named_color`] as the seam.
-const NAMED_COLORS_PARTIAL: &[&str] = &[
-    // Legacy engine-specific names (Color:: statics), lowercased for case-insensitive lookup.
-    "alpha",
-    "black",
-    "white",
-    "red",
-    "darkred",
-    "green",
-    "darkgreen",
-    "blue",
-    "darkblue",
-    "pink",
-    "darkpink",
-    "yellow",
-    "darkyellow",
-    "teal",
-    "darkteal",
-    "gray",
-    "darkgray",
-    "lightgray",
-    "orange",
-    // A handful of the most common CSS names + the `transparent` alias.
-    "transparent",
-    "cyan",
-    "magenta",
-    "lime",
-    "navy",
-    "purple",
-    "silver",
-    "maroon",
-    "olive",
-    "aqua",
-    "fuchsia",
-    "gold",
-    "grey",
-];
-
 /// A recognized color-value form (spec §2.9), returned by [`parse_color`].
 ///
 /// Only the two *parseable* forms are represented; named colors are handled separately by
-/// [`is_named_color`] because their catalog is (for now) partial. To decide whether an arbitrary
-/// value is a valid color, use `is_valid_color(v) || is_named_color(v)`.
+/// [`is_named_color`] against the generated [`crate::catalog::NAMED_COLORS`] table. To decide
+/// whether an arbitrary value is a valid color, use `is_valid_color(v) || is_named_color(v)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorForm {
     /// A `#rgb`, `#rgba`, `#rrggbb`, or `#rrggbbaa` hex literal.
@@ -208,12 +167,28 @@ pub fn is_known_event(name: &str) -> bool {
     EVENTS.contains(&name)
 }
 
-/// True if `name` is a named color in the (partial) catalog ([`NAMED_COLORS_PARTIAL`]).
-/// Case-insensitive. See the `TODO(xtask)` note: this is a deliberate partial set behind a stable
-/// seam, so a `false` here does not yet prove a color name is invalid.
+/// True if `name` is a named color in the generated catalog ([`crate::catalog::NAMED_COLORS`]).
+/// Case-insensitive, matching the engine's `css_lookup`, which lowercases the token before
+/// comparing. The table is machine-extracted from the engine's color source, so a `false` here now
+/// genuinely means the name is not an engine-recognized color.
 #[must_use]
 pub fn is_named_color(name: &str) -> bool {
-    contains_ascii_ci(NAMED_COLORS_PARTIAL, name)
+    contains_ascii_ci(crate::catalog::NAMED_COLORS, name)
+}
+
+/// True if `name` is a known OTML property tag in the generated catalog
+/// ([`crate::catalog::PROPERTIES`]).
+///
+/// **Exact match**, not case-insensitive: the engine dispatches on `node->tag() == "..."`, an exact
+/// byte compare against lowercase/kebab tag literals, so `Width` or `WIDTH` are not the `width`
+/// property. The catalog stores the tags in that canonical lowercase/kebab spelling.
+///
+/// Fidelity note for the later diagnostics node: an unknown property name is a **hint**, never an
+/// error or warning (spec §2.10) — the engine silently ignores tags it does not recognize. This
+/// helper only answers membership; it decides nothing about severity.
+#[must_use]
+pub fn is_known_property(name: &str) -> bool {
+    crate::catalog::PROPERTIES.contains(&name)
 }
 
 /// Classify a color value by its parseable form, faithful to `Color::operator>>` in the engine.
@@ -458,13 +433,15 @@ mod tests {
     }
 
     #[test]
-    fn partial_named_colors_recognized_case_insensitively() {
+    fn named_colors_recognized_case_insensitively() {
+        assert!(is_named_color("aliceblue"));
         assert!(is_named_color("red"));
         assert!(is_named_color("Red"));
         assert!(is_named_color("darkRed")); // legacy engine name
         assert!(is_named_color("lightGray"));
-        assert!(is_named_color("transparent"));
-        assert!(is_named_color("alpha"));
+        assert!(is_named_color("transparent")); // the `transparent` alias
+        assert!(is_named_color("alpha")); // legacy engine static
+        assert!(is_named_color("REBECCAPURPLE")); // a full-CSS-table name, upcased
     }
 
     #[test]
@@ -472,5 +449,37 @@ mod tests {
         assert!(!is_named_color("chartreuse-ish"));
         assert!(!is_named_color("notacolor"));
         assert!(!is_named_color(""));
+    }
+
+    #[test]
+    fn known_properties_recognized() {
+        assert!(is_known_property("width"));
+        assert!(is_known_property("color"));
+        assert!(is_known_property("image-source")); // an image-* family tag
+        assert!(is_known_property("text-align")); // a text-* family tag
+        assert!(is_known_property("margin"));
+    }
+
+    #[test]
+    fn unknown_or_miscased_property_is_rejected() {
+        assert!(!is_known_property("widht")); // typo
+        assert!(!is_known_property("not-a-property"));
+        assert!(!is_known_property("Width")); // exact (case-sensitive) tag compare
+        assert!(!is_known_property(""));
+    }
+
+    #[test]
+    fn generated_catalog_sets_are_populated() {
+        // Robust `>=` bounds, not brittle equality: the exact counts move with the engine source.
+        assert!(
+            crate::catalog::PROPERTIES.len() >= 100,
+            "expected a substantial property catalog, got {}",
+            crate::catalog::PROPERTIES.len()
+        );
+        assert!(
+            crate::catalog::NAMED_COLORS.len() >= 140,
+            "expected the full CSS named-color table (~150), got {}",
+            crate::catalog::NAMED_COLORS.len()
+        );
     }
 }

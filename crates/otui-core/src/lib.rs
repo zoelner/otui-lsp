@@ -11,6 +11,7 @@
 //! wires the [`LanguageService`] entry point to the parse-level [`diagnostics`] pass over the
 //! tree-sitter [`syntax`] substrate.
 
+pub mod catalog;
 pub mod completion;
 pub mod diagnostics;
 pub mod hover;
