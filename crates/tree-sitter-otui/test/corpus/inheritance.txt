@@ -1,0 +1,35 @@
+================================================================================
+inheritance chain with freeze
+================================================================================
+
+Button < UIButton
+  size: 96 24
+BigButton < Button
+  size: 128 32
+#FrozenButton < BigButton
+  color: #000000
+
+--------------------------------------------------------------------------------
+
+(document
+  (style_header
+    name: (style_name)
+    base: (style_base)
+    (property
+      key: (property_key)
+      value: (number)
+      value: (number)))
+  (style_header
+    name: (style_name)
+    base: (style_base)
+    (property
+      key: (property_key)
+      value: (number)
+      value: (number)))
+  (style_header
+    freeze: (freeze_marker)
+    name: (style_name)
+    base: (style_base)
+    (property
+      key: (property_key)
+      value: (color))))

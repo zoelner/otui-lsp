@@ -1,0 +1,33 @@
+================================================================================
+nested containers and ids
+================================================================================
+
+Panel
+  id: mainPanel
+  Label
+    id: title
+    text: Hello
+  Button
+    id: ok
+
+--------------------------------------------------------------------------------
+
+(document
+  (container
+    tag: (tag)
+    (id_property
+      key: (id_key)
+      value: (identifier))
+    (container
+      tag: (tag)
+      (id_property
+        key: (id_key)
+        value: (identifier))
+      (property
+        key: (property_key)
+        value: (identifier)))
+    (container
+      tag: (tag)
+      (id_property
+        key: (id_key)
+        value: (identifier)))))

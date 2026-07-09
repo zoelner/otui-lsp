@@ -1,0 +1,38 @@
+================================================================================
+state selectors with negation
+================================================================================
+
+Button
+  $hover:
+    color: #ffffff
+  $hover !disabled:
+    color: #cccccc
+  $pressed:
+    color: #888888
+
+--------------------------------------------------------------------------------
+
+(document
+  (container
+    tag: (tag)
+    (state_selector
+      (state
+        name: (state_name))
+      (property
+        key: (property_key)
+        value: (color)))
+    (state_selector
+      (state
+        name: (state_name))
+      (state
+        negated: (state_negation)
+        name: (state_name))
+      (property
+        key: (property_key)
+        value: (color)))
+    (state_selector
+      (state
+        name: (state_name))
+      (property
+        key: (property_key)
+        value: (color)))))

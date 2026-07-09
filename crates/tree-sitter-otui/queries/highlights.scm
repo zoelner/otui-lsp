@@ -1,0 +1,70 @@
+; Syntax highlighting for OTUI/OTML.
+; Maps the §3.1 host-agnostic token taxonomy onto standard tree-sitter capture
+; names. See docs/otui-language-service-spec.md §3.1.
+
+; --- comments (§2.1) --------------------------------------------------------
+(comment) @comment
+
+; --- Name < Base style headers (§2.2) ---------------------------------------
+(style_header name: (style_name) @type)
+(style_header "<" @operator)
+(freeze_marker) @punctuation.special
+
+; A base beginning with "UI" resolves to a built-in native widget class.
+((style_base) @type.builtin
+ (#match? @type.builtin "^UI"))
+(style_base) @type
+
+; --- widget / container tags (§2.1) -----------------------------------------
+(container tag: (tag) @type)
+
+; --- property keys (§2.10) --------------------------------------------------
+(property key: (property_key) @property)
+
+; id: is a definition target (§2.3)
+(id_property key: (id_key) @property)
+((id_key) @keyword
+ (#eq? @keyword "id"))
+
+; anchors.<edge>: (§2.4)
+(anchor_property (anchor_keyword) @property)
+(anchor_property edge: (anchor_edge) @property)
+(anchor_property "." @punctuation.delimiter)
+(anchor_target target: (identifier) @variable)
+
+; --- @tag: / &tag: / !tag: (§2.5-2.7) ---------------------------------------
+(event_property (event_name) @function)
+(event_property "@" @punctuation.special)
+(alias_property (alias_name) @property)
+(alias_property "&" @punctuation.special)
+(expr_property (expr_name) @property)
+(expr_property "!" @punctuation.special)
+
+; --- $state selectors (§2.8) ------------------------------------------------
+(state_selector "$" @punctuation.special)
+(state_negation) @operator
+
+; The closed set of 14 engine-recognised state names is rendered as a constant;
+; anything outside it is visibly distinct (an unknown state silently never
+; matches at runtime — a bug a hint should catch).
+((state_name) @constant.builtin
+ (#any-of? @constant.builtin
+  "active" "focus" "hover" "pressed" "checked" "disabled" "on"
+  "first" "middle" "last" "alternate" "dragging" "hidden" "mobile"))
+(state_name) @variable.parameter
+
+; --- literals (§2.9, §2.1) --------------------------------------------------
+(color) @constant
+(number) @number
+(boolean) @constant.builtin
+(null) @constant.builtin
+(string) @string
+(variable) @variable
+(identifier) @string
+
+; --- structural punctuation -------------------------------------------------
+(block_scalar_marker) @punctuation.special
+(inline_array ["[" "]"] @punctuation.bracket)
+(inline_array "," @punctuation.delimiter)
+(list_item "-" @punctuation.delimiter)
+":" @punctuation.delimiter

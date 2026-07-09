@@ -1,0 +1,14 @@
+{
+  "name": "tree-sitter-otui",
+  "version": "0.0.0",
+  "description": "Tree-sitter grammar for OTUI/OTML (OTClient UI markup)",
+  "license": "MIT OR Apache-2.0",
+  "private": true,
+  "tree-sitter": [
+    {
+      "scope": "source.otui",
+      "file-types": ["otui", "otml"],
+      "injection-regex": "^otui$"
+    }
+  ]
+}

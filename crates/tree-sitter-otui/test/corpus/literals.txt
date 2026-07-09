@@ -1,0 +1,91 @@
+================================================================================
+scalar literals
+================================================================================
+
+text: "hello world"
+name: 'single quoted'
+width: 100
+opacity: 0.5
+ratio: -3
+visible: true
+checked: false
+value: ~
+label: BareWord
+
+--------------------------------------------------------------------------------
+
+(document
+  (property
+    key: (property_key)
+    value: (string))
+  (property
+    key: (property_key)
+    value: (string))
+  (property
+    key: (property_key)
+    value: (number))
+  (property
+    key: (property_key)
+    value: (number))
+  (property
+    key: (property_key)
+    value: (number))
+  (property
+    key: (property_key)
+    value: (boolean))
+  (property
+    key: (property_key)
+    value: (boolean))
+  (property
+    key: (property_key)
+    value: (null))
+  (property
+    key: (property_key)
+    value: (identifier)))
+
+================================================================================
+space-separated value atoms
+================================================================================
+
+pos: 10 20
+border: 1 solid #ffffff
+
+--------------------------------------------------------------------------------
+
+(document
+  (property
+    key: (property_key)
+    value: (number)
+    value: (number))
+  (property
+    key: (property_key)
+    value: (number)
+    value: (identifier)
+    value: (color)))
+
+================================================================================
+inline arrays
+================================================================================
+
+items: [a, b, c]
+empty: []
+nums: [1, 2, 3]
+
+--------------------------------------------------------------------------------
+
+(document
+  (property
+    key: (property_key)
+    value: (inline_array
+      (identifier)
+      (identifier)
+      (identifier)))
+  (property
+    key: (property_key)
+    value: (inline_array))
+  (property
+    key: (property_key)
+    value: (inline_array
+      (number)
+      (number)
+      (number))))

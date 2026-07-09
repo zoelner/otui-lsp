@@ -1,0 +1,29 @@
+================================================================================
+block scalar chomping markers
+================================================================================
+
+a: |
+  keep one
+b: |-
+  strip trailing
+c: |+
+  keep all
+
+--------------------------------------------------------------------------------
+
+(document
+  (property
+    key: (property_key)
+    value: (block_scalar
+      marker: (block_scalar_marker)
+      (block_scalar_content)))
+  (property
+    key: (property_key)
+    value: (block_scalar
+      marker: (block_scalar_marker)
+      (block_scalar_content)))
+  (property
+    key: (property_key)
+    value: (block_scalar
+      marker: (block_scalar_marker)
+      (block_scalar_content))))

@@ -1,0 +1,27 @@
+{
+  "grammars": [
+    {
+      "name": "otui",
+      "camelcase": "Otui",
+      "scope": "source.otui",
+      "path": ".",
+      "file-types": ["otui", "otml"],
+      "injection-regex": "^otui$",
+      "highlights": ["queries/highlights.scm"],
+      "injections": ["queries/injections.scm"]
+    }
+  ],
+  "metadata": {
+    "version": "0.0.0",
+    "license": "MIT OR Apache-2.0",
+    "description": "Tree-sitter grammar for OTUI/OTML (OTClient UI markup)"
+  },
+  "bindings": {
+    "c": false,
+    "go": false,
+    "node": false,
+    "python": false,
+    "rust": true,
+    "swift": false
+  }
+}

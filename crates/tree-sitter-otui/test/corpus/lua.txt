@@ -1,0 +1,40 @@
+================================================================================
+embedded lua: event, alias, expr, block scalar
+================================================================================
+
+Button
+  @onClick: |
+    print("clicked")
+    self:hide()
+  &primaryColor: #33AAFF
+  &handler: |
+    function(self)
+      self:destroy()
+    end
+  !text: tr('Label')
+  color: $primaryColor
+
+--------------------------------------------------------------------------------
+
+(document
+  (container
+    tag: (tag)
+    (event_property
+      key: (event_name)
+      value: (block_scalar
+        marker: (block_scalar_marker)
+        (block_scalar_content)))
+    (alias_property
+      key: (alias_name)
+      value: (color))
+    (alias_property
+      key: (alias_name)
+      value: (block_scalar
+        marker: (block_scalar_marker)
+        (block_scalar_content)))
+    (expr_property
+      key: (expr_name)
+      value: (identifier))
+    (property
+      key: (property_key)
+      value: (variable))))

@@ -1,0 +1,29 @@
+[package]
+name = "tree-sitter-otui"
+description = "Tree-sitter grammar for OTUI/OTML — the OTClient UI markup language."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+build = "bindings/rust/build.rs"
+include = [
+    "bindings/rust/*",
+    "grammar.js",
+    "queries/*",
+    "src/*.c",
+    "src/*.h",
+    "src/tree_sitter/*",
+    "tree-sitter.json",
+]
+
+[lib]
+path = "bindings/rust/lib.rs"
+
+[dependencies]
+tree-sitter = "0.25"
+tree-sitter-language = "0.1"
+
+[build-dependencies]
+cc = "1"

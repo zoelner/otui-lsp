@@ -1,0 +1,33 @@
+================================================================================
+anchor properties and id cross-reference
+================================================================================
+
+Widget
+  id: child
+  anchors.top: parent.top
+  anchors.left: sibling.right
+  anchors.fill: parent
+
+--------------------------------------------------------------------------------
+
+(document
+  (container
+    tag: (tag)
+    (id_property
+      key: (id_key)
+      value: (identifier))
+    (anchor_property
+      object: (anchor_keyword)
+      edge: (anchor_edge)
+      value: (anchor_target
+        target: (identifier)))
+    (anchor_property
+      object: (anchor_keyword)
+      edge: (anchor_edge)
+      value: (anchor_target
+        target: (identifier)))
+    (anchor_property
+      object: (anchor_keyword)
+      edge: (anchor_edge)
+      value: (anchor_target
+        target: (identifier)))))
