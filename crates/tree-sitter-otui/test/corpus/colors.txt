@@ -1,0 +1,36 @@
+================================================================================
+color literals
+================================================================================
+
+a: #fff
+b: #ffff
+c: #ff0000
+d: #ff0000aa
+e: rgb(255, 0, 0)
+f: rgba(255, 0, 0, 128)
+g: hsl(120, 50%, 50%)
+
+--------------------------------------------------------------------------------
+
+(document
+  (property
+    key: (property_key)
+    value: (color))
+  (property
+    key: (property_key)
+    value: (color))
+  (property
+    key: (property_key)
+    value: (color))
+  (property
+    key: (property_key)
+    value: (color))
+  (property
+    key: (property_key)
+    value: (color))
+  (property
+    key: (property_key)
+    value: (color))
+  (property
+    key: (property_key)
+    value: (color)))

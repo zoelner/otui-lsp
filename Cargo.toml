@@ -4,6 +4,7 @@ members = [
     "crates/lang-api",
     "crates/otui-core",
     "crates/otui-lsp-server",
+    "crates/tree-sitter-otui",
     "xtask",
 ]
 

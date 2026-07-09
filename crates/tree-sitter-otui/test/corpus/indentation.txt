@@ -1,0 +1,28 @@
+================================================================================
+deep nesting then a multi-level dedent at one boundary
+================================================================================
+
+A
+  b:
+    c:
+      d:
+        e: 1
+  f: 2
+
+--------------------------------------------------------------------------------
+
+(document
+  (container
+    tag: (tag)
+    (property
+      key: (property_key)
+      (property
+        key: (property_key)
+        (property
+          key: (property_key)
+          (property
+            key: (property_key)
+            value: (number)))))
+    (property
+      key: (property_key)
+      value: (number))))

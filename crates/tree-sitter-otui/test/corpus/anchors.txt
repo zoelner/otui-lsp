@@ -1,0 +1,57 @@
+================================================================================
+anchor properties and id cross-reference
+================================================================================
+
+Widget
+  id: child
+  anchors.top: parent.top
+  anchors.left: sibling.right
+  anchors.fill: parent
+
+--------------------------------------------------------------------------------
+
+(document
+  (container
+    tag: (tag)
+    (id_property
+      key: (id_key)
+      value: (plain_value))
+    (anchor_property
+      object: (anchor_keyword)
+      edge: (anchor_edge)
+      value: (anchor_target
+        target: (identifier)))
+    (anchor_property
+      object: (anchor_keyword)
+      edge: (anchor_edge)
+      value: (anchor_target
+        target: (identifier)))
+    (anchor_property
+      object: (anchor_keyword)
+      edge: (anchor_edge)
+      value: (anchor_target
+        target: (identifier)))))
+
+================================================================================
+anchor shorthands: centerIn and the none reset
+================================================================================
+
+Widget
+  anchors.centerIn: parent
+  anchors.top: none
+
+--------------------------------------------------------------------------------
+
+(document
+  (container
+    tag: (tag)
+    (anchor_property
+      object: (anchor_keyword)
+      edge: (anchor_edge)
+      value: (anchor_target
+        target: (identifier)))
+    (anchor_property
+      object: (anchor_keyword)
+      edge: (anchor_edge)
+      value: (anchor_target
+        target: (identifier)))))

@@ -1,0 +1,201 @@
+================================================================================
+line comment at document start
+================================================================================
+
+// a full-line comment
+title: value
+
+--------------------------------------------------------------------------------
+
+(document
+  (comment)
+  (property
+    key: (property_key)
+    value: (plain_value)))
+
+================================================================================
+hash comment at document start
+================================================================================
+
+# a hash comment
+title: value
+
+--------------------------------------------------------------------------------
+
+(document
+  (comment)
+  (property
+    key: (property_key)
+    value: (plain_value)))
+
+================================================================================
+a comment marker with no following space is still a comment
+================================================================================
+
+#nospace
+//nospace
+title: value
+
+--------------------------------------------------------------------------------
+
+(document
+  (comment)
+  (comment)
+  (property
+    key: (property_key)
+    value: (plain_value)))
+
+================================================================================
+a leading # is a comment, not a style header
+================================================================================
+
+#Panel < UIWidget
+title: value
+
+--------------------------------------------------------------------------------
+
+(document
+  (comment)
+  (property
+    key: (property_key)
+    value: (plain_value)))
+
+================================================================================
+hash comment is indentation-neutral (does not close a block)
+================================================================================
+
+Button
+  id: x
+# a dedented comment
+  color: red
+
+--------------------------------------------------------------------------------
+
+(document
+  (container
+    tag: (tag)
+    (id_property
+      key: (id_key)
+      value: (plain_value))
+    (comment)
+    (property
+      key: (property_key)
+      value: (plain_value))))
+
+================================================================================
+slash comment at block indentation yields a comment node inside the block
+================================================================================
+
+Panel
+  // a block-level comment
+  id: x
+
+--------------------------------------------------------------------------------
+
+(document
+  (container
+    tag: (tag)
+    (comment)
+    (id_property
+      key: (id_key)
+      value: (plain_value))))
+
+================================================================================
+hash comment at block indentation yields a comment node inside the block
+================================================================================
+
+Panel
+  # a block-level comment
+  id: x
+
+--------------------------------------------------------------------------------
+
+(document
+  (container
+    tag: (tag)
+    (comment)
+    (id_property
+      key: (id_key)
+      value: (plain_value))))
+
+================================================================================
+comment indented deeper than the block is neutral (no spurious indent/dedent)
+================================================================================
+
+Panel
+  id: x
+    // over-indented comment
+  color: y
+
+--------------------------------------------------------------------------------
+
+(document
+  (container
+    tag: (tag)
+    (id_property
+      key: (id_key)
+      value: (plain_value))
+    (comment)
+    (property
+      key: (property_key)
+      value: (plain_value))))
+
+================================================================================
+a trailing // or # is value data, not a comment
+================================================================================
+
+width: 10 // trailing
+text: Press # go
+
+--------------------------------------------------------------------------------
+
+(document
+  (property
+    key: (property_key)
+    value: (plain_value))
+  (property
+    key: (property_key)
+    value: (plain_value)))
+
+================================================================================
+a trailing # or // on a container tag is part of the tag, not a comment
+================================================================================
+
+Foo # trailing
+Button // c
+
+--------------------------------------------------------------------------------
+
+(document
+  (container
+    tag: (tag))
+  (container
+    tag: (tag)))
+
+================================================================================
+a trailing # on a style header is data, not a comment
+================================================================================
+
+Name < UIWidget # x
+
+--------------------------------------------------------------------------------
+
+(document
+  (style_header
+    name: (style_name)
+    base: (style_base)))
+
+================================================================================
+a trailing # or // on a list item is value data, not a comment
+================================================================================
+
+- item # x
+- other // y
+
+--------------------------------------------------------------------------------
+
+(document
+  (list_item
+    value: (plain_value))
+  (list_item
+    value: (plain_value)))

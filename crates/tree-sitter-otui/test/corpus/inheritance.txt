@@ -1,0 +1,39 @@
+================================================================================
+inheritance chain
+================================================================================
+
+Button < UIButton
+  size: 96 24
+BigButton < Button
+  size: 128 32
+
+--------------------------------------------------------------------------------
+
+(document
+  (style_header
+    name: (style_name)
+    base: (style_base)
+    (property
+      key: (property_key)
+      value: (plain_value)))
+  (style_header
+    name: (style_name)
+    base: (style_base)
+    (property
+      key: (property_key)
+      value: (plain_value))))
+
+================================================================================
+a leading # makes the header a comment, not a style header
+================================================================================
+
+#Panel < UIWidget
+id: p
+
+--------------------------------------------------------------------------------
+
+(document
+  (comment)
+  (id_property
+    key: (id_key)
+    value: (plain_value)))
