@@ -15,6 +15,7 @@ pub mod catalog;
 pub mod completion;
 pub mod diagnostics;
 pub mod fixes;
+pub mod format;
 pub mod hover;
 pub mod navigation;
 pub mod schema;
@@ -128,6 +129,23 @@ impl OtuiService {
     #[must_use]
     pub fn quick_fixes(&self, source: &str, range: ByteSpan) -> Vec<Fix> {
         fixes::quick_fixes(source, range)
+    }
+
+    /// Format the whole document (spec §8): return the canonical, whitespace-normalized text, or
+    /// [`None`] when the source does not parse cleanly (parse failure, or any `ERROR` / `MISSING`
+    /// node) — in which case the server returns no edits and the document is left untouched.
+    ///
+    /// The formatter is conservative and byte-oriented: it re-indents structural lines to
+    /// `2 * depth` spaces (depth from the parse tree), collapses `key: value` spacing to a single
+    /// space after the first colon, strips trailing whitespace, ensures one final newline, and
+    /// leaves block-scalar bodies and multi-line value continuations verbatim. See [`format`] for
+    /// the full contract.
+    ///
+    /// Inherent (not on the [`LanguageService`] trait) so the protocol-agnostic trait stays minimal,
+    /// mirroring [`style_defs`](Self::style_defs).
+    #[must_use]
+    pub fn format(&self, source: &str) -> Option<String> {
+        format::format(source)
     }
 }
 
