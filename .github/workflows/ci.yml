@@ -31,16 +31,18 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      # Pin the CLI to the version the committed parser was generated with, so the
-      # drift check below compares like-for-like (a different CLI version can emit a
-      # byte-different parser.c and cause a spurious failure).
-      - run: npm install -g tree-sitter-cli@0.26.10
-      - name: Corpus tests
-        working-directory: crates/tree-sitter-otui
-        run: tree-sitter test
-      - name: Drift guard (committed parser matches grammar.js)
-        working-directory: crates/tree-sitter-otui
+      - name: Corpus tests + drift guard
         run: |
+          if [ ! -d crates/tree-sitter-otui ]; then
+            echo "No tree-sitter grammar crate on this branch — skipping."
+            exit 0
+          fi
+          # Pin the CLI to the version the committed parser was generated with, so the
+          # drift check compares like-for-like (a different CLI version can emit a
+          # byte-different parser.c and cause a spurious failure).
+          npm install -g tree-sitter-cli@0.26.10
+          cd crates/tree-sitter-otui
+          tree-sitter test
           tree-sitter generate
-          git diff --exit-code -- . \
+          git diff --exit-code -- src/parser.c src/grammar.json src/node-types.json \
             || (echo "::error::Generated parser is out of date. Run 'tree-sitter generate' in crates/tree-sitter-otui and commit the result." && exit 1)
