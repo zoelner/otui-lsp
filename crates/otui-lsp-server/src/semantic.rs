@@ -59,6 +59,18 @@ pub fn encode(text: &str, tokens: &[CoreToken], encoding: PositionEncoding) -> V
     let mut prev_start = 0u32;
     for tok in sorted {
         let pos = index.position(tok.span.start, encoding);
+        // LSP semantic tokens are single-line and this server does not advertise
+        // `multilineTokenSupport`, so `length` below (computed across the whole span) is only
+        // correct if the span never crosses a newline. Nothing upstream currently emits a
+        // multi-line token (block-scalar / Lua bodies are left untokenized precisely to
+        // preserve this), but nothing enforces it here either — catch a future regression in
+        // tests/debug builds rather than silently mis-encoding it.
+        debug_assert_eq!(
+            pos.line,
+            index.position(tok.span.end, encoding).line,
+            "semantic token spans a newline: {:?}",
+            tok.span
+        );
         let length = index.encoded_len(tok.span.start, tok.span.end, encoding);
         let delta_line = pos.line - prev_line;
         // `delta_start` is relative to the previous token only when on the same line; otherwise it
