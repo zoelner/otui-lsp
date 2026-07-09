@@ -33,7 +33,8 @@
 (anchor_property (anchor_keyword) @property)
 (anchor_property edge: (anchor_edge) @property)
 (anchor_property "." @punctuation.delimiter)
-(anchor_target target: (identifier) @variable)
+; The anchor target highlight is (re)stated after the generic `(identifier)`
+; rule below, so ordering + priority let it win rather than being shadowed.
 
 ; --- @tag: / &tag: / !tag: (§2.5-2.7) ---------------------------------------
 (event_property (event_name) @function)
@@ -69,6 +70,11 @@
 (string) @string
 (variable) @variable
 (identifier) @string
+; An anchor target is a widget/edge reference, not a plain string. Stated after
+; the generic `(identifier)` rule and given a higher priority so it wins over
+; it regardless of match order.
+((anchor_target target: (identifier) @variable)
+ (#set! priority 105))
 ; An untyped scalar value spanning to end-of-line (§ faithful to parseNode).
 (plain_value) @string
 

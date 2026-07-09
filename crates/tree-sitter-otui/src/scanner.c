@@ -15,6 +15,7 @@
 // fidelity checks live in otui-core, not here.
 
 #include <tree_sitter/parser.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -24,6 +25,8 @@ enum TokenType {
   DEDENT,
   BLOCK_SCALAR_CONTENT,
   PLAIN_VALUE,
+  COMMENT,
+  TAG,
   ERROR_SENTINEL,
 };
 
@@ -34,12 +37,27 @@ typedef struct {
   uint16_t queued_dedents;
 } Scanner;
 
-static inline void push(Scanner *s, uint16_t v) {
+// Grow the indent stack by one, guarding against integer overflow and a failed
+// reallocation. Returns false (leaving the prior buffer intact) if the stack
+// cannot grow; callers fail safe rather than dereference a NULL pointer.
+static inline bool push(Scanner *s, uint16_t v) {
   if (s->len == s->cap) {
-    s->cap = s->cap ? s->cap * 2 : 8;
-    s->data = realloc(s->data, s->cap * sizeof(uint16_t));
+    uint32_t new_cap = s->cap ? s->cap * 2 : 8;
+    // Overflow guards: the doubling must not wrap uint32_t, and the byte size
+    // must fit size_t.
+    if (new_cap < s->cap || new_cap > (uint32_t)(SIZE_MAX / sizeof(uint16_t))) {
+      return false;
+    }
+    uint16_t *new_data =
+        (uint16_t *)realloc(s->data, (size_t)new_cap * sizeof(uint16_t));
+    if (new_data == NULL) {
+      return false; // keep s->data usable; caller bails
+    }
+    s->data = new_data;
+    s->cap = new_cap;
   }
   s->data[s->len++] = v;
+  return true;
 }
 
 static inline uint16_t top(Scanner *s) {
@@ -313,6 +331,112 @@ static enum PlainResult scan_plain_value(TSLexer *lexer) {
   return PLAIN_EMITTED;
 }
 
+// --- line-start classification ----------------------------------------------
+//
+// Called only at a statement start (when TAG is a valid symbol). Faithful to
+// the OTML parser's `parseLine` / `parseNode`, which split a line by looking for
+// the FIRST `:` and treat a colon-less, non-list line as a whole-line tag:
+//
+//   * a line whose first non-space char is `#`, or begins with `//`, is a
+//     comment (line-start ONLY, unconditional) — emitted as COMMENT here so a
+//     trailing `#`/`//` elsewhere can never be mistaken for one;
+//   * a line whose first non-space char is `-` is a list item — declined so the
+//     internal grammar parses it;
+//   * a line containing `:` (a key/value separator) or `<` (the tooling-modelled
+//     `Name < Base` style header) is a structured form — declined;
+//   * otherwise the WHOLE trimmed line is a container tag, consumed to
+//     end-of-line so `Foo # trailing` is the single tag `Foo # trailing`.
+//
+// Never crosses a newline: it classifies only the current line. Leading
+// same-line spaces/tabs are skipped. Returns PLAIN_EMPTY (fall through to the
+// indentation scan) for a blank position.
+static enum PlainResult scan_line_start(TSLexer *lexer,
+                                        const bool *valid_symbols) {
+  // Skip leading blanks. This runs only at a statement start (TAG valid), where
+  // the preceding structural token has already emitted any INDENT/DEDENT and
+  // positioned us at the content; leading newlines only occur at the document
+  // start (base indent), so crossing them here is safe.
+  while (lexer->lookahead == ' ' || lexer->lookahead == '\t' ||
+         lexer->lookahead == '\n' || lexer->lookahead == '\r') {
+    skip(lexer);
+  }
+
+  int32_t c = lexer->lookahead;
+  if (lexer->eof(lexer)) {
+    return PLAIN_EMPTY;
+  }
+
+  // `#...` full-line comment.
+  if (c == '#') {
+    if (!valid_symbols[COMMENT]) {
+      return PLAIN_EMPTY;
+    }
+    while (lexer->lookahead != '\n' && !lexer->eof(lexer)) {
+      advance(lexer);
+    }
+    lexer->mark_end(lexer);
+    lexer->result_symbol = COMMENT;
+    return PLAIN_EMITTED;
+  }
+
+  bool tag_started = false; // a lone leading '/' already consumed as tag content
+  if (c == '/') {
+    if (valid_symbols[COMMENT]) {
+      advance(lexer);
+      if (lexer->lookahead == '/') {
+        // `//...` full-line comment.
+        while (lexer->lookahead != '\n' && !lexer->eof(lexer)) {
+          advance(lexer);
+        }
+        lexer->mark_end(lexer);
+        lexer->result_symbol = COMMENT;
+        return PLAIN_EMITTED;
+      }
+      // A lone '/': the first char of a plain tag. It is already consumed;
+      // continue scanning the rest as a tag below.
+      if (!valid_symbols[TAG]) {
+        return PLAIN_INTERNAL; // let the internal lexer take over from the start
+      }
+      tag_started = true;
+    } else if (!valid_symbols[TAG]) {
+      return PLAIN_EMPTY;
+    }
+    // COMMENT invalid but TAG valid: leave '/' unconsumed; the loop reads it.
+  } else if (c == '-') {
+    return PLAIN_INTERNAL; // list item — the internal grammar parses it
+  }
+
+  if (!valid_symbols[TAG]) {
+    return PLAIN_EMPTY;
+  }
+
+  // Plain container tag: consume to end-of-line, right-trimmed. Decline if a
+  // `:` or `<` appears (a structured key/value or style header).
+  bool content = tag_started;
+  if (tag_started) {
+    lexer->mark_end(lexer);
+  }
+  for (;;) {
+    int32_t ch = lexer->lookahead;
+    if (ch == '\n' || ch == '\r' || lexer->eof(lexer)) {
+      break;
+    }
+    if (ch == ':' || ch == '<') {
+      return PLAIN_INTERNAL; // structured form: internal grammar parses it
+    }
+    advance(lexer);
+    if (ch != ' ' && ch != '\t') {
+      content = true;
+      lexer->mark_end(lexer); // token ends after the last non-space char
+    }
+  }
+  if (!content) {
+    return PLAIN_EMPTY;
+  }
+  lexer->result_symbol = TAG;
+  return PLAIN_EMITTED;
+}
+
 bool tree_sitter_otui_external_scanner_scan(void *payload, TSLexer *lexer,
                                             const bool *valid_symbols) {
   Scanner *s = (Scanner *)payload;
@@ -357,6 +481,21 @@ bool tree_sitter_otui_external_scanner_scan(void *payload, TSLexer *lexer,
     // PLAIN_EMPTY: fall through to the newline/indent scan below.
   }
 
+  // At a statement start, classify the line: emit a line-start COMMENT, emit a
+  // whole-line container TAG, or decline (let the internal grammar parse a
+  // structured form). Gated on TAG so it never runs in a value position — a
+  // `#`/`//` mid-value is data, handled by plain_value / lua_value / hash_literal.
+  if (valid_symbols[TAG]) {
+    enum PlainResult r = scan_line_start(lexer, valid_symbols);
+    if (r == PLAIN_EMITTED) {
+      return true;
+    }
+    if (r == PLAIN_INTERNAL) {
+      return false; // structured form / list item: reset for the internal lexer
+    }
+    // PLAIN_EMPTY: fall through to the newline/indent scan below.
+  }
+
   bool found_line_end = false;
   uint32_t indent = 0;
 
@@ -378,29 +517,31 @@ bool tree_sitter_otui_external_scanner_scan(void *payload, TSLexer *lexer,
       indent = 0;
       lexer->mark_end(lexer);
       break;
-    } else if (lexer->lookahead == '/') {
-      // Possible `//` comment line. Mark the structural token's end at the `/`
-      // (zero-width) so the comment's bytes are handed back to the internal
-      // lexer, which tokenizes it as an `extras` `comment`. The block the
-      // comment sits in is decided by the next real line, not the comment's own
-      // column, keeping comments indentation-neutral.
+    } else if (lexer->lookahead == '/' && found_line_end) {
+      // A `//` comment line reached while scanning across line ends. Mark the
+      // structural token's end at the `/` (zero-width) and let the next real
+      // line decide this line's block structure, keeping comments
+      // indentation-neutral. The comment's own bytes are emitted as a COMMENT
+      // token on the following scan (scan_line_start). `found_line_end` gates
+      // this so a mid-line `/` in a value position stays data.
       lexer->mark_end(lexer);
       advance(lexer);
       if (lexer->lookahead == '/') {
         indent = peek_next_real_indent(lexer);
-        break; // emit the structural token here; internal lexer gets the comment
+        break; // emit the structural token here; COMMENT follows next scan
       }
       break; // a lone '/', let the internal lexer handle it (mark_end at '/')
-    } else if (lexer->lookahead == '#') {
+    } else if (lexer->lookahead == '#' && found_line_end) {
       // A `#` at line start is ALWAYS a full-line comment, unconditionally
       // (faithful to otmlparser `parseLine`: `line.starts_with("#")`). Like
       // `//`, it is indentation-neutral: mark the structural token's end at the
-      // `#` (zero-width) so the comment's bytes are handed back to the internal
-      // lexer, and let the next real line decide the block structure.
+      // `#` (zero-width) and let the next real line decide the block structure;
+      // the COMMENT token is emitted on the following scan. `found_line_end`
+      // gates this so a mid-line `#` (e.g. a `&tag:` hash literal) stays data.
       lexer->mark_end(lexer);
       advance(lexer);
       indent = peek_next_real_indent(lexer);
-      break; // emit the structural token here; internal lexer gets the comment
+      break; // emit the structural token here; COMMENT follows next scan
     } else {
       lexer->mark_end(lexer);
       break; // real content
@@ -414,7 +555,9 @@ bool tree_sitter_otui_external_scanner_scan(void *payload, TSLexer *lexer,
   uint16_t cur = top(s);
 
   if (valid_symbols[INDENT] && indent > cur) {
-    push(s, (uint16_t)indent);
+    if (!push(s, (uint16_t)indent)) {
+      return false; // out of memory: fail safe into error recovery
+    }
     lexer->result_symbol = INDENT;
     return true;
   }
@@ -476,7 +619,7 @@ void tree_sitter_otui_external_scanner_deserialize(void *payload,
   s->len = 0;
   s->queued_dedents = 0;
   if (length == 0) {
-    push(s, 0); // base indentation level
+    push(s, 0); // base indentation level (best effort; top() tolerates len 0)
     return;
   }
   unsigned pos = 0;
@@ -490,7 +633,9 @@ void tree_sitter_otui_external_scanner_deserialize(void *payload,
 
 void *tree_sitter_otui_external_scanner_create(void) {
   Scanner *s = (Scanner *)calloc(1, sizeof(Scanner));
-  push(s, 0); // base indentation level
+  if (s != NULL) {
+    push(s, 0); // base indentation level (top() tolerates an empty stack)
+  }
   return s;
 }
 

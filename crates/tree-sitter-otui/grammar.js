@@ -34,6 +34,18 @@ module.exports = grammar({
     // that makes a typed literal win only when it is the whole value — token
     // precedence alone cannot express it (precedence outranks match length).
     $.plain_value,
+    // A full-line comment (`//` / `#`), emitted by the external scanner ONLY at
+    // a line start (faithful to otmlparser `parseLine`). Producing it externally
+    // — rather than as an internal `token` in `extras` — is what makes a
+    // trailing `//` / `#` after real tokens DATA, never a comment.
+    $.comment,
+    // A plain (untyped) container tag: the whole trimmed line when it has no
+    // `:` separator and no `<` style-header marker (faithful to `parseNode`,
+    // where a colon-less line is `tag = line`). Emitted by the scanner so it can
+    // greedily reach end-of-line — `Foo # trailing` is the single tag
+    // `Foo # trailing` — while the internal grammar still parses the structured
+    // `Name < Base`, `$state:`, `@`/`&`/`!`/`anchors.`/`id:`/`key:` forms.
+    $.tag,
     $._error_sentinel,
   ],
 
@@ -42,12 +54,13 @@ module.exports = grammar({
   // internal lexer absorb stray blank lines (e.g. a leading blank line) that no
   // structural token applies to, instead of erroring on them.
   //
-  // Full-line `//` / `#` comments are `extras` too: they may appear at any
-  // position and are indentation-neutral (they never open or close a block).
-  // The external scanner (src/scanner.c) detects a comment line, computes the
-  // block structure from the *next real line* by peeking ahead, and hands the
-  // comment's bytes back to the internal lexer so the `comment` token below is
-  // produced here rather than being consumed by the indentation scan.
+  // Full-line `//` / `#` comments are `extras`: they may appear between
+  // statements at any indentation and are indentation-neutral (they never open
+  // or close a block). `$.comment` is an EXTERNAL token (see `externals`): the
+  // scanner emits it ONLY at a line start, so a trailing `//` / `#` after real
+  // tokens is never mistaken for a comment. The scanner computes the block
+  // structure from the *next real line* by peeking ahead, keeping the comment's
+  // own column from opening or closing a block.
   extras: $ => [/[ \t\r\n]/, $.comment],
 
   rules: {
@@ -71,18 +84,13 @@ module.exports = grammar({
     ),
 
     // --- comments (full line only) ------------------------------------------
-    // Faithful to the OTClient OTML parser (`parseLine`): after trimming
-    // leading whitespace, a line that starts with `//` or `#` is a comment —
-    // UNCONDITIONALLY. There is no "`#` only when followed by whitespace" rule
-    // and no freeze/`#Name < Base` exception; `#Panel < UIWidget` is a comment.
-    // A mid-line / trailing `//` or `#` is NOT a comment (it is value data,
-    // handled by `plain_value` below). Declared in `extras`: a single token
-    // with no trailing `_newline`, so it can float between statements at any
-    // indentation.
-    comment: $ => token(choice(
-      seq('//', /[^\n]*/),
-      seq('#', /[^\n]*/),
-    )),
+    // `$.comment` is an EXTERNAL token (declared in `externals`, produced by
+    // src/scanner.c). Faithful to the OTClient OTML parser (`parseLine`): after
+    // trimming leading whitespace, a line that starts with `//` or `#` is a
+    // comment — UNCONDITIONALLY (`#Panel < UIWidget` is a comment). Because the
+    // scanner emits it ONLY at a line start, a mid-line / trailing `//` or `#`
+    // after real tokens is NEVER a comment; it is data (consumed by the greedy
+    // `tag` / `style_base` / `plain_value` / `lua_value` tokens).
 
     // --- Name < Base style header (§2.2) ------------------------------------
     // Just `Name < Base` — inheritance only (`importStyleFromOTML` splits on
@@ -95,7 +103,12 @@ module.exports = grammar({
     ),
 
     style_name: $ => token(IDENT),
-    style_base: $ => token(IDENT),
+    // The base is the rest of the line after `<`, trimmed. Faithful to
+    // `parseNode` (a colon-less line is a whole-line tag), a trailing `//` / `#`
+    // is part of the base — data, not a comment — so `Name < UIWidget # x`
+    // yields no comment node. For the common `Name < Base` case the base is just
+    // `Base`.
+    style_base: $ => token(/\S([^\n]*\S)?/),
 
     // --- $state selector block (§2.8) ---------------------------------------
     state_selector: $ => seq(
@@ -181,12 +194,13 @@ module.exports = grammar({
     property_key: $ => token(IDENT),
 
     // --- bare container tag -------------------------------------------------
+    // `$.tag` is an EXTERNAL token (declared in `externals`): the scanner emits
+    // the whole trimmed line as the tag when the line has no `:` separator and
+    // no `<` style-header marker, so `Foo # trailing` is a single tag.
     container: $ => seq(
       field('tag', $.tag),
       choice($._newline, $._block),
     ),
-
-    tag: $ => token(IDENT),
 
     // --- list item ----------------------------------------------------------
     list_item: $ => seq(

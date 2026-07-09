@@ -767,11 +767,6 @@
     }
   },
   {
-    "type": "style_base",
-    "named": true,
-    "fields": {}
-  },
-  {
     "type": "style_header",
     "named": true,
     "fields": {
@@ -845,11 +840,6 @@
   },
   {
     "type": "style_name",
-    "named": true,
-    "fields": {}
-  },
-  {
-    "type": "tag",
     "named": true,
     "fields": {}
   },
@@ -976,6 +966,14 @@
   },
   {
     "type": "string",
+    "named": true
+  },
+  {
+    "type": "style_base",
+    "named": true
+  },
+  {
+    "type": "tag",
     "named": true
   },
   {

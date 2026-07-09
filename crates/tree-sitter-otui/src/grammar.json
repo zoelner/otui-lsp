@@ -78,40 +78,6 @@
         }
       ]
     },
-    "comment": {
-      "type": "TOKEN",
-      "content": {
-        "type": "CHOICE",
-        "members": [
-          {
-            "type": "SEQ",
-            "members": [
-              {
-                "type": "STRING",
-                "value": "//"
-              },
-              {
-                "type": "PATTERN",
-                "value": "[^\\n]*"
-              }
-            ]
-          },
-          {
-            "type": "SEQ",
-            "members": [
-              {
-                "type": "STRING",
-                "value": "#"
-              },
-              {
-                "type": "PATTERN",
-                "value": "[^\\n]*"
-              }
-            ]
-          }
-        ]
-      }
-    },
     "style_header": {
       "type": "SEQ",
       "members": [
@@ -161,7 +127,7 @@
       "type": "TOKEN",
       "content": {
         "type": "PATTERN",
-        "value": "[A-Za-z_][A-Za-z0-9_\\-]*"
+        "value": "\\S([^\\n]*\\S)?"
       }
     },
     "state_selector": {
@@ -666,13 +632,6 @@
         }
       ]
     },
-    "tag": {
-      "type": "TOKEN",
-      "content": {
-        "type": "PATTERN",
-        "value": "[A-Za-z_][A-Za-z0-9_\\-]*"
-      }
-    },
     "list_item": {
       "type": "SEQ",
       "members": [
@@ -1046,6 +1005,14 @@
     {
       "type": "SYMBOL",
       "name": "plain_value"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "comment"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "tag"
     },
     {
       "type": "SYMBOL",
