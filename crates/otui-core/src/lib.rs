@@ -19,6 +19,7 @@ pub mod folding;
 pub mod format;
 pub mod hover;
 pub mod navigation;
+pub mod references;
 pub mod schema;
 pub mod semantic;
 pub mod style_index;
@@ -30,7 +31,8 @@ use hover::StyleHover;
 use lang_api::{
     ByteSpan, CompletionItem, Diagnostic, DocumentSymbol, LanguageService, SemanticToken,
 };
-use navigation::{BaseRef, StyleHeaderRef};
+use navigation::{BaseRef, IdRef, StyleHeaderRef};
+use references::{IdOccurrences, StyleNameOccurrences};
 use style_index::{StyleDef, StyleIndex};
 use syntax::SyntaxTree;
 
@@ -84,6 +86,42 @@ impl OtuiService {
     #[must_use]
     pub fn style_header_at(&self, source: &str, offset: usize) -> Option<StyleHeaderRef> {
         navigation::style_header_at(source, offset)
+    }
+
+    /// Locate the `id:` value or anchor-target id under `offset`, if any (spec §5.4 references).
+    ///
+    /// Returns the id text + span when the cursor sits on an `id:` value (a declaration) or on the
+    /// `id` prefix of an `<id>.edge` anchor target (a reference); `None` otherwise. Collecting the
+    /// id's occurrences (document-local) is the server's job via [`id_occurrences`](Self::id_occurrences).
+    ///
+    /// Inherent (not on the [`LanguageService`] trait) for the same reason as
+    /// [`base_reference_at`](Self::base_reference_at): navigation is driven by server-owned state.
+    #[must_use]
+    pub fn id_at(&self, source: &str, offset: usize) -> Option<IdRef> {
+        navigation::id_at(source, offset)
+    }
+
+    /// Find every occurrence of the style name `name` in one document (spec §5.4): the top-level
+    /// `name < …` declarations and the `X < name` base references. The server calls this per open
+    /// document (the style namespace is global) and maps the spans to `Location`s, honoring the
+    /// request's `context.include_declaration` for the declaration spans.
+    ///
+    /// Inherent (not on the [`LanguageService`] trait), mirroring [`style_defs`](Self::style_defs):
+    /// the multi-document fan-out is the server's concern.
+    #[must_use]
+    pub fn style_name_occurrences(&self, source: &str, name: &str) -> StyleNameOccurrences {
+        references::style_name_occurrences(source, name)
+    }
+
+    /// Find every occurrence of the id `id` in one document (spec §5.4): the `id:` declaration and the
+    /// `<id>.edge` anchor references. Ids are per-widget-tree identities that can repeat across files,
+    /// so this is deliberately document-local — the server calls it on the current document only.
+    ///
+    /// Inherent (not on the [`LanguageService`] trait), mirroring
+    /// [`style_name_occurrences`](Self::style_name_occurrences).
+    #[must_use]
+    pub fn id_occurrences(&self, source: &str, id: &str) -> IdOccurrences {
+        references::id_occurrences(source, id)
     }
 
     /// Describe the hover for the style token under `offset`, resolved against the workspace `index`

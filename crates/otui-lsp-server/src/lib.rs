@@ -19,7 +19,7 @@ use std::sync::Mutex;
 use lang_api::{ByteSpan, LanguageService};
 use otui_core::fixes::Fix;
 use otui_core::hover::{Inheritance, StyleHover, StyleHoverKind};
-use otui_core::style_index::{DocId, StyleIndex};
+use otui_core::style_index::{is_native_base, DocId, StyleIndex};
 use otui_core::OtuiService;
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result as RpcResult;
@@ -32,11 +32,11 @@ use tower_lsp::lsp_types::{
     FoldingRangeProviderCapability, GotoDefinitionParams, GotoDefinitionResponse, Hover,
     HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
     InitializedParams, Location, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf,
-    PositionEncodingKind, SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions,
-    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, ServerInfo, SymbolInformation, SymbolKind, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextEdit, Url, WorkDoneProgressOptions, WorkspaceEdit,
-    WorkspaceSymbolParams,
+    PositionEncodingKind, ReferenceParams, SemanticTokens, SemanticTokensFullOptions,
+    SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SymbolInformation,
+    SymbolKind, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Url,
+    WorkDoneProgressOptions, WorkspaceEdit, WorkspaceSymbolParams,
 };
 use tower_lsp::{Client, LanguageServer};
 
@@ -187,6 +187,120 @@ fn resolve_base_definition(
         )),
         _ => Some(GotoDefinitionResponse::Array(locations)),
     }
+}
+
+/// What the cursor is on for a `textDocument/references` request (spec §5.4).
+///
+/// A [`StyleName`](Self::StyleName) is workspace-global (uses are collected across every open
+/// document); an [`Id`](Self::Id) is document-local (uses live only in the current widget tree).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReferenceTarget {
+    /// A style name — the cursor is on a top-level `Name < Base` declared name or base.
+    StyleName(String),
+    /// An `id:` value or an anchor-target id.
+    Id(String),
+}
+
+/// Classify the token at byte `offset` in `text` into a [`ReferenceTarget`], or `None` when the
+/// cursor is not on a style name or an id (spec §5.4).
+///
+/// A base reference and a declared name both resolve to a **style name**; an `id:` value and an
+/// anchor-target id both resolve to an **id**. A bare top-level container tag is a widget instance,
+/// not a style in the global namespace, so it is deliberately not a style-name target (only real
+/// `style_header` names are — mirroring the workspace [`StyleIndex`]).
+fn classify_reference_target(
+    service: &OtuiService,
+    text: &str,
+    offset: usize,
+) -> Option<ReferenceTarget> {
+    // Cursor on a base → the referenced style name.
+    if let Some(base_ref) = service.base_reference_at(text, offset) {
+        return Some(ReferenceTarget::StyleName(base_ref.name));
+    }
+    // Cursor on a top-level `style_header`'s declared name → that style name. `base_span.is_some()`
+    // distinguishes a real `style_header` (always has a base) from a bare `container` (base `None`),
+    // which is not a global-namespace style.
+    if let Some(header) = service.style_header_at(text, offset) {
+        let on_name = header.name_span.start <= offset && offset < header.name_span.end;
+        if header.base_span.is_some() && on_name {
+            return Some(ReferenceTarget::StyleName(header.name));
+        }
+    }
+    // Cursor on an `id:` value or an anchor-target id → that id.
+    service
+        .id_at(text, offset)
+        .map(|id_ref| ReferenceTarget::Id(id_ref.id))
+}
+
+/// Collect the LSP [`Location`]s answering a `textDocument/references` request for `target` (spec
+/// §5.4), honoring `include_declaration`.
+///
+/// * A [`StyleName`](ReferenceTarget::StyleName) fans out across **every** open document (the style
+///   namespace is global): each document's declarations (only when `include_declaration`) and base
+///   references become locations, mapped against that document's own text. A native `UI*` base with
+///   no user definition in the index is skipped — it has no declaration and listing all its uses is
+///   low value; a name that *is* in the index (even a `UI*`-shaped user style) is collected normally.
+/// * An [`Id`](ReferenceTarget::Id) is resolved **only in the current document** (`current_uri`): ids
+///   can repeat across files/widgets, so cross-document id references are ambiguous and intentionally
+///   out of scope. The declaration is included only when `include_declaration`.
+///
+/// Kept as a free function over borrowed state so it is unit-testable without a live `Client`
+/// (mirroring [`resolve_base_definition`]).
+fn collect_references(
+    target: &ReferenceTarget,
+    current_uri: &Url,
+    documents: &HashMap<Url, Document>,
+    index: &StyleIndex,
+    service: &OtuiService,
+    include_declaration: bool,
+    encoding: PositionEncoding,
+) -> Vec<Location> {
+    let mut out = Vec::new();
+    match target {
+        ReferenceTarget::StyleName(name) => {
+            // A native `UI*` base absent from the index has no user definition and no references
+            // worth listing.
+            if is_native_base(name) && index.lookup(name).is_empty() {
+                return out;
+            }
+            for (uri, doc) in documents {
+                let occ = service.style_name_occurrences(&doc.text, name);
+                if include_declaration {
+                    for span in occ.declarations {
+                        out.push(convert::location_of(uri.clone(), &doc.text, span, encoding));
+                    }
+                }
+                for span in occ.base_refs {
+                    out.push(convert::location_of(uri.clone(), &doc.text, span, encoding));
+                }
+            }
+        }
+        ReferenceTarget::Id(id) => {
+            let Some(doc) = documents.get(current_uri) else {
+                return out;
+            };
+            let occ = service.id_occurrences(&doc.text, id);
+            if include_declaration {
+                if let Some(span) = occ.declaration {
+                    out.push(convert::location_of(
+                        current_uri.clone(),
+                        &doc.text,
+                        span,
+                        encoding,
+                    ));
+                }
+            }
+            for span in occ.anchor_refs {
+                out.push(convert::location_of(
+                    current_uri.clone(),
+                    &doc.text,
+                    span,
+                    encoding,
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// Collect the workspace's `Name < Base` style definitions that match `query`, as a flat
@@ -439,6 +553,9 @@ impl LanguageServer for Backend {
                 definition_provider: Some(OneOf::Left(true)),
                 // Workspace symbols: the global `Name < Base` style namespace (spec §5.2).
                 workspace_symbol_provider: Some(OneOf::Left(true)),
+                // References: uses of a style name (workspace-global) or an `id:` (document-local)
+                // (spec §5.4).
+                references_provider: Some(OneOf::Left(true)),
                 // Hover: style names and `Name < Base` bases (spec §5.5).
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 // Formatting: whole-document, conservative whitespace normalization (spec §8).
@@ -594,6 +711,46 @@ impl LanguageServer for Backend {
             &base_ref.name,
             encoding,
         ))
+    }
+
+    async fn references(&self, params: ReferenceParams) -> RpcResult<Option<Vec<Location>>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let include_declaration = params.context.include_declaration;
+        let encoding = self.encoding();
+
+        // Read the request document's text (unknown document → nothing to resolve). Cloned so the
+        // documents lock is released before we take the index lock, keeping the two locks unnested.
+        let Some(text) = self
+            .documents
+            .read()
+            .await
+            .get(&uri)
+            .map(|doc| doc.text.clone())
+        else {
+            return Ok(None);
+        };
+
+        // Map the cursor Position to a byte offset, then classify what it is on. A cursor on neither
+        // a style name nor an id has no references.
+        let offset = LineIndex::new(&text).offset_at(position, encoding);
+        let Some(target) = classify_reference_target(&self.service, &text, offset) else {
+            return Ok(None);
+        };
+
+        // Aggregate: style names fan out across the workspace; ids stay in the current document.
+        let index = self.style_index.read().await;
+        let documents = self.documents.read().await;
+        let locations = collect_references(
+            &target,
+            &uri,
+            &documents,
+            &index,
+            &self.service,
+            include_declaration,
+            encoding,
+        );
+        Ok(Some(locations))
     }
 
     async fn symbol(
@@ -1013,6 +1170,196 @@ mod tests {
             resolve_base_definition(&index, &documents, "MyPanel", PositionEncoding::Utf16)
                 .is_none()
         );
+    }
+
+    /// The `(uri, range)` of each location, sorted, for order-independent assertions (the document
+    /// store iterates an unordered map).
+    fn sorted_locs(locs: &[Location]) -> Vec<(String, Position, Position)> {
+        let mut out: Vec<(String, Position, Position)> = locs
+            .iter()
+            .map(|l| (l.uri.to_string(), l.range.start, l.range.end))
+            .collect();
+        out.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then((a.1.line, a.1.character).cmp(&(b.1.line, b.1.character)))
+        });
+        out
+    }
+
+    #[test]
+    fn references_to_a_style_name_span_the_declaration_and_every_base_across_docs() {
+        // `MyPanel` is declared in one doc and used as a base in two others.
+        let (index, docs) = workspace(&[
+            ("file:///defs.otui", "MyPanel < UIWidget\n"),
+            ("file:///a.otui", "ChildA < MyPanel\n"),
+            ("file:///b.otui", "ChildB < MyPanel\n"),
+        ]);
+        let svc = OtuiService::new();
+        let uri = Url::parse("file:///a.otui").expect("uri");
+        // include_declaration: the declaration site plus both base references.
+        let target = ReferenceTarget::StyleName("MyPanel".to_owned());
+        let locs = collect_references(
+            &target,
+            &uri,
+            &docs,
+            &index,
+            &svc,
+            true,
+            PositionEncoding::Utf16,
+        );
+        assert_eq!(
+            sorted_locs(&locs),
+            vec![
+                (
+                    "file:///a.otui".to_owned(),
+                    Position::new(0, 9),
+                    Position::new(0, 16)
+                ),
+                (
+                    "file:///b.otui".to_owned(),
+                    Position::new(0, 9),
+                    Position::new(0, 16)
+                ),
+                (
+                    "file:///defs.otui".to_owned(),
+                    Position::new(0, 0),
+                    Position::new(0, 7)
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn references_exclude_the_declaration_when_not_requested() {
+        let (index, docs) = workspace(&[
+            ("file:///defs.otui", "MyPanel < UIWidget\n"),
+            ("file:///a.otui", "ChildA < MyPanel\n"),
+        ]);
+        let svc = OtuiService::new();
+        let uri = Url::parse("file:///a.otui").expect("uri");
+        let target = ReferenceTarget::StyleName("MyPanel".to_owned());
+        let locs = collect_references(
+            &target,
+            &uri,
+            &docs,
+            &index,
+            &svc,
+            false,
+            PositionEncoding::Utf16,
+        );
+        // Only the base reference survives; the declaration in defs.otui is dropped.
+        assert_eq!(
+            sorted_locs(&locs),
+            vec![(
+                "file:///a.otui".to_owned(),
+                Position::new(0, 9),
+                Position::new(0, 16)
+            )]
+        );
+    }
+
+    #[test]
+    fn references_to_a_native_base_without_a_user_def_are_empty() {
+        // `UIWidget` is a native built-in with no user definition in the index → no references listed.
+        let (index, docs) = workspace(&[("file:///a.otui", "MyPanel < UIWidget\n")]);
+        let svc = OtuiService::new();
+        let uri = Url::parse("file:///a.otui").expect("uri");
+        let target = ReferenceTarget::StyleName("UIWidget".to_owned());
+        let locs = collect_references(
+            &target,
+            &uri,
+            &docs,
+            &index,
+            &svc,
+            true,
+            PositionEncoding::Utf16,
+        );
+        assert!(locs.is_empty());
+    }
+
+    #[test]
+    fn id_references_are_document_local() {
+        // The current doc declares `header` and references it twice; another doc also declares
+        // `header` but must not contribute (ids are per-document).
+        let (index, docs) = workspace(&[
+            (
+                "file:///a.otui",
+                "Panel\n  id: header\nOther\n  anchors.top: header.bottom\n",
+            ),
+            ("file:///b.otui", "Elsewhere\n  id: header\n"),
+        ]);
+        let svc = OtuiService::new();
+        let uri = Url::parse("file:///a.otui").expect("uri");
+        let target = ReferenceTarget::Id("header".to_owned());
+        let locs = collect_references(
+            &target,
+            &uri,
+            &docs,
+            &index,
+            &svc,
+            true,
+            PositionEncoding::Utf16,
+        );
+        // Both locations are in a.otui only: the declaration and the anchor reference.
+        assert!(locs.iter().all(|l| l.uri.as_str() == "file:///a.otui"));
+        assert_eq!(locs.len(), 2);
+    }
+
+    #[test]
+    fn classify_reference_target_distinguishes_names_and_ids() {
+        let svc = OtuiService::new();
+        // Cursor on a base → the style name.
+        let src = "Child < MyPanel\n";
+        let off = src.find("MyPanel").expect("present");
+        assert_eq!(
+            classify_reference_target(&svc, src, off),
+            Some(ReferenceTarget::StyleName("MyPanel".to_owned()))
+        );
+        // Cursor on a declared name → the style name.
+        let off = src.find("Child").expect("present");
+        assert_eq!(
+            classify_reference_target(&svc, src, off),
+            Some(ReferenceTarget::StyleName("Child".to_owned()))
+        );
+        // Cursor on an `id:` value → the id.
+        let src = "Panel\n  id: main\n";
+        let off = src.find("main").expect("present");
+        assert_eq!(
+            classify_reference_target(&svc, src, off),
+            Some(ReferenceTarget::Id("main".to_owned()))
+        );
+        // Cursor on nothing referenceable → None.
+        let src = "Panel\n  width: 10\n";
+        let off = src.find("10").expect("present");
+        assert_eq!(classify_reference_target(&svc, src, off), None);
+    }
+
+    #[test]
+    fn full_flow_from_cursor_to_id_references() {
+        // Position → offset → classify → aggregate, the same path the `references` handler drives.
+        let (index, docs) = workspace(&[(
+            "file:///a.otui",
+            "Panel\n  id: header\nOther\n  anchors.top: header.bottom\n",
+        )]);
+        let svc = OtuiService::new();
+        let uri = Url::parse("file:///a.otui").expect("uri");
+        let text = "Panel\n  id: header\nOther\n  anchors.top: header.bottom\n";
+        // Cursor on the anchor-target id `header`.
+        let anchor = text.rfind("header").expect("present");
+        let position = LineIndex::new(text).position(anchor, PositionEncoding::Utf16);
+        let offset = LineIndex::new(text).offset_at(position, PositionEncoding::Utf16);
+        let target = classify_reference_target(&svc, text, offset).expect("on an id");
+        assert_eq!(target, ReferenceTarget::Id("header".to_owned()));
+        let locs = collect_references(
+            &target,
+            &uri,
+            &docs,
+            &index,
+            &svc,
+            true,
+            PositionEncoding::Utf16,
+        );
+        assert_eq!(locs.len(), 2);
     }
 
     /// Names of the symbols in `syms`, sorted for order-independent assertions (the index iterates
