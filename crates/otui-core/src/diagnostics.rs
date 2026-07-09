@@ -171,8 +171,12 @@ fn indentation_pass(source: &str) -> Vec<Diagnostic> {
                     i += 1;
                     continue;
                 }
-                let content_depth = leading_spaces(content.text) / 2;
-                if content_depth > current_depth {
+                // Compare raw leading-space counts against the opening property line's `sp`, not
+                // halved depths: halving loses parity, so a content line indented by an odd number
+                // of extra spaces (e.g. `sp + 1`) could wrongly compute the same depth as the
+                // marker line and be treated as structure. Content is anything deeper than `sp`.
+                let content_sp = leading_spaces(content.text);
+                if content_sp > sp {
                     i += 1; // raw block content
                 } else {
                     break; // next structural node — reprocess in the outer loop
@@ -315,6 +319,35 @@ btn:
   id: y
 ";
         assert!(analyze(src).is_empty(), "{:?}", analyze(src));
+    }
+
+    #[test]
+    fn block_scalar_content_with_odd_extra_indent_is_not_flagged() {
+        // The property line `@onClick: |` sits at 2 leading spaces (current_depth = 1). A content
+        // line at 3 spaces is only one space deeper: halving both (3 / 2 = 1) used to make the
+        // content look like it was at the *same* depth as the marker, so the old check wrongly
+        // broke out of the block and reprocessed this line as structure, flagging it
+        // `odd-indentation`. It must be treated as raw block-scalar content instead.
+        let src = "\
+Panel
+  @onClick: |
+   one()
+  id: y
+";
+        let diags = analyze(src);
+        assert!(diags.is_empty(), "{:?}", diags);
+    }
+
+    #[test]
+    fn block_scalar_content_with_five_space_indent_is_not_flagged() {
+        let src = "\
+Panel
+  @onClick: |-
+     one()
+  id: y
+";
+        let diags = analyze(src);
+        assert!(diags.is_empty(), "{:?}", diags);
     }
 
     #[test]
