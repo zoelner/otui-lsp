@@ -59,7 +59,14 @@ impl<'a> LineIndex<'a> {
     /// Offsets past the end of the text clamp to the document end; offsets that land inside a
     /// multi-byte UTF-8 sequence are treated as the start of that character's column.
     pub fn position(&self, offset: usize, encoding: PositionEncoding) -> Position {
-        let offset = offset.min(self.text.len());
+        let mut offset = offset.min(self.text.len());
+        // Byte-indexing `self.text` below requires a char boundary. An offset landing inside a
+        // multi-byte UTF-8 sequence (e.g. a caller mapping a byte span computed against
+        // different text) would otherwise panic; clamp down to the start of that character
+        // instead, matching the documented "start of that character's column" behavior.
+        while !self.text.is_char_boundary(offset) {
+            offset -= 1;
+        }
         // The line is the last line whose start is <= offset. `partition_point` gives the first
         // index whose start is > offset, so the line is one before that.
         let line = self.line_starts.partition_point(|&start| start <= offset) - 1;
@@ -148,6 +155,24 @@ mod tests {
         assert_eq!(
             idx.position(7, PositionEncoding::Utf16),
             Position::new(0, 6)
+        );
+    }
+
+    #[test]
+    fn offset_inside_multibyte_char_clamps_without_panicking() {
+        // "café: x" — 'é' spans bytes 3..5 (0xC3 0xA9). Byte offset 4 lands on its second byte,
+        // which is not a char boundary; the conversion must clamp down to offset 3 (the start
+        // of 'é') rather than panic on the slice.
+        let text = "café: x";
+        let idx = LineIndex::new(text);
+        assert!(!text.is_char_boundary(4));
+        assert_eq!(
+            idx.position(4, PositionEncoding::Utf16),
+            idx.position(3, PositionEncoding::Utf16),
+        );
+        assert_eq!(
+            idx.position(4, PositionEncoding::Utf16),
+            Position::new(0, 3)
         );
     }
 
