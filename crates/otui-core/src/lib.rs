@@ -12,15 +12,17 @@
 //! tree-sitter [`syntax`] substrate.
 
 pub mod diagnostics;
+pub mod hover;
 pub mod navigation;
 pub mod semantic;
 pub mod style_index;
 pub mod symbols;
 pub mod syntax;
 
+use hover::StyleHover;
 use lang_api::{Diagnostic, DocumentSymbol, LanguageService, SemanticToken};
 use navigation::{BaseRef, StyleHeaderRef};
-use style_index::StyleDef;
+use style_index::{StyleDef, StyleIndex};
 use syntax::SyntaxTree;
 
 /// The OTUI language backend. Constructed once per workspace/session.
@@ -73,6 +75,24 @@ impl OtuiService {
     #[must_use]
     pub fn style_header_at(&self, source: &str, offset: usize) -> Option<StyleHeaderRef> {
         navigation::style_header_at(source, offset)
+    }
+
+    /// Describe the hover for the style token under `offset`, resolved against the workspace `index`
+    /// (spec §5.5). Returns a structured [`StyleHover`] — native vs. user base, workspace-resolution,
+    /// definition count and inheritance are all decided here in the engine — or `None` when the cursor
+    /// is not on a top-level style header's name or base token. The server only formats the result
+    /// into an LSP hover.
+    ///
+    /// Inherent (not on the [`LanguageService`] trait) because it consumes server-owned state (the
+    /// workspace [`StyleIndex`]).
+    #[must_use]
+    pub fn style_hover_at(
+        &self,
+        source: &str,
+        offset: usize,
+        index: &StyleIndex,
+    ) -> Option<StyleHover> {
+        hover::style_hover_at(source, offset, index)
     }
 }
 

@@ -17,8 +17,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use lang_api::{ByteSpan, LanguageService};
-use otui_core::navigation::StyleHeaderRef;
-use otui_core::style_index::{is_native_base, DocId, StyleIndex};
+use otui_core::hover::{Inheritance, StyleHover, StyleHoverKind};
+use otui_core::style_index::{DocId, StyleIndex};
 use otui_core::OtuiService;
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result as RpcResult;
@@ -229,84 +229,53 @@ fn collect_workspace_symbols(
     out
 }
 
-/// Render a hover for a top-level `Name < Base` header the cursor is on (spec §5.5).
+/// Format a [`StyleHover`] description from the engine into an LSP Markdown [`Hover`] (spec §5.5).
 ///
-/// The `offset` decides the branch: if it lies within the header's base token, describe the
-/// **base** (native built-in vs. a resolved workspace style vs. a dangling name); otherwise it is on
-/// the declared name, so describe **this style** and its inheritance. The returned [`Hover`]'s range
-/// is the exact token the cursor fell in (base or name), so the client underlines it.
-///
-/// Pure over borrowed state (index + a `LineIndex` for the current doc) so it is unit-testable
-/// without a live `Client`, like [`resolve_base_definition`]. Never mutates state, never emits a
-/// diagnostic: a dangling base is merely described as "not found in workspace".
-fn render_style_hover(
-    header: &StyleHeaderRef,
-    offset: usize,
-    index: &StyleIndex,
-    line_index: &LineIndex,
-    encoding: PositionEncoding,
-) -> Hover {
-    // Base branch: the cursor is within the base token.
-    if let (Some(base), Some(base_span)) = (header.base.as_deref(), header.base_span) {
-        if base_span.start <= offset && offset < base_span.end {
-            let value = render_base_markdown(base, index);
-            return hover(value, base_span, line_index, encoding);
+/// This is pure presentation: every language decision (native vs. user base, workspace resolution,
+/// definition count, inheritance) was already made by [`otui_core`]'s
+/// [`style_hover_at`](OtuiService::style_hover_at); here we only turn the structured facts into
+/// wording and map the description's span to a range so the client underlines the hovered token.
+fn render_hover(desc: &StyleHover, line_index: &LineIndex, encoding: PositionEncoding) -> Hover {
+    let value = match &desc.kind {
+        StyleHoverKind::NativeBase { name } => {
+            format!("**`{name}`** — built-in native widget class")
         }
-    }
-
-    // Name branch: describe this style and, if present, what it inherits from.
-    let mut value = format!("**`{}`** — style", header.name);
-    if let Some(base) = header.base.as_deref() {
-        let native = if is_native_base(base) {
-            " (built-in)"
-        } else {
-            ""
-        };
-        value.push_str(&format!("\n\nInherits from `{base}`{native}"));
-    }
-    hover(value, header.name_span, line_index, encoding)
-}
-
-/// Markdown describing a `Name < Base` **base** name (the base branch of [`render_style_hover`]).
-fn render_base_markdown(base: &str, index: &StyleIndex) -> String {
-    if is_native_base(base) {
-        return format!("**`{base}`** — built-in native widget class");
-    }
-    let hits = index.lookup(base);
-    match hits.len() {
-        0 => format!("**`{base}`** — style (not found in workspace)"),
-        n => {
-            let mut value = format!("**`{base}`** — style");
-            if n > 1 {
-                value.push_str(&format!(" ({n} definitions)"));
+        StyleHoverKind::UserBase {
+            name,
+            def_count,
+            inherits,
+        } => {
+            let mut value = format!("**`{name}`** — style");
+            if *def_count > 1 {
+                value.push_str(&format!(" ({def_count} definitions)"));
             }
-            // If (any of) the resolved def(s) carries its own base, surface the next hop.
-            if let Some(grand) = hits.iter().find_map(|(_, def)| def.base.as_deref()) {
-                let native = if is_native_base(grand) {
-                    " (built-in)"
-                } else {
-                    ""
-                };
-                value.push_str(&format!("\n\nInherits from `{grand}`{native}"));
-            }
+            append_inherits(&mut value, inherits.as_ref());
             value
         }
-    }
-}
-
-/// Build a Markdown [`Hover`] whose range is `span` mapped through `line_index`.
-fn hover(
-    value: String,
-    span: lang_api::ByteSpan,
-    line_index: &LineIndex,
-    encoding: PositionEncoding,
-) -> Hover {
+        StyleHoverKind::DanglingBase { name } => {
+            format!("**`{name}`** — style (not found in workspace)")
+        }
+        StyleHoverKind::StyleName { name, inherits } => {
+            let mut value = format!("**`{name}`** — style");
+            append_inherits(&mut value, inherits.as_ref());
+            value
+        }
+    };
     Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
             value,
         }),
-        range: Some(line_index.range(span.start, span.end, encoding)),
+        range: Some(line_index.range(desc.span.start, desc.span.end, encoding)),
+    }
+}
+
+/// Append an "Inherits from `Base`" line (marking a native base as `(built-in)`) when `inherits` is
+/// present; a no-op otherwise.
+fn append_inherits(value: &mut String, inherits: Option<&Inheritance>) {
+    if let Some(inh) = inherits {
+        let native = if inh.native { " (built-in)" } else { "" };
+        value.push_str(&format!("\n\nInherits from `{}`{native}", inh.base));
     }
 }
 
@@ -539,22 +508,16 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        // Map the cursor Position to a byte offset, then classify the token under it.
+        // Map the cursor Position to a byte offset, then let the engine describe the token under it,
+        // resolving against the workspace index. Only the current doc's LineIndex is needed to map
+        // the description's span back to a range.
         let line_index = LineIndex::new(&text);
         let offset = line_index.offset_at(position, encoding);
-        let Some(header) = self.service.style_header_at(&text, offset) else {
+        let index = self.style_index.read().await;
+        let Some(desc) = self.service.style_hover_at(&text, offset, &index) else {
             return Ok(None);
         };
-
-        // Render against the workspace index; only the current doc's LineIndex is needed for range.
-        let index = self.style_index.read().await;
-        Ok(Some(render_style_hover(
-            &header,
-            offset,
-            &index,
-            &line_index,
-            encoding,
-        )))
+        Ok(Some(render_hover(&desc, &line_index, encoding)))
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -961,14 +924,15 @@ mod tests {
         }
     }
 
-    /// Locate the header at the first occurrence of `needle` in `text` and render its hover.
+    /// Describe the hover at the first occurrence of `needle` in `text` (via the engine) and format
+    /// it — the same path the `hover` handler drives, minus the document store.
     fn hover_at(index: &StyleIndex, text: &str, needle: &str) -> Hover {
         let offset = text.find(needle).expect("needle present");
-        let header = OtuiService::new()
-            .style_header_at(text, offset)
-            .expect("cursor is on a header token");
+        let desc = OtuiService::new()
+            .style_hover_at(text, offset, index)
+            .expect("cursor is on a style token");
         let line_index = LineIndex::new(text);
-        render_style_hover(&header, offset, index, &line_index, PositionEncoding::Utf16)
+        render_hover(&desc, &line_index, PositionEncoding::Utf16)
     }
 
     #[test]
@@ -1035,6 +999,17 @@ mod tests {
     }
 
     #[test]
+    fn hover_on_a_bare_header_name_shows_only_the_style() {
+        // A bare top-level `container` (no `< Base`): the name branch must emit just the style line,
+        // with no "Inherits from" suffix.
+        let (index, _) = workspace(&[("file:///a.otui", "Standalone\n  id: x\n")]);
+        let h = hover_at(&index, "Standalone\n  id: x\n", "Standalone");
+        let text = hover_text(&h);
+        assert_eq!(text, "**`Standalone`** — style");
+        assert!(!text.contains("Inherits from"), "{text}");
+    }
+
+    #[test]
     fn hover_range_equals_the_hovered_token_span() {
         let (index, _) = workspace(&[("file:///a.otui", "MainWindow < UIWindow\n")]);
         let src = "MainWindow < UIWindow\n";
@@ -1052,10 +1027,13 @@ mod tests {
 
     #[test]
     fn hover_on_a_non_header_offset_yields_nothing() {
-        // A property value is not a header token: the locator returns None, so no hover.
+        // A property value is not a header token: the engine describes nothing, so no hover.
+        let (index, _) = workspace(&[("file:///a.otui", "MainWindow < UIWindow\n  id: main\n")]);
         let src = "MainWindow < UIWindow\n  id: main\n";
         let offset = src.find("main").expect("present");
-        assert!(OtuiService::new().style_header_at(src, offset).is_none());
+        assert!(OtuiService::new()
+            .style_hover_at(src, offset, &index)
+            .is_none());
     }
 
     #[test]
