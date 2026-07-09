@@ -131,8 +131,14 @@ impl<'a> LineIndex<'a> {
             .get(line + 1)
             .copied()
             .unwrap_or(self.text.len());
+        // Trim the line terminator so the column never crosses onto the next line. Treat `\r\n` as
+        // a single terminator: strip the `\n`, then a preceding `\r`, so CRLF documents clamp to the
+        // visible line end rather than to a position after the stray `\r`.
         let mut content_end = next_line_start;
         if content_end > line_start && self.text.as_bytes()[content_end - 1] == b'\n' {
+            content_end -= 1;
+        }
+        if content_end > line_start && self.text.as_bytes()[content_end - 1] == b'\r' {
             content_end -= 1;
         }
         let line_text = &self.text[line_start..content_end];
@@ -330,6 +336,22 @@ mod tests {
         assert_eq!(
             idx.offset_at(Position::new(0, 4), PositionEncoding::Utf8),
             3
+        );
+    }
+
+    #[test]
+    fn offset_at_clamps_past_line_end_over_crlf_to_before_the_carriage_return() {
+        // A CRLF-terminated line: the `\r\n` is a single terminator, so a column past the visible
+        // content must clamp to just before the `\r`, not between `\r` and `\n`.
+        let text = "Panel\r\nHi\r\n";
+        let idx = LineIndex::new(text);
+        // Line 0 content is "Panel" (bytes 0..5); the terminator is `\r\n` at bytes 5..7. A huge
+        // column clamps to byte 5 (before `\r`), and that offset round-trips back to (0, 5).
+        let off = idx.offset_at(Position::new(0, 99), PositionEncoding::Utf16);
+        assert_eq!(off, 5);
+        assert_eq!(
+            idx.position(off, PositionEncoding::Utf16),
+            Position::new(0, 5)
         );
     }
 

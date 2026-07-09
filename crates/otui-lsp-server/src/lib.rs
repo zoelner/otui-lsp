@@ -598,6 +598,24 @@ mod tests {
     }
 
     #[test]
+    fn base_and_reference_in_the_same_document_resolve_within_it() {
+        // A base declared and referenced in the *same* open document — the self-referencing path
+        // `goto_definition` hits when a file inherits from a style it also defines.
+        let (index, docs) = workspace(&[("file:///self.otui", "Base < UIWidget\nChild < Base\n")]);
+        let resp = resolve_base_definition(&index, &docs, "Base", PositionEncoding::Utf16)
+            .expect("resolves");
+        match resp {
+            GotoDefinitionResponse::Scalar(loc) => {
+                assert_eq!(loc.uri.as_str(), "file:///self.otui");
+                // `Base`'s defining name span is line 0, columns 0..4 of the same document.
+                assert_eq!(loc.range.start, Position::new(0, 0));
+                assert_eq!(loc.range.end, Position::new(0, 4));
+            }
+            other => panic!("expected a scalar location, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn native_base_resolves_to_nothing() {
         // `UIWidget` is a native built-in with no defining file, so it is absent from the index and
         // resolves to `None` (the locator still returns a `BaseRef`; the index drops it).
