@@ -8,14 +8,14 @@ use lang_api::{
     Diagnostic as CoreDiagnostic, DocumentSymbol as CoreSymbol, Severity,
     SymbolKind as CoreSymbolKind,
 };
-use otui_core::folding::{FoldKind as CoreFoldKind, FoldRange as CoreFoldRange};
-use otui_core::schema::Rgba;
-use tower_lsp::lsp_types::{
+use lsp_types::{
     Color, ColorInformation, CompletionItem as LspCompletionItem,
     CompletionItemKind as LspCompletionItemKind, Diagnostic as LspDiagnostic, DiagnosticSeverity,
     DocumentSymbol as LspSymbol, FoldingRange, FoldingRangeKind, Location, NumberOrString,
-    Position, Range, SymbolInformation, SymbolKind as LspSymbolKind, TextEdit, Url,
+    Position, Range, SymbolInformation, SymbolKind as LspSymbolKind, TextEdit, Uri,
 };
+use otui_core::folding::{FoldKind as CoreFoldKind, FoldRange as CoreFoldRange};
+use otui_core::schema::Rgba;
 
 use crate::position::{LineIndex, PositionEncoding};
 
@@ -66,7 +66,7 @@ pub fn all_to_lsp(
 /// Used by go-to-definition (spec §5.3): a resolved target's `name_span` is a byte span into **its
 /// own** document's text, so this must be called with that target document's text (not the request
 /// document's), building a fresh [`LineIndex`] over it.
-pub fn location_of(uri: Url, text: &str, span: ByteSpan, encoding: PositionEncoding) -> Location {
+pub fn location_of(uri: Uri, text: &str, span: ByteSpan, encoding: PositionEncoding) -> Location {
     let index = LineIndex::new(text);
     Location {
         uri,
@@ -142,7 +142,7 @@ pub fn symbols_to_lsp(
 #[allow(deprecated)] // `SymbolInformation` (and its `deprecated` field) are deprecated but are the
                      // only shape a non-hierarchical client accepts.
 pub fn symbols_to_flat(
-    uri: &Url,
+    uri: &Uri,
     text: &str,
     syms: &[CoreSymbol],
     encoding: PositionEncoding,
@@ -159,7 +159,7 @@ pub fn symbols_to_flat(
 /// tagging each with its parent's name as `container_name`.
 #[allow(deprecated)] // See `symbols_to_flat`.
 fn flatten_symbol(
-    uri: &Url,
+    uri: &Uri,
     sym: &CoreSymbol,
     container: Option<&str>,
     index: &LineIndex<'_>,
@@ -313,10 +313,12 @@ pub fn folds_to_lsp(folds: &[CoreFoldRange]) -> Vec<FoldingRange> {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
     use lang_api::{ByteSpan, CompletionKind as CoreCompletionKind, LanguageService};
+    use lsp_types::Position;
     use otui_core::OtuiService;
-    use tower_lsp::lsp_types::Position;
 
     #[test]
     fn maps_tab_indentation_diagnostic_from_the_engine() {
@@ -373,7 +375,7 @@ mod tests {
 
     #[test]
     fn converts_nested_symbol_tree_with_ranges_and_kinds() {
-        use tower_lsp::lsp_types::Position;
+        use lsp_types::Position;
 
         // Text laid out so both spans are exercised:
         //   line 0: "Panel"
@@ -642,7 +644,7 @@ mod tests {
             }],
         };
 
-        let uri = Url::parse("file:///x.otui").unwrap();
+        let uri = Uri::from_str("file:///x.otui").unwrap();
         let flat = symbols_to_flat(
             &uri,
             text,
