@@ -30,22 +30,24 @@ use tower_lsp::lsp_types::request::{
 };
 use tower_lsp::lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
-    CodeActionProviderCapability, CodeActionResponse, CompletionOptions, CompletionParams,
+    CodeActionProviderCapability, CodeActionResponse, ColorInformation, ColorPresentation,
+    ColorPresentationParams, ColorProviderCapability, CompletionOptions, CompletionParams,
     CompletionResponse, Diagnostic as LspDiagnostic, DidChangeTextDocumentParams,
     DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
-    DocumentSymbolParams, DocumentSymbolResponse, FileChangeType, FileSystemWatcher, FoldingRange,
-    FoldingRangeParams, FoldingRangeProviderCapability, GlobPattern, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    ImplementationProviderCapability, InitializeParams, InitializeResult, InitializedParams,
-    Location, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf, PositionEncodingKind,
-    PrepareRenameResponse, ReferenceParams, Registration, RenameOptions, RenameParams,
-    SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
-    SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
-    SymbolInformation, SymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextEdit, TypeDefinitionProviderCapability, TypeHierarchyItem,
-    TypeHierarchyPrepareParams, TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Url,
-    WorkDoneProgressOptions, WorkspaceEdit, WorkspaceSymbolParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentColorParams,
+    DocumentFormattingParams, DocumentSymbolParams, DocumentSymbolResponse, FileChangeType,
+    FileSystemWatcher, FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability,
+    GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
+    InitializedParams, Location, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf,
+    PositionEncodingKind, PrepareRenameResponse, ReferenceParams, Registration, RenameOptions,
+    RenameParams, SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions,
+    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
+    ServerCapabilities, ServerInfo, SymbolInformation, SymbolKind, TextDocumentPositionParams,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, TypeDefinitionProviderCapability,
+    TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
+    TypeHierarchySupertypesParams, Url, WorkDoneProgressOptions, WorkspaceEdit,
+    WorkspaceSymbolParams,
 };
 use tower_lsp::{Client, LanguageServer};
 
@@ -1102,6 +1104,10 @@ impl LanguageServer for Backend {
                 // Code actions: quick-fixes for the parse-level diagnostics (spec §7). A plain
                 // boolean provider — the fixes are computed on demand per request range.
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                // Document colors: inline swatches at every OTML color value, plus color-picker
+                // presentations (spec §2.9). A plain boolean provider — colors are computed on
+                // demand per request.
+                color_provider: Some(ColorProviderCapability::Simple(true)),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -1329,6 +1335,54 @@ impl LanguageServer for Backend {
             ))
         };
         Ok(Some(response))
+    }
+
+    async fn document_color(
+        &self,
+        params: DocumentColorParams,
+    ) -> RpcResult<Vec<ColorInformation>> {
+        let uri = params.text_document.uri;
+        // Serve from the stored document text; an unknown document has no colors. The trait returns
+        // a plain `Vec` (not `Option`), so an unknown document is the empty vec.
+        let Some(text) = self
+            .documents
+            .read()
+            .await
+            .get(&uri)
+            .map(|doc| doc.text.clone())
+        else {
+            return Ok(Vec::new());
+        };
+
+        let core_colors = self.service.document_colors(&text);
+        Ok(convert::colors_to_lsp(&text, &core_colors, self.encoding()))
+    }
+
+    async fn color_presentation(
+        &self,
+        params: ColorPresentationParams,
+    ) -> RpcResult<Vec<ColorPresentation>> {
+        // The picked color, as engine `Rgba`. `range` is where the new text is inserted (the token
+        // being replaced) — so each presentation carries a `TextEdit` over that range.
+        let color = params.color;
+        let rgba = otui_core::schema::Rgba {
+            r: color.red,
+            g: color.green,
+            b: color.blue,
+            a: color.alpha,
+        };
+        let presentations = otui_core::schema::color_presentations(rgba)
+            .into_iter()
+            .map(|label| ColorPresentation {
+                text_edit: Some(TextEdit {
+                    range: params.range,
+                    new_text: label.clone(),
+                }),
+                label,
+                additional_text_edits: None,
+            })
+            .collect();
+        Ok(presentations)
     }
 
     async fn folding_range(

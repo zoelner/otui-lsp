@@ -12,6 +12,7 @@
 //! tree-sitter [`syntax`] substrate.
 
 pub mod catalog;
+pub mod colors;
 pub mod completion;
 pub mod diagnostics;
 pub mod fixes;
@@ -216,6 +217,18 @@ impl OtuiService {
     #[must_use]
     pub fn folding_ranges(&self, source: &str) -> Vec<folding::FoldRange> {
         folding::folding_ranges(source)
+    }
+
+    /// Find every color value in `source` with its byte span and resolved [`Rgba`]
+    /// (`textDocument/documentColor`, spec §2.9). Walks the CST for hex / functional / named color
+    /// tokens; the server maps each `(span, rgba)` onto an `lsp_types::ColorInformation` (byte span →
+    /// range, [`Rgba`] → `Color`). Returns an empty vec when the source cannot be parsed.
+    ///
+    /// Inherent (not on the [`LanguageService`] trait) so the protocol-agnostic trait stays minimal,
+    /// mirroring [`folding_ranges`](Self::folding_ranges).
+    #[must_use]
+    pub fn document_colors(&self, source: &str) -> Vec<(ByteSpan, schema::Rgba)> {
+        colors::document_colors(source)
     }
 }
 
