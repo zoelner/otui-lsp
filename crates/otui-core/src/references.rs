@@ -143,7 +143,13 @@ fn anchor_id_prefix(anchor_target: Node<'_>, source: &str, id: &str) -> Option<B
     let span = SyntaxTree::span_of(target);
     let text = &source[span.start..span.end];
     let dot = text.find('.')?; // no dot → magic keyword, not an `<id>.edge` reference
-    if &text[..dot] == id {
+    let prefix = &text[..dot];
+    // A dotted magic target (`parent.bottom`, `next.top`, `prev.left`) references the magic widget,
+    // not a user id — its prefix is never an id reference even if it happens to equal `id`.
+    if crate::schema::is_magic_anchor_target(prefix) {
+        return None;
+    }
+    if prefix == id {
         Some(ByteSpan::new(span.start, span.start + dot))
     } else {
         None
@@ -254,6 +260,19 @@ mod tests {
         assert!(
             occ.anchor_refs.is_empty(),
             "bare `parent`/`none` targets have no dot, so reference no id"
+        );
+    }
+
+    #[test]
+    fn dotted_magic_anchor_target_is_not_an_id_reference() {
+        // `parent.bottom` references the magic parent widget, not an id named `parent`, so querying
+        // references for the id `parent` must not collect it (only the real `id: parent` decl).
+        let src = "Panel\n  id: parent\n  anchors.top: parent.bottom\n";
+        let occ = id_occurrences(src, "parent");
+        assert!(occ.declaration.is_some(), "the `id: parent` decl is found");
+        assert!(
+            occ.anchor_refs.is_empty(),
+            "a dotted magic target's prefix is not an id reference"
         );
     }
 

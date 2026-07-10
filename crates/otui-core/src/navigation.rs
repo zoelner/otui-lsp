@@ -210,10 +210,16 @@ fn anchor_id_ref(anchor_target: Node<'_>, source: &str, offset: usize) -> Option
     let span = SyntaxTree::span_of(target);
     let text = &source[span.start..span.end];
     let dot = text.find('.')?; // no dot → magic keyword (parent/prev/next/…), not an id
+    let prefix = &text[..dot];
+    // A dotted target can still be magic: `parent.bottom` / `next.top` / `prev.left` reference the
+    // magic widget, not a user id, so their prefix is never an id reference.
+    if crate::schema::is_magic_anchor_target(prefix) {
+        return None;
+    }
     let prefix_end = span.start + dot;
     if span.start <= offset && offset < prefix_end {
         Some(IdRef {
-            id: text[..dot].to_owned(),
+            id: prefix.to_owned(),
             span: ByteSpan::new(span.start, prefix_end),
         })
     } else {
@@ -385,6 +391,20 @@ mod tests {
         // `parent` is a magic keyword (no dot), not an id.
         let src = "Other\n  anchors.fill: parent\n";
         assert!(id_at(src, at(src, "parent")).is_none());
+    }
+
+    #[test]
+    fn id_at_cursor_on_dotted_magic_target_prefix_is_none() {
+        // `parent.bottom` references the magic parent widget, not a user id — the `parent` prefix
+        // must not be classified as an id even though it is dotted.
+        let src = "Other\n  anchors.top: parent.bottom\n";
+        assert!(id_at(src, at(src, "parent")).is_none());
+        // ...while a real id prefix in the same shape IS a hit.
+        let src2 = "Other\n  anchors.top: header.bottom\n";
+        assert_eq!(
+            id_at(src2, at(src2, "header")).map(|r| r.id),
+            Some("header".to_owned())
+        );
     }
 
     #[test]
