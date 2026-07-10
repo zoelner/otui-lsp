@@ -14,6 +14,7 @@
 
 use crate::syntax::SyntaxTree;
 use lang_api::ByteSpan;
+use tree_sitter::Node;
 
 /// A cursor hit on the `Base` token of a top-level `Name < Base` inheritance declaration.
 ///
@@ -140,6 +141,90 @@ pub fn style_header_at(source: &str, offset: usize) -> Option<StyleHeaderRef> {
         }
     }
     None
+}
+
+/// A cursor hit on an `id:` value or on the `id` portion of an anchor target `<id>.edge` (spec §5.4).
+///
+/// [`id`](Self::id) is the id text; [`span`](Self::span) is its byte span — the `id:` value token
+/// when the cursor is on a declaration, or just the `id` prefix (not the `.edge` suffix) when it is on
+/// an anchor reference. Ids are per-document identities, so resolving occurrences is document-local
+/// (the server's job — see [`references`](crate::references)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdRef {
+    /// The id the cursor is on.
+    pub id: String,
+    /// The byte span of the id token (the `id:` value, or the `id` prefix of an `<id>.edge` target).
+    pub span: ByteSpan,
+}
+
+/// If `offset` falls on an `id:` value token, or on the `id` portion of an anchor target
+/// `<id>.edge`, return that id and its span; otherwise `None`.
+///
+/// Two grammar shapes carry an id the cursor can sit on:
+/// * the `value` of an `id_property` (`id: <value>`) — the declaration; and
+/// * the `id` prefix of a dotted `anchor_target` `<id>.edge` (`anchors.top: header.bottom`) — a
+///   reference. A hit on the `.edge` suffix, or on a bare (dot-less) magic target like `parent`,
+///   yields `None`: those are not id tokens.
+///
+/// The same half-open `[start, end)` boundary convention as [`base_reference_at`] applies.
+#[must_use]
+pub fn id_at(source: &str, offset: usize) -> Option<IdRef> {
+    let tree = SyntaxTree::parse(source)?;
+    find_id_at(tree.root(), source, offset)
+}
+
+/// Depth-first search for the id token under `offset` (ids nest at any depth).
+fn find_id_at(node: Node<'_>, source: &str, offset: usize) -> Option<IdRef> {
+    match node.kind() {
+        "id_property" => {
+            if let Some(value) = node.child_by_field_name("value") {
+                let span = SyntaxTree::span_of(value);
+                if span.start <= offset && offset < span.end {
+                    return Some(IdRef {
+                        id: source[span.start..span.end].to_owned(),
+                        span,
+                    });
+                }
+            }
+        }
+        "anchor_target" => {
+            if let Some(hit) = anchor_id_ref(node, source, offset) {
+                return Some(hit);
+            }
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(hit) = find_id_at(child, source, offset) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
+/// If `offset` falls on the `id` prefix of a dotted `anchor_target` `<id>.edge`, return that id ref;
+/// otherwise `None` (a hit on the `.edge` suffix, or a dot-less magic target, is not an id).
+fn anchor_id_ref(anchor_target: Node<'_>, source: &str, offset: usize) -> Option<IdRef> {
+    let target = anchor_target.child_by_field_name("target")?;
+    let span = SyntaxTree::span_of(target);
+    let text = &source[span.start..span.end];
+    let dot = text.find('.')?; // no dot → magic keyword (parent/prev/next/…), not an id
+    let prefix = &text[..dot];
+    // A dotted target can still be magic: `parent.bottom` / `next.top` / `prev.left` reference the
+    // magic widget, not a user id, so their prefix is never an id reference.
+    if crate::schema::is_magic_anchor_target(prefix) {
+        return None;
+    }
+    let prefix_end = span.start + dot;
+    if span.start <= offset && offset < prefix_end {
+        Some(IdRef {
+            id: prefix.to_owned(),
+            span: ByteSpan::new(span.start, prefix_end),
+        })
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -273,5 +358,59 @@ mod tests {
     fn header_at_property_value_is_none() {
         let src = "MainWindow < UIWindow\n  id: main\n";
         assert!(style_header_at(src, at(src, "main")).is_none());
+    }
+
+    #[test]
+    fn id_at_cursor_on_id_value_returns_it() {
+        let src = "Panel\n  id: header\n";
+        let got = id_at(src, at(src, "header")).expect("hit");
+        assert_eq!(got.id, "header");
+        assert_eq!(&src[got.span.start..got.span.end], "header");
+        // A cursor in the middle of the value is the same hit.
+        assert_eq!(id_at(src, at(src, "header") + 2).as_ref(), Some(&got));
+    }
+
+    #[test]
+    fn id_at_cursor_on_anchor_target_id_prefix_returns_it() {
+        // The `header` prefix of `header.bottom` is the id reference; its span excludes `.bottom`.
+        let src = "Other\n  anchors.top: header.bottom\n";
+        let got = id_at(src, at(src, "header.bottom")).expect("hit");
+        assert_eq!(got.id, "header");
+        assert_eq!(&src[got.span.start..got.span.end], "header");
+    }
+
+    #[test]
+    fn id_at_cursor_on_anchor_edge_suffix_is_none() {
+        // A hit on the `.bottom` edge (after the dot) is not an id token.
+        let src = "Other\n  anchors.top: header.bottom\n";
+        assert!(id_at(src, at(src, "bottom")).is_none());
+    }
+
+    #[test]
+    fn id_at_cursor_on_bare_magic_target_is_none() {
+        // `parent` is a magic keyword (no dot), not an id.
+        let src = "Other\n  anchors.fill: parent\n";
+        assert!(id_at(src, at(src, "parent")).is_none());
+    }
+
+    #[test]
+    fn id_at_cursor_on_dotted_magic_target_prefix_is_none() {
+        // `parent.bottom` references the magic parent widget, not a user id — the `parent` prefix
+        // must not be classified as an id even though it is dotted.
+        let src = "Other\n  anchors.top: parent.bottom\n";
+        assert!(id_at(src, at(src, "parent")).is_none());
+        // ...while a real id prefix in the same shape IS a hit.
+        let src2 = "Other\n  anchors.top: header.bottom\n";
+        assert_eq!(
+            id_at(src2, at(src2, "header")).map(|r| r.id),
+            Some("header".to_owned())
+        );
+    }
+
+    #[test]
+    fn id_at_cursor_off_any_id_is_none() {
+        let src = "MainWindow < UIWindow\n";
+        assert!(id_at(src, at(src, "UIWindow")).is_none());
+        assert!(id_at("", 0).is_none());
     }
 }
