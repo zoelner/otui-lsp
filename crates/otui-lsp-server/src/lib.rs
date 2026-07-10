@@ -194,6 +194,30 @@ impl Backend {
         self.disk_texts.write().await.insert(uri.clone(), text);
     }
 
+    /// Read `uri` from disk **off the async runtime**.
+    ///
+    /// [`read_otui_from_disk`] does blocking `std::fs` I/O (plus the size cap and UTF-8/binary skip);
+    /// calling it inline in an `async fn` would stall a tokio worker — and every LSP request shares
+    /// that runtime — on a slow/large/networked read. So the blocking read is offloaded to a
+    /// `spawn_blocking` thread and awaited. A `JoinError` (the blocking task panicked/was cancelled)
+    /// is treated exactly like an unreadable file: logged and mapped to `None`, so the caller falls
+    /// back to its graceful skip/remove path. No lock is held across this await.
+    async fn read_otui_off_runtime(&self, uri: &Url) -> Option<String> {
+        let uri_owned = uri.clone();
+        match tokio::task::spawn_blocking(move || read_otui_from_disk(&uri_owned)).await {
+            Ok(text) => text,
+            Err(err) => {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("otui-lsp: disk read task failed for {uri}: {err}"),
+                    )
+                    .await;
+                None
+            }
+        }
+    }
+
     /// Drop `uri` from both the style index and the disk-text cache (a deleted / vanished file).
     async fn deindex(&self, uri: &Url) {
         self.style_index
@@ -1212,8 +1236,9 @@ impl LanguageServer for Backend {
                 self.deindex(&uri).await;
             } else if change.typ == FileChangeType::CREATED || change.typ == FileChangeType::CHANGED
             {
-                // Re-read from disk and re-index; skip (with a log) an unreadable/oversized/binary file.
-                if let Some(text) = read_otui_from_disk(&uri) {
+                // Re-read from disk (off the runtime — see `read_otui_off_runtime`) and re-index; skip
+                // (with a log) an unreadable/oversized/binary file.
+                if let Some(text) = self.read_otui_off_runtime(&uri).await {
                     self.index_from_disk(&uri, text).await;
                 } else {
                     self.client
@@ -1792,7 +1817,9 @@ impl LanguageServer for Backend {
         // must stay indexed as a closed file. Re-read it from disk and re-index from that text (the
         // buffer's unsaved edits, if any, are discarded on close — disk is now authoritative). If the
         // disk read fails (the file was deleted while open), drop it from the index + cache instead.
-        match read_otui_from_disk(&uri) {
+        // The read runs off the async runtime (see `read_otui_off_runtime`) so a slow/large read
+        // never stalls the tokio worker shared by all LSP requests.
+        match self.read_otui_off_runtime(&uri).await {
             Some(text) => self.index_from_disk(&uri, text).await,
             None => self.deindex(&uri).await,
         }
