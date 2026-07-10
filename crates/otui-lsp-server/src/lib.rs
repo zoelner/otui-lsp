@@ -41,11 +41,12 @@ use lsp_types::{
     CompletionResponse, Diagnostic as LspDiagnostic, DidChangeTextDocumentParams,
     DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentColorParams,
-    DocumentFormattingParams, DocumentSymbolParams, DocumentSymbolResponse, FileChangeType,
-    FileSystemWatcher, FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability,
-    GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
-    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
-    Location, LogMessageParams, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf,
+    DocumentFormattingParams, DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
+    DocumentSymbolParams, DocumentSymbolResponse, FileChangeType, FileSystemWatcher, FoldingRange,
+    FoldingRangeParams, FoldingRangeProviderCapability, GlobPattern, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
+    ImplementationProviderCapability, InitializeParams, InitializeResult, Location,
+    LogMessageParams, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf,
     PositionEncodingKind, PrepareRenameResponse, PublishDiagnosticsParams, ReferenceParams,
     Registration, RegistrationParams, RenameOptions, RenameParams, SemanticTokens,
     SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
@@ -801,6 +802,60 @@ fn collect_references(
     out
 }
 
+/// Collect the LSP [`DocumentHighlight`]s answering a `textDocument/documentHighlight` request for the
+/// symbol under the cursor (spec §5.4), scanning **only** `text` (the current document).
+///
+/// This is the document-local cousin of [`collect_references`]: it reuses the very same occurrence
+/// finders (`style_name_occurrences` / `id_occurrences`), but never fans out across the workspace and
+/// never consults the [`StyleIndex`] — a highlight only colors occurrences in the buffer the cursor is
+/// in. Both a style name (its top-level declaration(s) + every base ref) and an `id:` (its declaration
+/// + every `<id>.edge` anchor ref) are handled.
+///
+/// Kind coloring is the idiomatic read/write split: the **declaration** span (which *defines* the
+/// symbol) is [`DocumentHighlightKind::WRITE`]; every usage (base ref / anchor ref) is
+/// [`DocumentHighlightKind::READ`].
+///
+/// Kept as a free function over borrowed state (no `Client`, no lock) so it is unit-testable in
+/// isolation, mirroring [`collect_references`].
+fn collect_document_highlights(
+    target: &ReferenceTarget,
+    text: &str,
+    service: &OtuiService,
+    encoding: PositionEncoding,
+) -> Vec<DocumentHighlight> {
+    let line_index = LineIndex::new(text);
+    let mut out = Vec::new();
+    let mut push = |span: ByteSpan, kind: DocumentHighlightKind| {
+        out.push(DocumentHighlight {
+            range: line_index.range(span.start, span.end, encoding),
+            kind: Some(kind),
+        });
+    };
+    match target {
+        ReferenceTarget::StyleName(name) => {
+            let occ = service.style_name_occurrences(text, name);
+            // The declaration defines the symbol → WRITE; base references read it → READ.
+            for span in occ.declarations {
+                push(span, DocumentHighlightKind::WRITE);
+            }
+            for span in occ.base_refs {
+                push(span, DocumentHighlightKind::READ);
+            }
+        }
+        ReferenceTarget::Id(id) => {
+            let occ = service.id_occurrences(text, id);
+            // The `id:` declaration defines the id → WRITE; anchor references read it → READ.
+            if let Some(span) = occ.declaration {
+                push(span, DocumentHighlightKind::WRITE);
+            }
+            for span in occ.anchor_refs {
+                push(span, DocumentHighlightKind::READ);
+            }
+        }
+    }
+    out
+}
+
 /// The error message returned when a `textDocument/rename` carries a `new_name` that is not a valid
 /// OTML identifier (spec §rename). Rewriting occurrences with a name the grammar could not re-parse
 /// would silently corrupt the document, so a bad rename is rejected rather than applied. The
@@ -1164,6 +1219,12 @@ impl Backend {
                 reply!(req, "textDocument/references", ReferenceParams, |p| self
                     .references(p))
             }
+            "textDocument/documentHighlight" => reply!(
+                req,
+                "textDocument/documentHighlight",
+                DocumentHighlightParams,
+                |p| self.document_highlight(p)
+            ),
             "textDocument/documentSymbol" => reply!(
                 req,
                 "textDocument/documentSymbol",
@@ -1346,6 +1407,10 @@ impl Backend {
                 // References: uses of a style name (workspace-global) or an `id:` (document-local)
                 // (spec §5.4).
                 references_provider: Some(OneOf::Left(true)),
+                // Document highlight: every occurrence of the style name / `id:` under the cursor
+                // within the CURRENT document only — the document-local cousin of references (spec
+                // §5.4).
+                document_highlight_provider: Some(OneOf::Left(true)),
                 // Rename: a style name (workspace-global) or an `id:` (document-local), with
                 // client-side prepare support so the editor pre-selects the token (spec §rename).
                 rename_provider: Some(OneOf::Right(RenameOptions {
@@ -1806,6 +1871,37 @@ impl Backend {
             encoding,
         );
         Some(locations)
+    }
+
+    fn document_highlight(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> Option<Vec<DocumentHighlight>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let encoding = self.encoding();
+
+        // Read the request document's text (unknown document → nothing to highlight). Highlights are
+        // document-local, so only this buffer's text is ever needed — no merged view, no index.
+        let text = self
+            .documents
+            .read()
+            .expect("documents lock poisoned")
+            .get(&uri)
+            .map(|doc| doc.text.clone())?;
+
+        // Map the cursor Position to a byte offset, then classify what it is on (the SAME classifier
+        // references/rename use, so the three features agree on what a symbol is). A cursor on neither
+        // a style name nor an id has nothing to highlight.
+        let offset = LineIndex::new(&text).offset_at(position, encoding);
+        let target = classify_reference_target(&self.service, &text, offset)?;
+
+        Some(collect_document_highlights(
+            &target,
+            &text,
+            &self.service,
+            encoding,
+        ))
     }
 
     fn prepare_rename(&self, params: TextDocumentPositionParams) -> Option<PrepareRenameResponse> {
@@ -3071,6 +3167,114 @@ mod tests {
             PositionEncoding::Utf16,
         );
         assert_eq!(locs.len(), 2);
+    }
+
+    /// `(start, end, kind)` of each highlight, sorted by position, for order-independent asserts
+    /// (the finders return declarations before refs, but ids/anchors nest at any depth).
+    fn sorted_highlights(
+        hls: &[DocumentHighlight],
+    ) -> Vec<(Position, Position, DocumentHighlightKind)> {
+        let mut out: Vec<(Position, Position, DocumentHighlightKind)> = hls
+            .iter()
+            .map(|h| (h.range.start, h.range.end, h.kind.expect("kind set")))
+            .collect();
+        out.sort_by_key(|a| (a.0.line, a.0.character));
+        out
+    }
+
+    /// Classify the cursor at the first occurrence of `needle` and collect its document-local
+    /// highlights — the exact path the `document_highlight` handler drives, minus the doc store.
+    fn highlights_at(src: &str, needle: &str) -> Vec<DocumentHighlight> {
+        let svc = OtuiService::new();
+        let off = src.find(needle).expect("needle present");
+        let target = classify_reference_target(&svc, src, off).expect("on a symbol");
+        collect_document_highlights(&target, src, &svc, PositionEncoding::Utf16)
+    }
+
+    #[test]
+    fn document_highlight_on_a_style_name_marks_declaration_write_and_base_refs_read() {
+        // `Base` is declared once (WRITE) and used as a base twice (READ), all in one document.
+        // The unrelated `Other` declaration must not be highlighted.
+        let src = "Base < UIWidget\nChildA < Base\nChildB < Base\nOther < UIWidget\n";
+        let hls = highlights_at(src, "Base");
+        assert_eq!(
+            sorted_highlights(&hls),
+            vec![
+                // Declaration: `Base` on line 0 → WRITE.
+                (
+                    Position::new(0, 0),
+                    Position::new(0, 4),
+                    DocumentHighlightKind::WRITE
+                ),
+                // Base refs: `Base` on lines 1 and 2 → READ.
+                (
+                    Position::new(1, 9),
+                    Position::new(1, 13),
+                    DocumentHighlightKind::READ
+                ),
+                (
+                    Position::new(2, 9),
+                    Position::new(2, 13),
+                    DocumentHighlightKind::READ
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn document_highlight_on_an_id_marks_declaration_write_and_anchor_refs_read() {
+        let src = "Panel\n  id: header\nOther\n  anchors.top: header.bottom\n  anchors.left: header.left\n";
+        // Cursor on the `id:` value declaration.
+        let hls = highlights_at(src, "header");
+        assert_eq!(
+            sorted_highlights(&hls),
+            vec![
+                // The `id: header` declaration → WRITE.
+                (
+                    Position::new(1, 6),
+                    Position::new(1, 12),
+                    DocumentHighlightKind::WRITE
+                ),
+                // Each `<id>.edge` anchor prefix → READ (span covers just `header`, not `.edge`).
+                (
+                    Position::new(3, 15),
+                    Position::new(3, 21),
+                    DocumentHighlightKind::READ
+                ),
+                (
+                    Position::new(4, 16),
+                    Position::new(4, 22),
+                    DocumentHighlightKind::READ
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn document_highlight_ignores_a_dotted_magic_anchor_target_prefix() {
+        // `parent.bottom` references the magic parent widget, not the `id: parent`; only the real
+        // declaration is highlighted (reusing the finders' existing magic-target exclusion).
+        let src = "Panel\n  id: parent\n  anchors.top: parent.bottom\n";
+        // First `parent` occurrence is the `id:` value token (cursor on the declaration).
+        let hls = highlights_at(src, "parent");
+        assert_eq!(
+            sorted_highlights(&hls),
+            vec![(
+                Position::new(1, 6),
+                Position::new(1, 12),
+                DocumentHighlightKind::WRITE
+            )],
+            "the dotted magic target's `parent` prefix is not an id reference"
+        );
+    }
+
+    #[test]
+    fn document_highlight_off_symbol_classifies_to_none() {
+        // A property value is neither a style name nor an id → the handler answers `None`.
+        let svc = OtuiService::new();
+        let src = "Panel\n  width: 10\n";
+        let off = src.find("10").expect("present");
+        assert!(classify_reference_target(&svc, src, off).is_none());
     }
 
     #[test]
