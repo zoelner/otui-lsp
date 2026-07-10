@@ -60,6 +60,7 @@ use lsp_types::{
 use otui_core::fixes::Fix;
 use otui_core::hover::{Inheritance, StyleHover, StyleHoverKind};
 use otui_core::links::PathRef;
+use otui_core::lua_widgets::LuaWidgetIndex;
 use otui_core::style_index::{is_native_base, DocId, StyleDef, StyleIndex};
 use otui_core::OtuiService;
 
@@ -106,6 +107,15 @@ pub struct Backend {
     /// deadlock — each is taken and released cleanly around its critical section. [`Arc`] so the
     /// background scan can write into it from a spawned task.
     style_index: Arc<RwLock<StyleIndex>>,
+    /// The workspace-wide **Lua** widget index: the custom style properties each widget adds in Lua
+    /// and its `extends` parent, keyed by document URL string. Populated at startup by scanning
+    /// `*.lua` under the workspace roots and kept in sync via file watching
+    /// (`did_change_watched_files` for `*.lua`). Consumed by the widget-aware `unknown-property`
+    /// check ([`OtuiService::diagnostics_with_widgets`]) so a Lua-added property (e.g. a `UITable`'s
+    /// `column-style`) is not wrongly flagged. Unlike [`style_index`](Self::style_index) there is no
+    /// open-buffer or disk-text tracking: Lua files are never opened as OTUI documents, so this index
+    /// is fed only from disk. [`Arc`] so the background scan can write into it from a spawned task.
+    lua_index: Arc<RwLock<LuaWidgetIndex>>,
     /// On-disk text of every **indexed closed** `.otui` file, keyed by its `file://` URL. This is
     /// the content store that lets the aggregators map a closed file's byte span → LSP range without
     /// the file being open. For any URI also present in [`documents`](Self::documents) the open
@@ -147,6 +157,7 @@ impl Backend {
             hierarchical_symbols: Mutex::new(client_supports_hierarchical_symbols(params)),
             documents: Arc::new(RwLock::new(HashMap::new())),
             style_index: Arc::new(RwLock::new(StyleIndex::new())),
+            lua_index: Arc::new(RwLock::new(LuaWidgetIndex::new())),
             disk_texts: Arc::new(RwLock::new(HashMap::new())),
             roots: Mutex::new(workspace_roots(params)),
             reindex_guard: Arc::new(Mutex::new(())),
@@ -198,7 +209,16 @@ impl Backend {
     /// the version check here is belt-and-braces: it still discards diagnostics computed for an
     /// older `version` than the one currently stored for `uri`.
     fn publish(&self, uri: Uri, text: &str, version: i32) {
-        let core_diags = self.service.diagnostics(text);
+        // Widget-aware diagnostics: the unknown-property check consults the workspace style + Lua
+        // indexes so a Lua-added property is not wrongly hinted. Both read locks are taken and
+        // released here around the (owned) result, and no document lock is held meanwhile, preserving
+        // the unnested-lock discipline. With the indexes still empty (scan not yet complete) this is
+        // identical to the catalog-only pass.
+        let core_diags = {
+            let styles = self.style_index.read().expect("style_index lock poisoned");
+            let lua = self.lua_index.read().expect("lua_index lock poisoned");
+            self.service.diagnostics_with_widgets(text, &styles, &lua)
+        };
         let lsp_diags = convert::all_to_lsp(text, &core_diags, self.encoding());
 
         let latest = self
@@ -299,6 +319,25 @@ impl Backend {
             .expect("disk_texts lock poisoned")
             .remove(uri);
     }
+
+    /// Re-index a `*.lua` file's widget definitions into the [`lua_index`](Self::lua_index) from its
+    /// on-disk `text` (the initial scan and the file watcher). Extraction is pure; there is no
+    /// disk-text cache or open-buffer check because Lua is never an open OTUI document.
+    fn index_lua_from_disk(&self, uri: &Uri, text: &str) {
+        let defs = self.service.lua_widgets(text);
+        self.lua_index
+            .write()
+            .expect("lua_index lock poisoned")
+            .set_document(DocId::from(uri.to_string()), defs);
+    }
+
+    /// Drop `uri`'s widget definitions from the [`lua_index`](Self::lua_index) (a deleted Lua file).
+    fn deindex_lua(&self, uri: &Uri) {
+        self.lua_index
+            .write()
+            .expect("lua_index lock poisoned")
+            .remove_document(&DocId::from(uri.to_string()));
+    }
 }
 
 /// Merge the open buffers over the on-disk cache into a single `URI → Document` view for one
@@ -385,7 +424,11 @@ fn resolve_asset_candidates(
     }
 }
 
-fn read_otui_from_disk(uri: &Uri) -> Option<String> {
+/// Read an indexable file (`.otui` or `.lua`) from disk, or `None` when it cannot / should not be
+/// indexed: a non-`file:` URI, an unreadable path, a file larger than [`MAX_INDEXED_FILE_BYTES`], or
+/// content that is not valid UTF-8 (a binary/garbage file must never crash the server or land bogus
+/// entries in an index). The single disk-read seam shared by the scan, the watcher and `did_close`.
+fn read_indexed_file(uri: &Uri) -> Option<String> {
     let path = uri_to_file_path(uri)?;
     let meta = std::fs::metadata(&path).ok()?;
     if !meta.is_file() || meta.len() > MAX_INDEXED_FILE_BYTES {
@@ -395,28 +438,41 @@ fn read_otui_from_disk(uri: &Uri) -> Option<String> {
     std::fs::read_to_string(&path).ok()
 }
 
-/// Recursively collect every `*.otui` file under `roots`, reading each into `(url, text)`.
+/// Recursively collect every `*.otui` file under `roots`, reading each into `(url, text)` — the
+/// `.otui` style corpus for the initial workspace scan.
+fn scan_workspace(roots: &[Uri]) -> Vec<(Uri, String)> {
+    scan_workspace_ext(roots, "otui")
+}
+
+/// Recursively collect every `*.lua` file under `roots`, reading each into `(url, text)` — the Lua
+/// module corpus scanned for widget definitions ([`OtuiService::lua_widgets`]).
+fn scan_workspace_lua(roots: &[Uri]) -> Vec<(Uri, String)> {
+    scan_workspace_ext(roots, "lua")
+}
+
+/// Recursively collect every file with extension `ext` under `roots`, reading each into
+/// `(url, text)`.
 ///
 /// Blocking filesystem work — run on the dedicated scan thread spawned in `run_initialized`, never
-/// on the single-threaded main loop. Symlinks
-/// are **not** followed (so the walk cannot escape the root or loop), unreadable directories are
-/// skipped, and each file is read through [`read_otui_from_disk`] (so oversized/binary files are
-/// dropped). Duplicate roots (or nested roots) are de-duplicated by URL at the end.
-fn scan_workspace(roots: &[Uri]) -> Vec<(Uri, String)> {
+/// on the single-threaded main loop. Symlinks are **not** followed (so the walk cannot escape the
+/// root or loop), unreadable directories are skipped, and each file is read through
+/// [`read_indexed_file`] (so oversized/binary files are dropped). Duplicate roots (or nested roots)
+/// are de-duplicated by URL at the end.
+fn scan_workspace_ext(roots: &[Uri], ext: &str) -> Vec<(Uri, String)> {
     let mut out: HashMap<Uri, String> = HashMap::new();
     for root in roots {
         let Some(dir) = uri_to_file_path(root) else {
             continue;
         };
-        collect_otui_under(&dir, &mut out);
+        collect_files_under(&dir, ext, &mut out);
     }
     out.into_iter().collect()
 }
 
-/// Depth-first walk of `dir`, pushing every readable `*.otui` file into `out` keyed by its
-/// `file://` URL. Does not follow symlinks (checked via the dir entry's own metadata) and silently
-/// skips entries it cannot stat/read.
-fn collect_otui_under(dir: &Path, out: &mut HashMap<Uri, String>) {
+/// Depth-first walk of `dir`, pushing every readable file whose extension is `ext` into `out` keyed
+/// by its `file://` URL. Does not follow symlinks (checked via the dir entry's own metadata) and
+/// silently skips entries it cannot stat/read.
+fn collect_files_under(dir: &Path, ext: &str, out: &mut HashMap<Uri, String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -431,10 +487,10 @@ fn collect_otui_under(dir: &Path, out: &mut HashMap<Uri, String>) {
             continue;
         }
         if meta.is_dir() {
-            collect_otui_under(&path, out);
-        } else if meta.is_file() && path.extension().is_some_and(|e| e == "otui") {
+            collect_files_under(&path, ext, out);
+        } else if meta.is_file() && path.extension().is_some_and(|e| e == ext) {
             if let Some(uri) = uri_from_file_path(&path) {
-                if let Some(text) = read_otui_from_disk(&uri) {
+                if let Some(text) = read_indexed_file(&uri) {
                     out.insert(uri, text);
                 }
             }
@@ -1525,21 +1581,29 @@ impl Backend {
             },
         );
 
-        // Watch every `.otui` in the workspace so the index tracks files edited/created/deleted on
-        // disk outside the editor (or in files the user never opens). Registered dynamically for the
-        // same reason as type hierarchy above: it is the portable way to request
-        // `workspace/didChangeWatchedFiles`, and (like above) it is fire-and-forget — the client's
-        // ack is a `Message::Response` the loop ignores.
+        // Watch every `.otui` (style corpus) and `.lua` (widget-definition corpus) in the workspace
+        // so both indexes track files edited/created/deleted on disk outside the editor (or in files
+        // the user never opens). Registered dynamically for the same reason as type hierarchy above:
+        // it is the portable way to request `workspace/didChangeWatchedFiles`, and (like above) it is
+        // fire-and-forget — the client's ack is a `Message::Response` the loop ignores. A client that
+        // honors dynamic watcher registration (VS Code, Neovim) then delivers `.lua` change events to
+        // keep the Lua widget index live; one that does not still gets the initial scan below.
         self.register_capability(
             "otui-watched-files",
             Registration {
                 id: "otui-watched-files".to_owned(),
                 method: "workspace/didChangeWatchedFiles".to_owned(),
                 register_options: serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
-                    watchers: vec![FileSystemWatcher {
-                        glob_pattern: GlobPattern::String("**/*.otui".to_owned()),
-                        kind: None, // default: create | change | delete
-                    }],
+                    watchers: vec![
+                        FileSystemWatcher {
+                            glob_pattern: GlobPattern::String("**/*.otui".to_owned()),
+                            kind: None, // default: create | change | delete
+                        },
+                        FileSystemWatcher {
+                            glob_pattern: GlobPattern::String("**/*.lua".to_owned()),
+                            kind: None,
+                        },
+                    ],
                 })
                 .ok(),
             },
@@ -1559,6 +1623,7 @@ impl Backend {
             );
         } else {
             let style_index = Arc::clone(&self.style_index);
+            let lua_index = Arc::clone(&self.lua_index);
             let disk_texts = Arc::clone(&self.disk_texts);
             let documents = Arc::clone(&self.documents);
             let reindex_guard = Arc::clone(&self.reindex_guard);
@@ -1598,9 +1663,28 @@ impl Backend {
                         .insert(uri, text);
                     indexed += 1;
                 }
+                // Then scan `.lua` for widget definitions (custom style props + `extends` parents).
+                // No reindex guard, open-check, or disk-text cache: Lua is never an open OTUI
+                // document, so this index is fed purely from disk. Files that declare no widget
+                // contribute an empty result and are skipped to keep the index lean.
+                let mut lua_indexed = 0usize;
+                for (uri, text) in scan_workspace_lua(&roots) {
+                    let defs = service.lua_widgets(&text);
+                    if defs.is_empty() {
+                        continue;
+                    }
+                    lua_index
+                        .write()
+                        .expect("lua_index lock poisoned")
+                        .set_document(DocId::from(uri.to_string()), defs);
+                    lua_indexed += 1;
+                }
                 // stderr, not the LSP channel: keeps no `Sender` alive on this detached thread (see
                 // the note at the spawn site), so shutdown's `IoThreads::join()` never waits on it.
-                eprintln!("otui-lsp: indexed {indexed} workspace .otui file(s)");
+                eprintln!(
+                    "otui-lsp: indexed {indexed} workspace .otui file(s), \
+                     {lua_indexed} .lua widget file(s)"
+                );
             });
         }
 
@@ -1624,6 +1708,12 @@ impl Backend {
     fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         for change in params.changes {
             let uri = change.uri;
+            // A `.lua` widget module feeds the Lua index only (no open-buffer or disk-text tracking —
+            // Lua is never an open OTUI document), so route it before the `.otui` logic.
+            if uri.as_str().ends_with(".lua") {
+                self.apply_lua_watch_change(&uri, change.typ);
+                continue;
+            }
             // Open buffer wins: a document open in the editor is authoritative over its on-disk copy,
             // so a disk event for it must never clobber the buffer-derived index entry. did_close
             // re-syncs it from disk once the buffer goes away.
@@ -1640,7 +1730,7 @@ impl Backend {
                 // The old post-await open-state re-check is gone: with a single-threaded loop this
                 // handler runs to completion before the next message is read, so no concurrent
                 // `did_open` can slip in between the read and the index write. The race is impossible.
-                if let Some(text) = read_otui_from_disk(&uri) {
+                if let Some(text) = read_indexed_file(&uri) {
                     self.index_from_disk(&uri, text);
                 } else {
                     self.log(
@@ -1649,6 +1739,24 @@ impl Backend {
                     );
                 }
             }
+        }
+    }
+
+    /// Apply one watched-file change for a `.lua` module to the [`lua_index`](Self::lua_index): drop
+    /// it on delete, else re-scan it from disk. An unreadable/oversized/binary file is skipped.
+    fn apply_lua_watch_change(&self, uri: &Uri, typ: FileChangeType) {
+        if typ == FileChangeType::DELETED {
+            self.deindex_lua(uri);
+        } else if let Some(text) = read_indexed_file(uri) {
+            self.index_lua_from_disk(uri, &text);
+        } else {
+            self.log(
+                MessageType::INFO,
+                format!(
+                    "otui-lsp: skipped unreadable watched lua file {}",
+                    uri.as_str()
+                ),
+            );
         }
     }
 
@@ -2286,7 +2394,7 @@ impl Backend {
         // The old post-await open-state re-check is gone: with a single-threaded loop this handler
         // runs to completion before the next message is read, so no concurrent `did_open` can slip in
         // between the read and the index write. The race is impossible.
-        match read_otui_from_disk(&uri) {
+        match read_indexed_file(&uri) {
             Some(text) => self.index_from_disk(&uri, text),
             None => self.deindex(&uri),
         }
@@ -2763,6 +2871,48 @@ mod tests {
         );
         assert!(entries[0].0.as_str().ends_with("good.otui"));
         assert_eq!(entries[0].1, "Panel < UIWidget\n");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn scan_workspace_lua_collects_lua_and_scans_widgets() {
+        // The `.lua` walk mirrors the `.otui` one but feeds the widget scanner: only `.lua` files
+        // are returned, and the scanner extracts the widget's parent + custom props.
+        let base = std::env::temp_dir().join(format!("otui-lua-scan-{}", std::process::id()));
+        let nested = base.join("ui");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+        std::fs::write(
+            nested.join("uitable.lua"),
+            "\
+UITable = extends(UIWidget, 'UITable')
+
+function UITable:onStyleApply(styleName, styleNode)
+  for name, value in pairs(styleNode) do
+    if name == 'column-style' then
+    end
+  end
+end
+",
+        )
+        .expect("write lua");
+        // An `.otui` sibling must not be collected by the lua walk.
+        std::fs::write(base.join("styles.otui"), "Panel < UIWidget\n").expect("write otui");
+
+        let root = uri_from_file_path(&base).expect("root url");
+        let entries = scan_workspace_lua(&[root]);
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the .lua file is collected: {entries:?}"
+        );
+        assert!(entries[0].0.as_str().ends_with("uitable.lua"));
+
+        let defs = OtuiService::new().lua_widgets(&entries[0].1);
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "UITable");
+        assert_eq!(defs[0].lua_parent.as_deref(), Some("UIWidget"));
+        assert!(defs[0].custom_props.contains("column-style"));
 
         std::fs::remove_dir_all(&base).ok();
     }
