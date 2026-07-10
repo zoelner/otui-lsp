@@ -74,6 +74,16 @@ pub const MAGIC_ANCHOR_TARGETS: &[&str] = &["parent", "next", "prev"];
 /// kept as their own small set rather than folded into [`ANCHOR_EDGES`].
 pub const SHORTHAND_ANCHORS: &[&str] = &["fill", "centerIn"];
 
+/// The file-path-valued OTUI property tags: property keys whose *value* the engine treats as a
+/// filesystem path to a texture/image and loads via `g_textures.getTexture`. Verified against the
+/// engine's `UIWidget` style parsing: `image-source` is passed to `setImageSource` (which calls
+/// `g_textures.getTexture`) in `parseImageStyle`, and the `icon` / `icon-source` tags are resolved
+/// as a path and passed to `setIcon` (also `g_textures.getTexture`) in `parseBaseStyle`. This is the
+/// exhaustive set of genuinely path-valued tags; it is deliberately small and precise (properties
+/// that are merely image-*related* — offsets, rects, colors — are NOT here). It can be extended if a
+/// fork introduces another path-valued tag.
+pub const PATH_PROPERTIES: &[&str] = &["image-source", "icon", "icon-source"];
+
 /// The closed set of accepted `display` values (spec §2.10), from the engine's `display`-style
 /// dispatch. Validated against the engine source: the parser lowercases the value and compares it
 /// against this fixed list; any value outside it makes the parser **throw** (`Invalid display value`),
@@ -1160,6 +1170,22 @@ mod tests {
             "expected the legacy engine color statics, got {}",
             crate::catalog::LEGACY_COLORS.len()
         );
+    }
+
+    #[test]
+    fn path_properties_are_the_texture_path_tags_and_known_properties() {
+        // The file-path-valued set: primarily `image-source`, plus the `icon` family — verified
+        // against the engine's `setImageSource` / `setIcon` (both `g_textures.getTexture`) sites.
+        assert!(PATH_PROPERTIES.contains(&"image-source"));
+        assert!(PATH_PROPERTIES.contains(&"icon"));
+        assert!(PATH_PROPERTIES.contains(&"icon-source"));
+        // Every path-valued tag is also a known property (dispatched by the engine's style parsers).
+        for tag in PATH_PROPERTIES {
+            assert!(
+                is_known_property(tag),
+                "path property `{tag}` should be in PROPERTIES"
+            );
+        }
     }
 
     #[test]
