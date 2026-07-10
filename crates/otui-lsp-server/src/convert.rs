@@ -555,14 +555,16 @@ mod tests {
     #[test]
     fn document_color_end_to_end_over_a_small_doc() {
         // Position → engine document_colors → LSP ColorInformation, the path the handler drives.
-        let text = "Panel\n  color: #00ff00\n  background-color: red\n";
+        // Only context-free `color` literals (hex + functional) are scanned; a bare named color is
+        // deliberately not swatched (see otui_core::colors), so this doc uses literals.
+        let text = "Panel\n  color: #00ff00\n  background-color: rgb(255, 0, 0)\n";
         let core = OtuiService::new().document_colors(text);
         let lsp = colors_to_lsp(text, &core, PositionEncoding::Utf16);
         assert_eq!(lsp.len(), 2);
         // The hex green on line 1.
         assert_eq!(lsp[0].range.start, Position::new(1, 9));
         assert!((lsp[0].color.green - 1.0).abs() < f32::EPSILON);
-        // The named red on line 2 (its span covers the `red` token).
+        // The functional red on line 2.
         assert!((lsp[1].color.red - 1.0).abs() < f32::EPSILON);
         assert!((lsp[1].color.green - 0.0).abs() < f32::EPSILON);
     }

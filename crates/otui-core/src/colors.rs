@@ -1,31 +1,41 @@
 //! Locating color values in a document for the LSP `documentColor` feature (spec §2.9).
 //!
-//! Walks the CST for every color token and resolves it to its actual [`Rgba`] via
-//! [`schema::color_value`], returning `(span, rgba)` pairs the server maps to LSP `ColorInformation`.
-//! Everything here is pure — byte spans only, no `lsp-types` — so it is unit-testable without a live
-//! server.
+//! Walks the CST for the grammar's dedicated `color` literals and resolves each to its actual
+//! [`Rgba`] via [`schema::color_value`], returning `(span, rgba)` pairs the server maps to LSP
+//! `ColorInformation`. Everything here is pure — byte spans only, no `lsp-types` — so it is
+//! unit-testable without a live server.
+//!
+//! ## Why only `color` literals (named-color swatches are deferred)
+//!
+//! Only the **hex** (`#rgb`/`#rrggbb`/…) and **functional** (`rgb(..)`, `hsl(..)`, …) forms are
+//! scanned. The grammar tags exactly those as a dedicated `color` node, and they are **context-free**
+//! — a `#ff0000` or `rgb(1,2,3)` is unambiguously a color no matter which property it sits on, so it
+//! never false-positives.
+//!
+//! A **named** color (`red`, `blue`, …) is just a bare word, lexically indistinguishable from an
+//! `id:` value or any other identifier — `id: red` must NOT get a swatch. Deciding whether a bare
+//! word is a color requires knowing which properties are **color-typed** (`color`, `*-color`, …),
+//! metadata the catalog does not carry yet. So named-color swatching is **deferred** pending a
+//! color-typed-property catalog (a future `xtask` extraction of the engine's `value<Color>` property
+//! set); this also makes legacy-static color values moot for now (they only matter for named
+//! swatches). [`schema::color_value`] still resolves named strings — it is used by
+//! `colorPresentation` — we simply do not SCAN for them here.
 
 use lang_api::ByteSpan;
 
 use crate::schema::{self, Rgba};
 use crate::syntax::SyntaxTree;
 
-/// The CST node kinds whose text can hold a color value:
-///
-/// * `color` — a hex or functional literal (`#rrggbb`, `rgb(..)`, …), tagged by the grammar's
-///   dedicated color rule (spec §2.9). Always a color.
-/// * `plain_value` — a whole untyped property value (`color: red`), where a **named** color surfaces
-///   (named colors are not lexed as `color` nodes).
-/// * `identifier` — a bare word inside an inline array (`[red, blue]`), the array-item form of a
-///   named color.
-///
-/// Each candidate's text is run through [`schema::color_value`]; only the ones that actually resolve
-/// to a color become swatches, so non-color values (`width: 10`, `text: Hello`) are ignored.
-const COLOR_NODE_KINDS: &[&str] = &["color", "plain_value", "identifier"];
+/// The CST node kind that unambiguously holds a color: the grammar's `color` literal — a hex
+/// (`#rrggbb`, …) or functional (`rgb(..)`, `hsl(..)`, …) form (spec §2.9). These are context-free
+/// colors, so scanning only them cannot false-positive. Named colors (bare words) are intentionally
+/// NOT scanned — see the module docs.
+const COLOR_NODE_KIND: &str = "color";
 
-/// Find every color value in `source` and its resolved [`Rgba`], each with the byte span of the exact
-/// token (spec §2.9). Returns an empty vector when the source cannot be parsed. Values that do not
-/// resolve to a color are skipped, so the result contains only real color occurrences.
+/// Find every color literal in `source` and its resolved [`Rgba`], each with the byte span of the
+/// exact token (spec §2.9). Returns an empty vector when the source cannot be parsed. Only the
+/// grammar's context-free `color` literals (hex + functional) are scanned; bare named colors are not
+/// (see the module docs), so `id: red` and any identifier merely spelled like a color yield nothing.
 #[must_use]
 pub fn document_colors(source: &str) -> Vec<(ByteSpan, Rgba)> {
     let Some(tree) = SyntaxTree::parse(source) else {
@@ -33,7 +43,7 @@ pub fn document_colors(source: &str) -> Vec<(ByteSpan, Rgba)> {
     };
     let mut out = Vec::new();
     tree.walk(|kind, span| {
-        if !COLOR_NODE_KINDS.contains(&kind) {
+        if kind != COLOR_NODE_KIND {
             return;
         }
         let text = &source[span.start..span.end];
@@ -74,34 +84,33 @@ mod tests {
     }
 
     #[test]
-    fn finds_named_colors_as_plain_values() {
-        let found = colors_with_text("Label\n  color: red\n");
+    fn named_colors_are_not_scanned() {
+        // A bare named color in a value position is lexically an identifier/plain value, not a
+        // grammar `color` node, so it is NOT swatched — named-color swatching is deferred (see the
+        // module docs). `schema::color_value("red")` still resolves; we simply do not scan for it.
+        assert!(document_colors("Label\n  color: red\n").is_empty());
+        assert!(document_colors("Panel\n  color: transparent\n").is_empty());
+        // Only the hex literal in a mixed array is found; the bare `red` is skipped.
+        let found = colors_with_text("Widget\n  colors: [red, #00ff00]\n");
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].0, "red");
-        assert_eq!(found[0].1, Rgba::from_u8(255, 0, 0, 255));
+        assert_eq!(found[0].0, "#00ff00");
+        assert_eq!(found[0].1, Rgba::from_u8(0, 255, 0, 255));
     }
 
     #[test]
-    fn finds_named_colors_inside_inline_arrays() {
-        let found = colors_with_text("Widget\n  colors: [red, #00ff00]\n");
-        let texts: Vec<&str> = found.iter().map(|(t, _)| *t).collect();
-        assert!(texts.contains(&"red"));
-        assert!(texts.contains(&"#00ff00"));
-        assert_eq!(found.len(), 2);
+    fn identifier_spelled_like_a_color_is_not_a_swatch() {
+        // The classic false-positive: an `id:` value spelled exactly like a named color must yield
+        // no color, because a bare word is indistinguishable from a real color name without
+        // color-typed-property metadata.
+        assert!(document_colors("Panel\n  id: red\n").is_empty());
+        assert!(document_colors("Panel\n  text: blue\n").is_empty());
     }
 
     #[test]
     fn ignores_non_color_values() {
-        // A number, a plain word and an unknown name are not colors.
+        // A number, a plain word and an id are not colors.
         let source = "Panel\n  width: 100\n  text: Hello World\n  id: main\n";
         assert!(document_colors(source).is_empty());
-    }
-
-    #[test]
-    fn transparent_named_color_is_fully_transparent() {
-        let found = colors_with_text("Panel\n  color: transparent\n");
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].1, Rgba::from_u8(0, 0, 0, 0));
     }
 
     #[test]
