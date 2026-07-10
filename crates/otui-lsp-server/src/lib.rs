@@ -1443,7 +1443,10 @@ impl Backend {
             let disk_texts = Arc::clone(&self.disk_texts);
             let documents = Arc::clone(&self.documents);
             let reindex_guard = Arc::clone(&self.reindex_guard);
-            let sender = self.sender.clone();
+            // NOTE: the scan thread deliberately does NOT capture the LSP `Sender`. A detached,
+            // possibly-long-running thread holding a `Sender<Message>` clone would keep the stdio
+            // writer's channel open and make `IoThreads::join()` hang on shutdown until the scan
+            // finished. It reports its result to stderr instead, which never blocks shutdown.
             std::thread::spawn(move || {
                 let entries = scan_workspace(&roots);
                 // The scan is stateless, so a fresh service suffices for extraction.
@@ -1476,13 +1479,9 @@ impl Backend {
                         .insert(uri, text);
                     indexed += 1;
                 }
-                let _ = sender.send(Message::Notification(Notification::new(
-                    "window/logMessage".to_owned(),
-                    LogMessageParams {
-                        typ: MessageType::INFO,
-                        message: format!("otui-lsp: indexed {indexed} workspace .otui file(s)"),
-                    },
-                )));
+                // stderr, not the LSP channel: keeps no `Sender` alive on this detached thread (see
+                // the note at the spawn site), so shutdown's `IoThreads::join()` never waits on it.
+                eprintln!("otui-lsp: indexed {indexed} workspace .otui file(s)");
             });
         }
 

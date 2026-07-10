@@ -41,6 +41,13 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
     // dropped connection) exits 1, as the spec requires.
     let termination = serve(&backend, &connection)?;
 
+    // Drop everything holding a `Sender<Message>` (the backend's clone and the connection itself)
+    // BEFORE joining the I/O threads: `IoThreads::join` waits for the stdio writer, which only
+    // finishes once every sender to its channel is dropped. Leaving these alive would hang `join`
+    // before we ever reach `process::exit`.
+    drop(backend);
+    drop(connection);
+
     io_threads.join()?;
     std::process::exit(termination.exit_code());
 }
