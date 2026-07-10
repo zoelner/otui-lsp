@@ -10,12 +10,19 @@
 //! loop). The pure conversion/mapping logic in [`position`] and [`convert`] is unit-tested without
 //! any real I/O.
 
+// `lsp_types::Uri` (0.97, `fluent_uri`-backed) carries an internal `Cell` for lazy scheme/authority
+// bookkeeping, so it counts as an interior-mutability type. Its `Hash`/`Eq` are defined purely over
+// `as_str()`, though, so the cell never perturbs a key's hash — using `Uri` as a map key is sound.
+// Allow the (false-positive) lint crate-wide rather than annotate every `Uri`-keyed map.
+#![allow(clippy::mutable_key_type)]
+
 pub mod convert;
 pub mod position;
 pub mod semantic;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crossbeam_channel::Sender;
@@ -43,7 +50,7 @@ use lsp_types::{
     SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SymbolInformation,
     SymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
     TextEdit, TypeDefinitionProviderCapability, TypeHierarchyItem, TypeHierarchyPrepareParams,
-    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Url, WorkDoneProgressOptions,
+    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri, WorkDoneProgressOptions,
     WorkspaceEdit, WorkspaceSymbolParams,
 };
 use otui_core::fixes::Fix;
@@ -84,7 +91,7 @@ pub struct Backend {
     /// on-disk copy cached in [`disk_texts`](Self::disk_texts). Wrapped in an [`Arc`] so the
     /// background workspace scan can consult it (to skip files that became open mid-scan) from a
     /// spawned task.
-    documents: Arc<RwLock<HashMap<Url, Document>>>,
+    documents: Arc<RwLock<HashMap<Uri, Document>>>,
     /// The workspace-wide `Name < Base` style index (spec §5.2), keyed by document URL string.
     /// Populated at startup by scanning every `.otui` file in the workspace roots and kept in sync
     /// via the document lifecycle (open/change re-index) and file watching
@@ -99,12 +106,12 @@ pub struct Backend {
     /// the file being open. For any URI also present in [`documents`](Self::documents) the open
     /// buffer wins (it may have unsaved edits); see [`merge_documents`]. [`Arc`] so the background
     /// scan can populate it from a spawned task.
-    disk_texts: Arc<RwLock<HashMap<Url, String>>>,
+    disk_texts: Arc<RwLock<HashMap<Uri, String>>>,
     /// The workspace root URLs captured during `initialize` (`workspace_folders`, else `root_uri`),
     /// consumed once by the background scan in `run_initialized`. Empty when the client opened no
     /// folder — the server then falls back to open-docs-only indexing. Guarded by a [`Mutex`]
     /// because it is written once and read once.
-    roots: Mutex<Vec<Url>>,
+    roots: Mutex<Vec<Uri>>,
 }
 
 /// Largest `.otui` file the workspace scan / watcher will read into the index. A style file is a few
@@ -154,7 +161,7 @@ impl Backend {
 
     /// Push a `textDocument/publishDiagnostics` notification for `uri`. `version` is echoed so the
     /// client can drop stale results.
-    fn send_diagnostics(&self, uri: Url, diagnostics: Vec<LspDiagnostic>, version: Option<i32>) {
+    fn send_diagnostics(&self, uri: Uri, diagnostics: Vec<LspDiagnostic>, version: Option<i32>) {
         let params = PublishDiagnosticsParams {
             uri,
             diagnostics,
@@ -172,7 +179,7 @@ impl Backend {
     /// The single-threaded loop processes `did_open`/`did_change` to completion one at a time, so
     /// the version check here is belt-and-braces: it still discards diagnostics computed for an
     /// older `version` than the one currently stored for `uri`.
-    fn publish(&self, uri: Url, text: &str, version: i32) {
+    fn publish(&self, uri: Uri, text: &str, version: i32) {
         let core_diags = self.service.diagnostics(text);
         let lsp_diags = convert::all_to_lsp(text, &core_diags, self.encoding());
 
@@ -194,7 +201,7 @@ impl Backend {
     /// Run on open/change; extraction is pure and cheap. The index lock is taken only for the
     /// insert, never while any document lock is held (see the [`style_index`](Self::style_index)
     /// note), so the two locks cannot deadlock.
-    fn reindex_styles(&self, uri: &Url, text: &str) {
+    fn reindex_styles(&self, uri: &Uri, text: &str) {
         let defs = self.service.style_defs(text);
         self.style_index
             .write()
@@ -210,7 +217,7 @@ impl Backend {
     /// (`resolve_base_definition`, `collect_references`, …) unchanged. Both read locks are taken and
     /// released here (the returned map is owned), so no document/disk lock is held across the
     /// subsequent `style_index` read — preserving the unnested-lock discipline.
-    fn merged_documents(&self) -> HashMap<Url, Document> {
+    fn merged_documents(&self) -> HashMap<Uri, Document> {
         let open = self.documents.read().expect("documents lock poisoned");
         let disk = self.disk_texts.read().expect("disk_texts lock poisoned");
         merge_documents(&open, &disk)
@@ -219,7 +226,7 @@ impl Backend {
     /// Index `uri` from its on-disk text (the closed-file path used by the initial scan, the file
     /// watcher, and `did_close`): parse `text`, store its style defs in the index and cache the text
     /// in [`disk_texts`](Self::disk_texts) so its spans stay resolvable while the file is closed.
-    fn index_from_disk(&self, uri: &Url, text: String) {
+    fn index_from_disk(&self, uri: &Uri, text: String) {
         let defs = self.service.style_defs(&text);
         self.style_index
             .write()
@@ -232,7 +239,7 @@ impl Backend {
     }
 
     /// Whether `uri` is currently an open buffer.
-    fn is_open(&self, uri: &Url) -> bool {
+    fn is_open(&self, uri: &Uri) -> bool {
         self.documents
             .read()
             .expect("documents lock poisoned")
@@ -240,7 +247,7 @@ impl Backend {
     }
 
     /// Drop `uri` from both the style index and the disk-text cache (a deleted / vanished file).
-    fn deindex(&self, uri: &Url) {
+    fn deindex(&self, uri: &Uri) {
         self.style_index
             .write()
             .expect("style_index lock poisoned")
@@ -262,10 +269,10 @@ impl Backend {
 ///
 /// Pure over borrowed state so the open-vs-disk precedence is unit-testable without any real I/O.
 fn merge_documents(
-    open: &HashMap<Url, Document>,
-    disk: &HashMap<Url, String>,
-) -> HashMap<Url, Document> {
-    let mut merged: HashMap<Url, Document> = disk
+    open: &HashMap<Uri, Document>,
+    disk: &HashMap<Uri, String>,
+) -> HashMap<Uri, Document> {
+    let mut merged: HashMap<Uri, Document> = disk
         .iter()
         .map(|(uri, text)| {
             (
@@ -291,8 +298,22 @@ fn merge_documents(
 /// larger than [`MAX_INDEXED_FILE_BYTES`], or content that is not valid UTF-8 (a binary/garbage file
 /// must never crash the server or land bogus entries in the index). This is the single disk-read seam
 /// shared by the scan, the watcher and `did_close`.
-fn read_otui_from_disk(uri: &Url) -> Option<String> {
-    let path = uri.to_file_path().ok()?;
+/// Convert a `file:` [`Uri`] to a filesystem path, or `None` for a non-`file:` URI or one that
+/// does not map to a valid path. `lsp_types::Uri` (0.97, `fluent_uri`-backed) carries no
+/// file-path helpers, so the well-tested `url` crate does the percent-decoding and platform path
+/// mapping — the exact behaviour the server relied on before the 0.97 bump.
+fn uri_to_file_path(uri: &Uri) -> Option<PathBuf> {
+    url::Url::parse(uri.as_str()).ok()?.to_file_path().ok()
+}
+
+/// Build a `file:` [`Uri`] from a filesystem path, or `None` if the path cannot be represented as
+/// a `file:` URL. Mirror of [`uri_to_file_path`]; see it for why the `url` crate is used.
+fn uri_from_file_path(path: &Path) -> Option<Uri> {
+    Uri::from_str(url::Url::from_file_path(path).ok()?.as_str()).ok()
+}
+
+fn read_otui_from_disk(uri: &Uri) -> Option<String> {
+    let path = uri_to_file_path(uri)?;
     let meta = std::fs::metadata(&path).ok()?;
     if !meta.is_file() || meta.len() > MAX_INDEXED_FILE_BYTES {
         return None;
@@ -308,10 +329,10 @@ fn read_otui_from_disk(uri: &Url) -> Option<String> {
 /// are **not** followed (so the walk cannot escape the root or loop), unreadable directories are
 /// skipped, and each file is read through [`read_otui_from_disk`] (so oversized/binary files are
 /// dropped). Duplicate roots (or nested roots) are de-duplicated by URL at the end.
-fn scan_workspace(roots: &[Url]) -> Vec<(Url, String)> {
-    let mut out: HashMap<Url, String> = HashMap::new();
+fn scan_workspace(roots: &[Uri]) -> Vec<(Uri, String)> {
+    let mut out: HashMap<Uri, String> = HashMap::new();
     for root in roots {
-        let Ok(dir) = root.to_file_path() else {
+        let Some(dir) = uri_to_file_path(root) else {
             continue;
         };
         collect_otui_under(&dir, &mut out);
@@ -322,7 +343,7 @@ fn scan_workspace(roots: &[Url]) -> Vec<(Url, String)> {
 /// Depth-first walk of `dir`, pushing every readable `*.otui` file into `out` keyed by its
 /// `file://` URL. Does not follow symlinks (checked via the dir entry's own metadata) and silently
 /// skips entries it cannot stat/read.
-fn collect_otui_under(dir: &Path, out: &mut HashMap<Url, String>) {
+fn collect_otui_under(dir: &Path, out: &mut HashMap<Uri, String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -339,7 +360,7 @@ fn collect_otui_under(dir: &Path, out: &mut HashMap<Url, String>) {
         if meta.is_dir() {
             collect_otui_under(&path, out);
         } else if meta.is_file() && path.extension().is_some_and(|e| e == "otui") {
-            if let Ok(uri) = Url::from_file_path(&path) {
+            if let Some(uri) = uri_from_file_path(&path) {
                 if let Some(text) = read_otui_from_disk(&uri) {
                     out.insert(uri, text);
                 }
@@ -351,7 +372,8 @@ fn collect_otui_under(dir: &Path, out: &mut HashMap<Url, String>) {
 /// The workspace roots carried by an `initialize` request: `workspace_folders` when present (each
 /// folder's URI), else the single legacy `root_uri`, else empty. Empty means the client opened no
 /// folder, and the server falls back to open-docs-only indexing.
-fn workspace_roots(params: &InitializeParams) -> Vec<Url> {
+#[allow(deprecated)] // `InitializeParams.root_uri` is the mandatory legacy fallback; still read.
+fn workspace_roots(params: &InitializeParams) -> Vec<Uri> {
     if let Some(folders) = &params.workspace_folders {
         if !folders.is_empty() {
             return folders.iter().map(|f| f.uri.clone()).collect();
@@ -371,10 +393,10 @@ fn workspace_roots(params: &InitializeParams) -> Vec<Url> {
 fn resolve_location(
     doc_id: &DocId,
     span: ByteSpan,
-    documents: &HashMap<Url, Document>,
+    documents: &HashMap<Uri, Document>,
     encoding: PositionEncoding,
 ) -> Option<Location> {
-    let target_uri = Url::parse(doc_id.as_str()).ok()?;
+    let target_uri = Uri::from_str(doc_id.as_str()).ok()?;
     let target_doc = documents.get(&target_uri)?;
     Some(convert::location_of(
         target_uri,
@@ -394,7 +416,7 @@ fn resolve_location(
 /// Kept as a free function over borrowed state so it can be unit-tested without a live `Client`.
 fn resolve_base_definition(
     index: &StyleIndex,
-    documents: &HashMap<Url, Document>,
+    documents: &HashMap<Uri, Document>,
     base_name: &str,
     encoding: PositionEncoding,
 ) -> Option<GotoDefinitionResponse> {
@@ -427,7 +449,7 @@ fn resolve_base_definition(
 /// Kept as a free function over borrowed state so it can be unit-tested without a live `Client`.
 fn resolve_type_definition(
     index: &StyleIndex,
-    documents: &HashMap<Url, Document>,
+    documents: &HashMap<Uri, Document>,
     name: &str,
     encoding: PositionEncoding,
 ) -> Option<GotoDefinitionResponse> {
@@ -461,7 +483,7 @@ fn resolve_type_definition(
 /// (mirroring [`resolve_base_definition`] / [`collect_references`]).
 fn collect_implementations(
     index: &StyleIndex,
-    documents: &HashMap<Url, Document>,
+    documents: &HashMap<Uri, Document>,
     name: &str,
     encoding: PositionEncoding,
 ) -> Vec<Location> {
@@ -490,10 +512,10 @@ fn collect_implementations(
 fn build_type_hierarchy_item(
     doc_id: &DocId,
     def: &StyleDef,
-    documents: &HashMap<Url, Document>,
+    documents: &HashMap<Uri, Document>,
     encoding: PositionEncoding,
 ) -> Option<TypeHierarchyItem> {
-    let uri = Url::parse(doc_id.as_str()).ok()?;
+    let uri = Uri::from_str(doc_id.as_str()).ok()?;
     let doc = documents.get(&uri)?;
     let line_index = LineIndex::new(&doc.text);
     Some(TypeHierarchyItem {
@@ -536,7 +558,7 @@ fn item_style_name(item: &TypeHierarchyItem) -> String {
 /// [`resolve_base_definition`]).
 fn prepare_type_hierarchy_item(
     index: &StyleIndex,
-    documents: &HashMap<Url, Document>,
+    documents: &HashMap<Uri, Document>,
     name: &str,
     encoding: PositionEncoding,
 ) -> Option<TypeHierarchyItem> {
@@ -558,7 +580,7 @@ fn prepare_type_hierarchy_item(
 /// Kept `Client`-free so it is unit-testable without a live server.
 fn resolve_supertypes(
     index: &StyleIndex,
-    documents: &HashMap<Url, Document>,
+    documents: &HashMap<Uri, Document>,
     name: &str,
     encoding: PositionEncoding,
 ) -> Vec<TypeHierarchyItem> {
@@ -596,7 +618,7 @@ fn resolve_supertypes(
 /// Kept `Client`-free so it is unit-testable without a live server.
 fn resolve_subtypes(
     index: &StyleIndex,
-    documents: &HashMap<Url, Document>,
+    documents: &HashMap<Uri, Document>,
     name: &str,
     encoding: PositionEncoding,
 ) -> Vec<TypeHierarchyItem> {
@@ -685,8 +707,8 @@ fn classify_rename_target(
 /// (mirroring [`resolve_base_definition`]).
 fn collect_references(
     target: &ReferenceTarget,
-    current_uri: &Url,
-    documents: &HashMap<Url, Document>,
+    current_uri: &Uri,
+    documents: &HashMap<Uri, Document>,
     index: &StyleIndex,
     service: &OtuiService,
     include_declaration: bool,
@@ -771,8 +793,8 @@ fn invalid_identifier_message(new_name: &str) -> String {
 /// unit-testable without a live `Client` (mirroring [`collect_references`]).
 fn build_rename_edits(
     target: &ReferenceTarget,
-    current_uri: &Url,
-    documents: &HashMap<Url, Document>,
+    current_uri: &Uri,
+    documents: &HashMap<Uri, Document>,
     index: &StyleIndex,
     service: &OtuiService,
     new_name: &str,
@@ -782,7 +804,7 @@ fn build_rename_edits(
         return Err(invalid_identifier_message(new_name));
     }
 
-    let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+    let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
     match target {
         ReferenceTarget::StyleName(name) => {
             // A native `UI*` base absent from the index has no user declaration to rename.
@@ -840,7 +862,7 @@ fn build_rename_edits(
 /// Matching is **case-insensitive substring** over the style name — simple and predictable, and the
 /// convention the client expects (it filters further as the user types). An **empty query matches
 /// everything**, so the picker opens showing all styles. Each surviving def maps its [`DocId`] back
-/// to a [`Url`] and builds a [`Location`] for its `name_span` against
+/// to a [`Uri`] and builds a [`Location`] for its `name_span` against
 /// **that** target document's own text (via [`convert::location_of`]), exactly as
 /// [`resolve_base_definition`] does. A def whose document is in neither the open nor the disk view is
 /// skipped — its span cannot be mapped to a range. The widget's base
@@ -853,7 +875,7 @@ fn build_rename_edits(
 #[allow(deprecated)] // `SymbolInformation.deprecated` is a mandatory-but-deprecated struct field.
 fn collect_workspace_symbols(
     index: &StyleIndex,
-    documents: &HashMap<Url, Document>,
+    documents: &HashMap<Uri, Document>,
     query: &str,
     encoding: PositionEncoding,
 ) -> Vec<SymbolInformation> {
@@ -942,7 +964,7 @@ fn append_inherits(value: &mut String, inherits: Option<&Inheritance>) {
 /// unit-testable without a live `Client`.
 fn build_code_actions(
     service: &OtuiService,
-    uri: &Url,
+    uri: &Uri,
     text: &str,
     range: ByteSpan,
     context: &[LspDiagnostic],
@@ -1461,7 +1483,7 @@ impl Backend {
                 } else {
                     self.log(
                         MessageType::INFO,
-                        format!("otui-lsp: skipped unreadable watched file {uri}"),
+                        format!("otui-lsp: skipped unreadable watched file {}", uri.as_str()),
                     );
                 }
             }
@@ -2128,12 +2150,12 @@ mod tests {
 
     /// Build a `(StyleIndex, documents)` pair from `(uri, text)` entries, indexing each document's
     /// style defs exactly the way the backend does on open/change.
-    fn workspace(entries: &[(&str, &str)]) -> (StyleIndex, HashMap<Url, Document>) {
+    fn workspace(entries: &[(&str, &str)]) -> (StyleIndex, HashMap<Uri, Document>) {
         let svc = OtuiService::new();
         let mut index = StyleIndex::new();
         let mut documents = HashMap::new();
         for (uri_str, text) in entries {
-            let uri = Url::parse(uri_str).expect("valid uri");
+            let uri = Uri::from_str(uri_str).expect("valid uri");
             index.set_document(DocId::from(uri.to_string()), svc.style_defs(text));
             documents.insert(
                 uri,
@@ -2148,12 +2170,12 @@ mod tests {
 
     /// Build a `StyleIndex` + `disk_texts` map from `(uri, text)` entries, indexing each the way the
     /// workspace scan / did_close does (as a *closed* file: index its defs, cache its disk text).
-    fn disk_workspace(entries: &[(&str, &str)]) -> (StyleIndex, HashMap<Url, String>) {
+    fn disk_workspace(entries: &[(&str, &str)]) -> (StyleIndex, HashMap<Uri, String>) {
         let svc = OtuiService::new();
         let mut index = StyleIndex::new();
         let mut disk = HashMap::new();
         for (uri_str, text) in entries {
-            let uri = Url::parse(uri_str).expect("valid uri");
+            let uri = Uri::from_str(uri_str).expect("valid uri");
             index.set_document(DocId::from(uri.to_string()), svc.style_defs(text));
             disk.insert(uri, (*text).to_owned());
         }
@@ -2163,7 +2185,7 @@ mod tests {
     #[test]
     fn merge_prefers_the_open_buffer_over_a_stale_disk_entry() {
         // Same URI in both views: the open buffer (unsaved edits) must win over the on-disk copy.
-        let uri = Url::parse("file:///a.otui").expect("uri");
+        let uri = Uri::from_str("file:///a.otui").expect("uri");
         let mut open = HashMap::new();
         open.insert(
             uri.clone(),
@@ -2185,7 +2207,7 @@ mod tests {
     fn merge_resolves_a_closed_uri_to_its_disk_text() {
         // A URI present only on disk (never opened) resolves to the disk text.
         let open = HashMap::new();
-        let disk_uri = Url::parse("file:///closed.otui").expect("uri");
+        let disk_uri = Uri::from_str("file:///closed.otui").expect("uri");
         let mut disk = HashMap::new();
         disk.insert(disk_uri.clone(), "Closed < UIWidget\n".to_owned());
 
@@ -2197,8 +2219,8 @@ mod tests {
     #[test]
     fn merge_unions_open_and_disk_only_uris() {
         // One URI open, a different one only on disk: the merged view contains both.
-        let open_uri = Url::parse("file:///open.otui").expect("uri");
-        let disk_uri = Url::parse("file:///disk.otui").expect("uri");
+        let open_uri = Uri::from_str("file:///open.otui").expect("uri");
+        let disk_uri = Uri::from_str("file:///disk.otui").expect("uri");
         let mut open = HashMap::new();
         open.insert(
             open_uri.clone(),
@@ -2222,7 +2244,7 @@ mod tests {
         // the merged view, references must span both — the whole point of a workspace-wide index.
         let (index, disk) = disk_workspace(&[("file:///defs.otui", "MyPanel < UIWidget\n")]);
         let mut open = HashMap::new();
-        let use_uri = Url::parse("file:///use.otui").expect("uri");
+        let use_uri = Uri::from_str("file:///use.otui").expect("uri");
         open.insert(
             use_uri.clone(),
             Document {
@@ -2266,7 +2288,7 @@ mod tests {
         // Declaration on disk, base ref open: a workspace rename must edit both files.
         let (index, disk) = disk_workspace(&[("file:///defs.otui", "MyPanel < UIWidget\n")]);
         let mut open = HashMap::new();
-        let use_uri = Url::parse("file:///use.otui").expect("uri");
+        let use_uri = Uri::from_str("file:///use.otui").expect("uri");
         open.insert(
             use_uri.clone(),
             Document {
@@ -2295,7 +2317,7 @@ mod tests {
             2,
             "both the closed def and the open use are edited"
         );
-        assert!(changes.contains_key(&Url::parse("file:///defs.otui").expect("uri")));
+        assert!(changes.contains_key(&Uri::from_str("file:///defs.otui").expect("uri")));
         assert!(changes.contains_key(&use_uri));
     }
 
@@ -2304,7 +2326,7 @@ mod tests {
         // A stale disk entry for `Old` plus an open buffer redefining it as `New`. The merged view
         // must resolve the URI to the buffer, so definition lookup sees `New`, not `Old`.
         let (_stale_index, disk) = disk_workspace(&[("file:///a.otui", "Old < UIWidget\n")]);
-        let uri = Url::parse("file:///a.otui").expect("uri");
+        let uri = Uri::from_str("file:///a.otui").expect("uri");
         let mut open = HashMap::new();
         open.insert(
             uri.clone(),
@@ -2336,7 +2358,7 @@ mod tests {
         // Simulate the did_close semantics on the pure indexing path: a doc that was open is closed,
         // so it is re-indexed from its *disk* text (fed here directly). The closed file stays in the
         // index and its span still resolves against the cached disk text.
-        let uri = Url::parse("file:///a.otui").expect("uri");
+        let uri = Uri::from_str("file:///a.otui").expect("uri");
         let disk_text = "Panel < UIWidget\n"; // what is on disk at close time
         let svc = OtuiService::new();
         let mut index = StyleIndex::new();
@@ -2360,7 +2382,7 @@ mod tests {
         // it simply contributes no `Name < Base` headers.
         let svc = OtuiService::new();
         let mut index = StyleIndex::new();
-        let uri = Url::parse("file:///junk.otui").expect("uri");
+        let uri = Uri::from_str("file:///junk.otui").expect("uri");
         // Replacement char + NUL + brackets, and crucially no top-level `Name < Base` header.
         let junk = "\u{fffd}\u{0}not-a-style {{{ ][ \n\t\t garbage bytes";
         // Extraction is total: it returns whatever headers it finds (here, none) without panicking.
@@ -2387,7 +2409,7 @@ mod tests {
         // A non-`.otui` file is ignored entirely.
         std::fs::write(base.join("notes.txt"), "Ignore < UIWidget\n").expect("write txt");
 
-        let root = Url::from_file_path(&base).expect("root url");
+        let root = uri_from_file_path(&base).expect("root url");
         let mut entries = scan_workspace(&[root]);
         entries.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -2404,31 +2426,32 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // exercises the mandatory-but-deprecated `root_uri` fallback path.
     fn workspace_roots_prefers_folders_then_falls_back_to_root_uri() {
         use lsp_types::WorkspaceFolder;
         // workspace_folders present → its URIs win over root_uri.
         let params = InitializeParams {
             workspace_folders: Some(vec![WorkspaceFolder {
-                uri: Url::parse("file:///ws/").expect("uri"),
+                uri: Uri::from_str("file:///ws/").expect("uri"),
                 name: "ws".to_owned(),
             }]),
-            root_uri: Some(Url::parse("file:///legacy/").expect("uri")),
+            root_uri: Some(Uri::from_str("file:///legacy/").expect("uri")),
             ..InitializeParams::default()
         };
         assert_eq!(
             workspace_roots(&params),
-            vec![Url::parse("file:///ws/").expect("uri")]
+            vec![Uri::from_str("file:///ws/").expect("uri")]
         );
 
         // No folders → the legacy root_uri is used.
         let params = InitializeParams {
             workspace_folders: None,
-            root_uri: Some(Url::parse("file:///legacy/").expect("uri")),
+            root_uri: Some(Uri::from_str("file:///legacy/").expect("uri")),
             ..InitializeParams::default()
         };
         assert_eq!(
             workspace_roots(&params),
-            vec![Url::parse("file:///legacy/").expect("uri")]
+            vec![Uri::from_str("file:///legacy/").expect("uri")]
         );
 
         // Neither → empty (fall back to open-docs-only indexing).
@@ -2744,7 +2767,7 @@ mod tests {
             kind: SymbolKind::CLASS,
             tags: None,
             detail: None,
-            uri: Url::parse("file:///a.otui").expect("uri"),
+            uri: Uri::from_str("file:///a.otui").expect("uri"),
             range: Range::default(),
             selection_range: Range::default(),
             data: None,
@@ -2781,7 +2804,7 @@ mod tests {
     fn sorted_locs(locs: &[Location]) -> Vec<(String, Position, Position)> {
         let mut out: Vec<(String, Position, Position)> = locs
             .iter()
-            .map(|l| (l.uri.to_string(), l.range.start, l.range.end))
+            .map(|l| (l.uri.as_str().to_string(), l.range.start, l.range.end))
             .collect();
         out.sort_by(|a, b| {
             a.0.cmp(&b.0)
@@ -2799,7 +2822,7 @@ mod tests {
             ("file:///b.otui", "ChildB < MyPanel\n"),
         ]);
         let svc = OtuiService::new();
-        let uri = Url::parse("file:///a.otui").expect("uri");
+        let uri = Uri::from_str("file:///a.otui").expect("uri");
         // include_declaration: the declaration site plus both base references.
         let target = ReferenceTarget::StyleName("MyPanel".to_owned());
         let locs = collect_references(
@@ -2840,7 +2863,7 @@ mod tests {
             ("file:///a.otui", "ChildA < MyPanel\n"),
         ]);
         let svc = OtuiService::new();
-        let uri = Url::parse("file:///a.otui").expect("uri");
+        let uri = Uri::from_str("file:///a.otui").expect("uri");
         let target = ReferenceTarget::StyleName("MyPanel".to_owned());
         let locs = collect_references(
             &target,
@@ -2867,7 +2890,7 @@ mod tests {
         // `UIWidget` is a native built-in with no user definition in the index → no references listed.
         let (index, docs) = workspace(&[("file:///a.otui", "MyPanel < UIWidget\n")]);
         let svc = OtuiService::new();
-        let uri = Url::parse("file:///a.otui").expect("uri");
+        let uri = Uri::from_str("file:///a.otui").expect("uri");
         let target = ReferenceTarget::StyleName("UIWidget".to_owned());
         let locs = collect_references(
             &target,
@@ -2893,7 +2916,7 @@ mod tests {
             ("file:///b.otui", "Elsewhere\n  id: header\n"),
         ]);
         let svc = OtuiService::new();
-        let uri = Url::parse("file:///a.otui").expect("uri");
+        let uri = Uri::from_str("file:///a.otui").expect("uri");
         let target = ReferenceTarget::Id("header".to_owned());
         let locs = collect_references(
             &target,
@@ -2946,7 +2969,7 @@ mod tests {
             "Panel\n  id: header\nOther\n  anchors.top: header.bottom\n",
         )]);
         let svc = OtuiService::new();
-        let uri = Url::parse("file:///a.otui").expect("uri");
+        let uri = Uri::from_str("file:///a.otui").expect("uri");
         let text = "Panel\n  id: header\nOther\n  anchors.top: header.bottom\n";
         // Cursor on the anchor-target id `header`.
         let anchor = text.rfind("header").expect("present");
@@ -3010,7 +3033,7 @@ mod tests {
             ("file:///b.otui", "ChildB < MyPanel\n"),
         ]);
         let svc = OtuiService::new();
-        let uri = Url::parse("file:///a.otui").expect("uri");
+        let uri = Uri::from_str("file:///a.otui").expect("uri");
         let target = ReferenceTarget::StyleName("MyPanel".to_owned());
         let edit = build_rename_edits(
             &target,
@@ -3027,14 +3050,14 @@ mod tests {
         // All three docs are edited: the declaration in defs, plus a base ref in each of a/b.
         assert_eq!(changes.len(), 3);
         // The declaration is always rewritten (a rename includes the definition).
-        let defs = &changes[&Url::parse("file:///defs.otui").expect("uri")];
+        let defs = &changes[&Uri::from_str("file:///defs.otui").expect("uri")];
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].new_text, "Renamed");
         assert_eq!(defs[0].range.start, Position::new(0, 0));
         assert_eq!(defs[0].range.end, Position::new(0, 7));
         // Each base reference (`ChildX < MyPanel`) is rewritten at columns 9..16.
         for name in ["file:///a.otui", "file:///b.otui"] {
-            let e = &changes[&Url::parse(name).expect("uri")];
+            let e = &changes[&Uri::from_str(name).expect("uri")];
             assert_eq!(e.len(), 1);
             assert_eq!(e[0].new_text, "Renamed");
             assert_eq!(e[0].range.start, Position::new(0, 9));
@@ -3054,7 +3077,7 @@ mod tests {
             ("file:///b.otui", "Elsewhere\n  id: header\n"),
         ]);
         let svc = OtuiService::new();
-        let uri = Url::parse("file:///a.otui").expect("uri");
+        let uri = Uri::from_str("file:///a.otui").expect("uri");
         let target = ReferenceTarget::Id("header".to_owned());
         let edit = build_rename_edits(
             &target,
@@ -3080,7 +3103,7 @@ mod tests {
     fn rename_rejects_an_invalid_new_name() {
         let (index, docs) = workspace(&[("file:///a.otui", "MyPanel < UIWidget\n")]);
         let svc = OtuiService::new();
-        let uri = Url::parse("file:///a.otui").expect("uri");
+        let uri = Uri::from_str("file:///a.otui").expect("uri");
         let target = ReferenceTarget::StyleName("MyPanel".to_owned());
         // A name containing a space is not a valid identifier → an `Err(message)` (which the
         // dispatch arm turns into a JSON-RPC `InvalidParams` error), never an edit.
@@ -3105,7 +3128,7 @@ mod tests {
         // `UIWidget` is a native built-in with no user definition → no declaration to rename.
         let (index, docs) = workspace(&[("file:///a.otui", "MyPanel < UIWidget\n")]);
         let svc = OtuiService::new();
-        let uri = Url::parse("file:///a.otui").expect("uri");
+        let uri = Uri::from_str("file:///a.otui").expect("uri");
         let target = ReferenceTarget::StyleName("UIWidget".to_owned());
         let out = build_rename_edits(
             &target,
@@ -3136,7 +3159,7 @@ mod tests {
             classify_rename_target(&svc, request_text, offset).expect("renameable");
         assert_eq!(target, ReferenceTarget::StyleName("MyPanel".to_owned()));
         assert_eq!(&request_text[span.start..span.end], "MyPanel");
-        let uri = Url::parse("file:///use.otui").expect("uri");
+        let uri = Uri::from_str("file:///use.otui").expect("uri");
         let edit = build_rename_edits(
             &target,
             &uri,
@@ -3385,8 +3408,8 @@ mod tests {
         }
     }
 
-    /// The single `(Url, Vec<TextEdit>)` change set of an action's workspace edit.
-    fn only_change(action: &CodeAction) -> (&Url, &Vec<TextEdit>) {
+    /// The single `(Uri, Vec<TextEdit>)` change set of an action's workspace edit.
+    fn only_change(action: &CodeAction) -> (&Uri, &Vec<TextEdit>) {
         let changes = action
             .edit
             .as_ref()
@@ -3400,7 +3423,7 @@ mod tests {
 
     #[test]
     fn code_action_offers_tabs_to_spaces_fix_with_a_workspace_edit() {
-        let uri = Url::parse("file:///a.otui").expect("uri");
+        let uri = Uri::from_str("file:///a.otui").expect("uri");
         let text = "Panel\n\tid: main\n";
         // A range over the tab-indented line, no client-supplied context diagnostics.
         let range = ByteSpan::new(6, 15);
@@ -3429,7 +3452,7 @@ mod tests {
 
     #[test]
     fn code_action_links_the_matching_context_diagnostic() {
-        let uri = Url::parse("file:///a.otui").expect("uri");
+        let uri = Uri::from_str("file:///a.otui").expect("uri");
         let text = "Panel\n  widht: 10\n";
         // The client sends back the unknown-property diagnostic it received for `widht`.
         let widht = text.find("widht").expect("present");
@@ -3462,7 +3485,7 @@ mod tests {
 
     #[test]
     fn code_action_returns_empty_when_nothing_in_range_is_fixable() {
-        let uri = Url::parse("file:///a.otui").expect("uri");
+        let uri = Uri::from_str("file:///a.otui").expect("uri");
         // A clean document: no diagnostics, so no fixes anywhere.
         let text = "MainWindow < UIWindow\n  id: main\n";
         let actions = build_code_actions(

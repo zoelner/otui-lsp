@@ -2,12 +2,13 @@
 //! [`lsp_server::Connection`] (no stdio), proving `initialize → didOpen → hover → shutdown/exit`
 //! works through `Backend::handle_request`/`handle_notification`.
 
+use std::str::FromStr;
 use std::thread;
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     DidOpenTextDocumentParams, HoverParams, InitializeParams, InitializedParams, Position,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Uri,
     WorkDoneProgressParams,
 };
 use otui_lsp_server::Backend;
@@ -95,7 +96,7 @@ fn memory_connection_drives_initialize_open_hover_shutdown() {
         .expect("send initialized");
 
     // 2. didOpen a small `.otui` document.
-    let uri = Url::parse("file:///scratch/widget.otui").expect("uri");
+    let uri = Uri::from_str("file:///scratch/widget.otui").expect("uri");
     client
         .sender
         .send(Message::Notification(Notification::new(
