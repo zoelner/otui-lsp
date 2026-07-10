@@ -20,6 +20,7 @@ pub mod folding;
 pub mod format;
 pub mod hierarchy;
 pub mod hover;
+pub mod links;
 pub mod navigation;
 pub mod references;
 pub mod schema;
@@ -229,6 +230,21 @@ impl OtuiService {
     #[must_use]
     pub fn document_colors(&self, source: &str) -> Vec<(ByteSpan, schema::Rgba)> {
         colors::document_colors(source)
+    }
+
+    /// Find every file-path-valued property value in `source` (`textDocument/documentLink`): for
+    /// each `property` whose key is in [`schema::PATH_PROPERTIES`] (primarily `image-source`), the
+    /// value token's byte span and the raw path string. The server resolves each path against the
+    /// filesystem (relative to the current file's directory or the workspace root) and emits a
+    /// [`DocumentLink`](links::PathRef) only when the target file exists. Returns an empty vec when
+    /// the source cannot be parsed.
+    ///
+    /// Inherent (not on the [`LanguageService`] trait) so the protocol-agnostic trait stays minimal,
+    /// mirroring [`document_colors`](Self::document_colors). Kept **pure** — the path→file
+    /// resolution and the existence check are the server's I/O, deliberately not done here.
+    #[must_use]
+    pub fn document_links(&self, source: &str) -> Vec<links::PathRef> {
+        links::document_links(source)
     }
 }
 

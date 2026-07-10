@@ -42,22 +42,24 @@ use lsp_types::{
     DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentColorParams,
     DocumentFormattingParams, DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
-    DocumentSymbolParams, DocumentSymbolResponse, FileChangeType, FileSystemWatcher, FoldingRange,
-    FoldingRangeParams, FoldingRangeProviderCapability, GlobPattern, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    ImplementationProviderCapability, InitializeParams, InitializeResult, Location,
-    LogMessageParams, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf,
-    PositionEncodingKind, PrepareRenameResponse, PublishDiagnosticsParams, ReferenceParams,
-    Registration, RegistrationParams, RenameOptions, RenameParams, SemanticTokens,
-    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SymbolInformation,
-    SymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextEdit, TypeDefinitionProviderCapability, TypeHierarchyItem, TypeHierarchyPrepareParams,
-    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri, WorkDoneProgressOptions,
-    WorkspaceEdit, WorkspaceSymbolParams,
+    DocumentLink, DocumentLinkOptions, DocumentLinkParams, DocumentSymbolParams,
+    DocumentSymbolResponse, FileChangeType, FileSystemWatcher, FoldingRange, FoldingRangeParams,
+    FoldingRangeProviderCapability, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse,
+    Hover, HoverContents, HoverParams, HoverProviderCapability, ImplementationProviderCapability,
+    InitializeParams, InitializeResult, Location, LogMessageParams, MarkupContent, MarkupKind,
+    MessageType, NumberOrString, OneOf, PositionEncodingKind, PrepareRenameResponse,
+    PublishDiagnosticsParams, ReferenceParams, Registration, RegistrationParams, RenameOptions,
+    RenameParams, SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions,
+    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
+    ServerCapabilities, ServerInfo, SymbolInformation, SymbolKind, TextDocumentPositionParams,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, TypeDefinitionProviderCapability,
+    TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
+    TypeHierarchySupertypesParams, Uri, WorkDoneProgressOptions, WorkspaceEdit,
+    WorkspaceSymbolParams,
 };
 use otui_core::fixes::Fix;
 use otui_core::hover::{Inheritance, StyleHover, StyleHoverKind};
+use otui_core::links::PathRef;
 use otui_core::style_index::{is_native_base, DocId, StyleDef, StyleIndex};
 use otui_core::OtuiService;
 
@@ -350,6 +352,37 @@ fn uri_to_file_path(uri: &Uri) -> Option<PathBuf> {
 /// a `file:` URL. Mirror of [`uri_to_file_path`]; see it for why the `url` crate is used.
 fn uri_from_file_path(path: &Path) -> Option<Uri> {
     Uri::from_str(url::Url::from_file_path(path).ok()?.as_str()).ok()
+}
+
+/// Compute the candidate filesystem paths a raw OTUI asset path could resolve to, **without**
+/// touching the filesystem (no existence check — that stays in the handler).
+///
+/// This mirrors OTClient's path model heuristically: the real data root is configurable, so the best
+/// the server can do offline is treat the workspace root(s) as the data root.
+///
+/// * A **`/`-rooted** path is an OTClient "absolute" path — relative to the *data root*, not the OS
+///   root. The leading `/` is stripped and the remainder joined onto each workspace root candidate
+///   (there may be several workspace folders, or none — in which case a `/`-rooted path yields no
+///   candidates offline).
+/// * Any **other** (relative) path is resolved against the current document's directory.
+///
+/// Returns the candidates in probe order; the caller keeps the first that exists.
+fn resolve_asset_candidates(
+    raw: &str,
+    doc_dir: &Path,
+    workspace_roots: &[PathBuf],
+) -> Vec<PathBuf> {
+    let path = raw.trim();
+    if path.is_empty() {
+        return Vec::new();
+    }
+    if let Some(rest) = path.strip_prefix('/') {
+        // OTClient "absolute" = relative to the data root; approximate the data root as each
+        // workspace root. Strip the leading `/` so `join` does not discard the root.
+        workspace_roots.iter().map(|root| root.join(rest)).collect()
+    } else {
+        vec![doc_dir.join(path)]
+    }
 }
 
 fn read_otui_from_disk(uri: &Uri) -> Option<String> {
@@ -1270,6 +1303,11 @@ impl Backend {
                 ColorPresentationParams,
                 |p| self.color_presentation(p)
             ),
+            "textDocument/documentLink" => {
+                reply!(req, "textDocument/documentLink", DocumentLinkParams, |p| {
+                    self.document_link(p)
+                })
+            }
             "textDocument/prepareRename" => reply!(
                 req,
                 "textDocument/prepareRename",
@@ -1441,6 +1479,13 @@ impl Backend {
                 // presentations (spec §2.9). A plain boolean provider — colors are computed on
                 // demand per request.
                 color_provider: Some(ColorProviderCapability::Simple(true)),
+                // Document links: clickable asset paths (`image-source: <path>`, `icon` family).
+                // Targets are resolved eagerly and only emitted when the file exists on disk, so
+                // `resolve_provider` is `false` — there is no `documentLink/resolve`.
+                document_link_provider: Some(DocumentLinkOptions {
+                    resolve_provider: Some(false),
+                    work_done_progress_options: WorkDoneProgressOptions::default(),
+                }),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -1663,6 +1708,57 @@ impl Backend {
 
         let core_colors = self.service.document_colors(&text);
         convert::colors_to_lsp(&text, &core_colors, self.encoding())
+    }
+
+    /// `textDocument/documentLink`: make asset paths (`image-source: <path>`, `icon` family)
+    /// clickable. Best-effort — a link is emitted only when the resolved target file actually exists
+    /// on disk, so there are no dead links.
+    fn document_link(&self, params: DocumentLinkParams) -> Option<Vec<DocumentLink>> {
+        let uri = params.text_document.uri;
+        // Serve from the stored document text; an unknown document has no links.
+        let text = self
+            .documents
+            .read()
+            .expect("documents lock poisoned")
+            .get(&uri)
+            .map(|doc| doc.text.clone())?;
+
+        // Only `file://` documents have a directory to resolve relative paths against.
+        let doc_path = uri_to_file_path(&uri)?;
+        let doc_dir = doc_path.parent()?.to_path_buf();
+        // The workspace roots as filesystem paths (the heuristic "data root" for `/`-rooted paths).
+        let workspace_roots: Vec<PathBuf> = self
+            .roots
+            .lock()
+            .expect("roots mutex poisoned")
+            .iter()
+            .filter_map(uri_to_file_path)
+            .collect();
+
+        let encoding = self.encoding();
+        let index = LineIndex::new(&text);
+        let mut links = Vec::new();
+        for PathRef { span, path } in self.service.document_links(&text) {
+            // Pure resolution → candidate filesystem paths; the `.exists()` I/O is the only fs work,
+            // kept thin here (a handful of links per document).
+            let Some(target_path) = resolve_asset_candidates(&path, &doc_dir, &workspace_roots)
+                .into_iter()
+                .find(|candidate| candidate.exists())
+            else {
+                // No candidate resolves to an existing file → skip (no dead link).
+                continue;
+            };
+            let Some(target) = uri_from_file_path(&target_path) else {
+                continue;
+            };
+            links.push(DocumentLink {
+                range: index.range(span.start, span.end, encoding),
+                target: Some(target),
+                tooltip: Some(format!("Open {path}")),
+                data: None,
+            });
+        }
+        Some(links)
     }
 
     fn color_presentation(&self, params: ColorPresentationParams) -> Vec<ColorPresentation> {
@@ -3806,5 +3902,130 @@ mod tests {
         let resp = resolve_base_definition(&index, &docs, &base_ref.name, PositionEncoding::Utf16)
             .expect("resolves");
         assert!(matches!(resp, GotoDefinitionResponse::Scalar(_)));
+    }
+
+    // --- document links -----------------------------------------------------
+
+    #[test]
+    fn resolve_asset_candidates_maps_rooted_path_against_workspace_roots() {
+        // A `/`-rooted OTClient "absolute" path is joined onto each workspace root with the leading
+        // `/` stripped — never against the doc dir.
+        let doc_dir = Path::new("/project/modules/game_things");
+        let roots = vec![PathBuf::from("/data-a"), PathBuf::from("/data-b")];
+        let candidates = resolve_asset_candidates("/images/ui/window.png", doc_dir, &roots);
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/data-a/images/ui/window.png"),
+                PathBuf::from("/data-b/images/ui/window.png"),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_asset_candidates_maps_relative_path_against_doc_dir() {
+        // A relative path resolves against the current file's directory, ignoring workspace roots.
+        let doc_dir = Path::new("/project/modules/game_things");
+        let roots = vec![PathBuf::from("/data-root")];
+        let candidates = resolve_asset_candidates("sprites/ok.png", doc_dir, &roots);
+        assert_eq!(
+            candidates,
+            vec![PathBuf::from("/project/modules/game_things/sprites/ok.png")]
+        );
+    }
+
+    #[test]
+    fn resolve_asset_candidates_rooted_with_no_workspace_yields_nothing() {
+        // Offline, a `/`-rooted path has no data root to resolve against when no workspace is open.
+        let candidates = resolve_asset_candidates("/images/x.png", Path::new("/project/sub"), &[]);
+        assert!(candidates.is_empty());
+    }
+
+    /// Build a `Backend` with an open `file://` document and the given workspace roots, for driving
+    /// the `document_link` handler directly.
+    fn backend_with_doc(uri: &Uri, text: &str, roots: Vec<Uri>) -> Backend {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let params = InitializeParams::default();
+        let backend = Backend::new(tx, &params);
+        *backend.roots.lock().expect("roots") = roots;
+        backend.documents.write().expect("documents").insert(
+            uri.clone(),
+            Document {
+                text: text.to_owned(),
+                version: 0,
+            },
+        );
+        backend
+    }
+
+    fn link_params(uri: &Uri) -> DocumentLinkParams {
+        use lsp_types::{PartialResultParams, TextDocumentIdentifier, WorkDoneProgressParams};
+        DocumentLinkParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        }
+    }
+
+    #[test]
+    fn document_link_emits_for_existing_target_and_skips_missing() {
+        // A real temp tree: one asset that exists (relative to the doc dir) and one that does not.
+        let base = std::env::temp_dir().join(format!("otui-links-{}", std::process::id()));
+        let assets = base.join("images");
+        std::fs::create_dir_all(&assets).expect("mkdir");
+        std::fs::write(assets.join("present.png"), b"png").expect("write asset");
+
+        let doc_path = base.join("window.otui");
+        let doc_uri = uri_from_file_path(&doc_path).expect("doc uri");
+        // Two relative image-source paths: one existing, one missing.
+        let text = "Panel\n  image-source: images/present.png\nOther\n  image-source: images/missing.png\n";
+        let backend = backend_with_doc(&doc_uri, text, Vec::new());
+
+        let links = backend
+            .document_link(link_params(&doc_uri))
+            .expect("known document");
+        // Only the existing target produces a link (no dead links).
+        assert_eq!(links.len(), 1, "got {links:?}");
+        let link = &links[0];
+        assert_eq!(link.tooltip.as_deref(), Some("Open images/present.png"));
+        let target = uri_from_file_path(&assets.join("present.png")).expect("target uri");
+        assert_eq!(link.target.as_ref(), Some(&target));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn document_link_resolves_rooted_path_against_workspace_root() {
+        // A `/`-rooted path resolves against the workspace root (the heuristic data root).
+        let base = std::env::temp_dir().join(format!("otui-links-root-{}", std::process::id()));
+        let assets = base.join("data").join("images");
+        std::fs::create_dir_all(&assets).expect("mkdir");
+        std::fs::write(assets.join("bg.png"), b"png").expect("write asset");
+
+        let root = base.join("data");
+        let root_uri = uri_from_file_path(&root).expect("root uri");
+        // Document sits somewhere under the project; the `/`-rooted path is data-root relative.
+        let doc_path = base.join("modules").join("ui.otui");
+        std::fs::create_dir_all(doc_path.parent().unwrap()).expect("mkdir doc");
+        let doc_uri = uri_from_file_path(&doc_path).expect("doc uri");
+        let text = "Panel\n  image-source: /images/bg.png\n";
+        let backend = backend_with_doc(&doc_uri, text, vec![root_uri]);
+
+        let links = backend
+            .document_link(link_params(&doc_uri))
+            .expect("known document");
+        assert_eq!(links.len(), 1, "got {links:?}");
+        let target = uri_from_file_path(&assets.join("bg.png")).expect("target uri");
+        assert_eq!(links[0].target.as_ref(), Some(&target));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn document_link_on_unknown_document_is_none() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let backend = Backend::new(tx, &InitializeParams::default());
+        let uri = Uri::from_str("file:///nope.otui").expect("uri");
+        assert!(backend.document_link(link_params(&uri)).is_none());
     }
 }
