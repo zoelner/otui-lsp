@@ -72,12 +72,6 @@ pub struct Backend {
     /// decides the `textDocument/documentSymbol` response shape (nested vs. flat). Defaults to
     /// `false` (the LSP default when the capability is absent). Guarded like [`encoding`].
     hierarchical_symbols: Mutex<bool>,
-    /// Whether the client advertised dynamic registration for `textDocument/typeHierarchy` during
-    /// `initialize`. This lsp-types (0.94.1) has no static `type_hierarchy_provider` field in
-    /// [`ServerCapabilities`], so the type-hierarchy capability is registered dynamically in
-    /// [`initialized`](Backend::initialized) — but only when the client supports it. Guarded like
-    /// [`encoding`].
-    type_hierarchy_dyn_reg: Mutex<bool>,
     /// Open documents by URL, full text (text document sync = FULL) plus sync version.
     documents: RwLock<HashMap<Url, Document>>,
     /// The workspace-wide `Name < Base` style index (spec §5.2), keyed by document URL string.
@@ -96,7 +90,6 @@ impl Backend {
             service: OtuiService::new(),
             encoding: Mutex::new(PositionEncoding::Utf16),
             hierarchical_symbols: Mutex::new(false),
-            type_hierarchy_dyn_reg: Mutex::new(false),
             documents: RwLock::new(HashMap::new()),
             style_index: RwLock::new(StyleIndex::new()),
         }
@@ -830,24 +823,6 @@ fn client_supports_hierarchical_symbols(params: &InitializeParams) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether the client supports **dynamic registration** of the `textDocument/typeHierarchy`
-/// capability (`textDocument.typeHierarchy.dynamicRegistration`).
-///
-/// This lsp-types (0.94.1) exposes no static `type_hierarchy_provider` field on
-/// [`ServerCapabilities`], so type hierarchy can only be advertised via `client/registerCapability`
-/// — which requires the client to opt into dynamic registration for it. When the capability is
-/// absent the default is `false`, and the server registers nothing (so clients that cannot handle a
-/// registration are never sent one).
-fn client_supports_type_hierarchy_dynamic_registration(params: &InitializeParams) -> bool {
-    params
-        .capabilities
-        .text_document
-        .as_ref()
-        .and_then(|td| td.type_hierarchy.as_ref())
-        .and_then(|th| th.dynamic_registration)
-        .unwrap_or(false)
-}
-
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> RpcResult<InitializeResult> {
@@ -858,11 +833,6 @@ impl LanguageServer for Backend {
             .lock()
             .expect("hierarchical_symbols mutex poisoned") =
             client_supports_hierarchical_symbols(&params);
-        *self
-            .type_hierarchy_dyn_reg
-            .lock()
-            .expect("type_hierarchy_dyn_reg mutex poisoned") =
-            client_supports_type_hierarchy_dynamic_registration(&params);
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -938,27 +908,27 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
-        // Type hierarchy (spec §5.2, the `Name < Base` graph): this lsp-types has no static
-        // `type_hierarchy_provider` capability field, so advertise it via dynamic registration —
-        // only when the client opted into it (see the flag set during `initialize`).
-        let dyn_reg = *self
-            .type_hierarchy_dyn_reg
-            .lock()
-            .expect("type_hierarchy_dyn_reg mutex poisoned");
-        if dyn_reg {
-            let registration = Registration {
-                id: "otui-type-hierarchy".to_owned(),
-                method: "textDocument/prepareTypeHierarchy".to_owned(),
-                register_options: None,
-            };
-            if let Err(err) = self.client.register_capability(vec![registration]).await {
-                self.client
-                    .log_message(
-                        MessageType::WARNING,
-                        format!("failed to register type hierarchy capability: {err}"),
-                    )
-                    .await;
-            }
+        // Type hierarchy (the `Name < Base` graph): this lsp-types (0.94.1) has no static
+        // `type_hierarchy_provider` field in `ServerCapabilities`, so the only way to advertise it is
+        // dynamic registration. We register **unconditionally** rather than gating on the client's
+        // `textDocument.typeHierarchy.dynamicRegistration` flag — neither VS Code nor Neovim sets that
+        // flag by default, yet both process an incoming `client/registerCapability` for type
+        // hierarchy, so gating on it would make the feature undiscoverable in exactly the clients that
+        // matter. A client that genuinely cannot handle the registration replies with an error, which
+        // we log and otherwise ignore (the rest of the server is unaffected). A future lsp-types bump
+        // would let us advertise this statically instead.
+        let registration = Registration {
+            id: "otui-type-hierarchy".to_owned(),
+            method: "textDocument/prepareTypeHierarchy".to_owned(),
+            register_options: None,
+        };
+        if let Err(err) = self.client.register_capability(vec![registration]).await {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("failed to register type hierarchy capability: {err}"),
+                )
+                .await;
         }
 
         self.client
