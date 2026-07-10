@@ -21,6 +21,7 @@ pub mod format;
 pub mod hierarchy;
 pub mod hover;
 pub mod links;
+pub mod lua_widgets;
 pub mod navigation;
 pub mod references;
 pub mod schema;
