@@ -51,12 +51,21 @@ const OUTPUT_REL: &str = "crates/otui-core/src/catalog.rs";
 /// The extracted, sorted, de-duped catalog ready to be rendered to Rust source.
 struct Catalog {
     properties: Vec<String>,
+    /// The OTML property tags whose value the engine parses as a color (the style-dispatch sites
+    /// that call `node->value<Color>()` or `Color(node->value())`, e.g. `color`, `background`,
+    /// `border-color*`, `icon-color`, `image-color`, `ttf-stroke-color`). Sorted. Used to gate
+    /// named-color swatches to genuine color-value positions.
+    color_properties: Vec<String>,
     /// The CSS named-color table: `(lowercased name, packed 0xRRGGBB)`, sorted by name. The value is
     /// captured from the `rgb_to_abgr(0xRRGGBB)` literal in the engine's `kCss` table.
     named_colors: Vec<(String, u32)>,
-    /// Legacy engine color names (the `tmp == "..."` / `key == "..."` statics, e.g. `alpha`,
-    /// `darkPink`, `transparent`) that are **not** in the CSS table, so carry no extractable RGB
-    /// value — kept names-only for `is_named_color` membership. Lowercased, sorted.
+    /// The legacy engine color statics (`const Color Color::NAME = 0xAABBGGRR;`, e.g. `red`, `teal`,
+    /// `darkPink`) as `(lowercased name, packed 0xRRGGBBAA)`, converted from the source's AABBGGRR
+    /// literal so alpha is preserved. Sorted by name.
+    legacy_colors: Vec<(String, u32)>,
+    /// Legacy color names recognized by the engine but with no extractable RGB value (the
+    /// `transparent` alias, matched as `key == "transparent"` in `css_lookup`) — kept names-only for
+    /// `is_named_color` membership. Lowercased, sorted.
     legacy_color_names: Vec<String>,
 }
 
@@ -123,9 +132,12 @@ fn gen_catalog(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         .map_err(|e| format!("failed to write '{}': {e}", out_path.display()))?;
 
     println!(
-        "gen-catalog: wrote {} properties, {} named colors and {} legacy color names to {}",
+        "gen-catalog: wrote {} properties ({} color-typed), {} named colors, {} legacy colors and \
+         {} legacy names to {}",
         catalog.properties.len(),
+        catalog.color_properties.len(),
         catalog.named_colors.len(),
+        catalog.legacy_colors.len(),
         catalog.legacy_color_names.len(),
         OUTPUT_REL
     );
@@ -142,6 +154,7 @@ fn extract(src: &Path) -> Result<Catalog, String> {
         Regex::new(r#"\btag\s*(?:\(\))?\s*==\s*"([^"]+)""#).expect("valid property regex");
 
     let mut properties: Vec<String> = Vec::new();
+    let mut color_properties: Vec<String> = Vec::new();
     for (rel, required) in PROPERTY_FILES {
         let path = src.join(rel);
         let text = match std::fs::read_to_string(&path) {
@@ -161,42 +174,95 @@ fn extract(src: &Path) -> Result<Catalog, String> {
         for caps in prop_re.captures_iter(&stripped) {
             properties.push(caps[1].to_string());
         }
+        color_properties.extend(extract_color_properties(&stripped));
     }
     if properties.is_empty() {
         return Err(
             "extracted zero property tags — is the engine source layout as expected?".into(),
         );
     }
+    if color_properties.is_empty() {
+        return Err(
+            "extracted zero color-typed properties — is the style-dispatch layout as expected?"
+                .into(),
+        );
+    }
 
-    // Named colors: the CSS table entries `{"name", rgb_to_abgr(0xRRGGBB)}` (name + value) plus the
-    // legacy engine color names and the `transparent` alias compared as `tmp == "..."` /
-    // `key == "..."` (names only — the legacy statics carry an AABBGGRR literal we do not extract).
-    // Names are lowercased to match the engine's case-insensitive `css_lookup`.
+    // Colors: the CSS table entries `{"name", rgb_to_abgr(0xRRGGBB)}` (name + RGB value), the legacy
+    // engine color statics `const Color Color::NAME = 0xAABBGGRR` (name + RGBA value, alpha
+    // preserved), and any remaining recognized names (the `transparent` alias). Names are lowercased
+    // to match the engine's case-insensitive `css_lookup`.
     let color_path = src.join(COLOR_FILE);
     let color_text = std::fs::read_to_string(&color_path)
         .map_err(|e| format!("failed to read '{}': {e}", color_path.display()))?;
     let color_text = strip_comments(&color_text);
 
     let named_colors = extract_css_colors(&color_text)?;
+    let legacy_colors = extract_legacy_colors(&color_text);
 
-    // Legacy `tmp == "..."` / `key == "..."` names, minus any already carried (with a value) by the
-    // CSS table — those extras have no CSS-table RGB, so they are membership-only.
+    // Remaining `tmp == "..."` / `key == "..."` names, minus any already carried (with a value) by
+    // the CSS table or the legacy statics — those extras are recognized but have no extractable RGB,
+    // so they are membership-only (e.g. `transparent`).
     let name_re = Regex::new(r#"\b(?:tmp|key)\s*==\s*"([^"]+)""#).expect("valid color-name regex");
-    let css_names: std::collections::HashSet<&str> =
-        named_colors.iter().map(|(n, _)| n.as_str()).collect();
+    let valued: std::collections::HashSet<&str> = named_colors
+        .iter()
+        .chain(legacy_colors.iter())
+        .map(|(n, _)| n.as_str())
+        .collect();
     let mut legacy_color_names: Vec<String> = Vec::new();
     for caps in name_re.captures_iter(&color_text) {
         let lower = caps[1].to_ascii_lowercase();
-        if !css_names.contains(lower.as_str()) {
+        if !valued.contains(lower.as_str()) {
             legacy_color_names.push(lower);
         }
     }
 
     Ok(Catalog {
         properties: sorted_dedup(properties),
+        color_properties: sorted_dedup(color_properties),
         named_colors,
+        legacy_colors,
         legacy_color_names: sorted_dedup(legacy_color_names),
     })
+}
+
+/// Extract the OTML property tags whose value the engine parses as a color: a `tag == "..."` compare
+/// whose handler statement (up to its terminating `;`, without crossing a `{`/`}` block boundary)
+/// parses the whole value as a `Color` — either `node->value<Color>()` or `Color(node->value())`.
+/// The `[^;{}]` bound keeps each match inside one statement, so a non-color handler is never
+/// mismatched and the brace-bodied `border` / `ttf-stroke` shorthands (whose color is only a
+/// sub-token) are excluded. Returns lowercased/verbatim tags (as authored).
+fn extract_color_properties(stripped: &str) -> Vec<String> {
+    let re = Regex::new(
+        r#"\btag\s*(?:\(\))?\s*==\s*"([^"]+)"\s*\)[^;{}]*?(?:value<\s*Color\s*>|Color\s*\(\s*node->value)"#,
+    )
+    .expect("valid color-property regex");
+    re.captures_iter(stripped)
+        .map(|caps| caps[1].to_string())
+        .collect()
+}
+
+/// Extract the legacy engine color statics (`const Color Color::NAME = 0xAABBGGRR;`) as
+/// `(lowercased name, packed 0xRRGGBBAA)`, converting the source's AABBGGRR (little-endian channel)
+/// literal into RGBA so alpha survives. Sorted by name, de-duped (first wins).
+fn extract_legacy_colors(color_text: &str) -> Vec<(String, u32)> {
+    let re = Regex::new(r#"const\s+Color\s+Color::(\w+)\s*=\s*0x([0-9A-Fa-f]+)U?\s*;"#)
+        .expect("valid legacy-color regex");
+    let mut out: Vec<(String, u32)> = Vec::new();
+    for caps in re.captures_iter(color_text) {
+        let name = caps[1].to_ascii_lowercase();
+        // Parse the AABBGGRR literal, then repack as 0xRRGGBBAA.
+        if let Ok(abgr) = u32::from_str_radix(&caps[2], 16) {
+            let a = (abgr >> 24) & 0xFF;
+            let b = (abgr >> 16) & 0xFF;
+            let g = (abgr >> 8) & 0xFF;
+            let r = abgr & 0xFF;
+            out.push((name, (r << 24) | (g << 16) | (b << 8) | a));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.dedup_by(|a, b| a.0 == b.0);
+    out
 }
 
 /// Extract the CSS named-color table (`{"name", rgb_to_abgr(0xRRGGBB)}`) as `(lowercased name,
@@ -297,10 +363,15 @@ fn render(catalog: &Catalog) -> String {
          //! * [`PROPERTIES`] — the OTML property tag names dispatched by the widget style parsers\n\
          //!   (`parseBaseStyle` / `parseImageStyle` / `parseTextStyle`). Lowercase/kebab, matching\n\
          //!   the engine's exact tag compare.\n\
+         //! * [`COLOR_PROPERTIES`] — the subset of property tags whose value the engine parses as a\n\
+         //!   color (`node->value<Color>()` / `Color(node->value())`), used to gate named-color\n\
+         //!   swatches to genuine color-value positions.\n\
          //! * [`NAMED_COLORS`] — the CSS named-color table as `(name, 0xRRGGBB)` pairs, lowercased\n\
          //!   to match the engine's case-insensitive lookup. The packed value is the color's RGB.\n\
-         //! * [`LEGACY_COLOR_NAMES`] — the legacy engine color names and the `transparent` alias\n\
-         //!   that are not in the CSS table, so carry no extractable RGB value (membership only).\n\
+         //! * [`LEGACY_COLORS`] — the legacy engine color statics as `(name, 0xRRGGBBAA)` pairs\n\
+         //!   (alpha preserved), lowercased.\n\
+         //! * [`LEGACY_COLOR_NAMES`] — recognized color names with no extractable RGB value (the\n\
+         //!   `transparent` alias); membership only.\n\
          //!\n\
          //! A future per-fork variant would add sibling tables here; the single catalog is the\n\
          //! current scope.\n\n",
@@ -310,13 +381,25 @@ fn render(catalog: &Catalog) -> String {
     s.push_str(&render_slice("PROPERTIES", &catalog.properties));
     s.push('\n');
     s.push_str(
+        "/// OTML property tags whose value the engine parses as a color (a `value<Color>` / \
+         `Color(node->value())` dispatch site).\n",
+    );
+    s.push_str(&render_slice("COLOR_PROPERTIES", &catalog.color_properties));
+    s.push('\n');
+    s.push_str(
         "/// CSS named colors recognized by the engine's color parser: `(lowercased name, packed \
          0xRRGGBB)`.\n",
     );
-    s.push_str(&render_pairs("NAMED_COLORS", &catalog.named_colors));
+    s.push_str(&render_pairs("NAMED_COLORS", &catalog.named_colors, 6));
     s.push('\n');
     s.push_str(
-        "/// Legacy engine color names (and the `transparent` alias) with no CSS-table RGB value \
+        "/// Legacy engine color statics: `(lowercased name, packed 0xRRGGBBAA)` (alpha \
+         preserved).\n",
+    );
+    s.push_str(&render_pairs("LEGACY_COLORS", &catalog.legacy_colors, 8));
+    s.push('\n');
+    s.push_str(
+        "/// Recognized color names with no extractable RGB value (the `transparent` alias) \
          (lowercased).\n",
     );
     s.push_str(&render_slice(
@@ -338,10 +421,15 @@ fn render_slice(name: &str, values: &[String]) -> String {
     s
 }
 
-fn render_pairs(name: &str, values: &[(String, u32)]) -> String {
+/// Render a `&[(&str, u32)]` table with each value as a zero-padded `hex_width`-digit hex literal
+/// (6 for `0xRRGGBB`, 8 for `0xRRGGBBAA`).
+fn render_pairs(name: &str, values: &[(String, u32)], hex_width: usize) -> String {
     let mut s = format!("pub static {name}: &[(&str, u32)] = &[\n");
     for (n, v) in values {
-        s.push_str(&format!("    (\"{n}\", 0x{v:06X}),\n"));
+        s.push_str(&format!(
+            "    (\"{n}\", 0x{v:0width$X}),\n",
+            width = hex_width
+        ));
     }
     s.push_str("];\n");
     s
@@ -385,6 +473,44 @@ mod tests {
     #[test]
     fn empty_color_table_is_an_error() {
         assert!(extract_css_colors("no table here").is_err());
+    }
+
+    #[test]
+    fn extracts_only_color_typed_properties() {
+        // A miniature style-dispatch chain: two color-parsed tags (via `value<Color>` and
+        // `Color(node->value())`), one int tag, and a brace-bodied `border` whose color is only a
+        // sub-token. Only the two whole-value color tags are captured.
+        let src = r#"
+            if (node->tag() == "color")
+                setColor(node->value<Color>());
+            else if (node->tag() == "width")
+                setWidth(node->value<int>());
+            else if (node->tag() == "ttf-stroke-color")
+                ttfStrokeColor = Color(node->value());
+            else if (node->tag() == "border") {
+                Color c = stdext::safe_cast<Color>(token);
+            }
+        "#;
+        let mut got = super::extract_color_properties(src);
+        got.sort();
+        assert_eq!(got, vec!["color".to_owned(), "ttf-stroke-color".to_owned()]);
+    }
+
+    #[test]
+    fn extracts_legacy_color_statics_as_rgba() {
+        // AABBGGRR literal repacked to RGBA; alpha preserved (opaque and fully transparent).
+        let src = "const Color Color::red = 0xff0000ffU;\n\
+                   const Color Color::alpha = 0x00000000U;\n\
+                   const Color Color::teal = 0xffffff00U;\n";
+        let got = super::extract_legacy_colors(src);
+        assert_eq!(
+            got,
+            vec![
+                ("alpha".to_owned(), 0x0000_0000), // fully transparent
+                ("red".to_owned(), 0xFF00_00FF),   // opaque red
+                ("teal".to_owned(), 0x00FF_FFFF),  // engine teal is cyan, opaque
+            ]
+        );
     }
 
     #[test]

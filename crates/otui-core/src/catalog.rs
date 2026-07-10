@@ -8,10 +8,15 @@
 //! * [`PROPERTIES`] — the OTML property tag names dispatched by the widget style parsers
 //!   (`parseBaseStyle` / `parseImageStyle` / `parseTextStyle`). Lowercase/kebab, matching
 //!   the engine's exact tag compare.
+//! * [`COLOR_PROPERTIES`] — the subset of property tags whose value the engine parses as a
+//!   color (`node->value<Color>()` / `Color(node->value())`), used to gate named-color
+//!   swatches to genuine color-value positions.
 //! * [`NAMED_COLORS`] — the CSS named-color table as `(name, 0xRRGGBB)` pairs, lowercased
 //!   to match the engine's case-insensitive lookup. The packed value is the color's RGB.
-//! * [`LEGACY_COLOR_NAMES`] — the legacy engine color names and the `transparent` alias
-//!   that are not in the CSS table, so carry no extractable RGB value (membership only).
+//! * [`LEGACY_COLORS`] — the legacy engine color statics as `(name, 0xRRGGBBAA)` pairs
+//!   (alpha preserved), lowercased.
+//! * [`LEGACY_COLOR_NAMES`] — recognized color names with no extractable RGB value (the
+//!   `transparent` alias); membership only.
 //!
 //! A future per-fork variant would add sibling tables here; the single catalog is the
 //! current scope.
@@ -172,6 +177,21 @@ pub static PROPERTIES: &[&str] = &[
     "y",
 ];
 
+/// OTML property tags whose value the engine parses as a color (a `value<Color>` / `Color(node->value())` dispatch site).
+pub static COLOR_PROPERTIES: &[&str] = &[
+    "background",
+    "background-color",
+    "border-color",
+    "border-color-bottom",
+    "border-color-left",
+    "border-color-right",
+    "border-color-top",
+    "color",
+    "icon-color",
+    "image-color",
+    "ttf-stroke-color",
+];
+
 /// CSS named colors recognized by the engine's color parser: `(lowercased name, packed 0xRRGGBB)`.
 pub static NAMED_COLORS: &[(&str, u32)] = &[
     ("aliceblue", 0xF0F8FF),
@@ -324,6 +344,28 @@ pub static NAMED_COLORS: &[(&str, u32)] = &[
     ("yellowgreen", 0x9ACD32),
 ];
 
-/// Legacy engine color names (and the `transparent` alias) with no CSS-table RGB value (lowercased).
-pub static LEGACY_COLOR_NAMES: &[&str] =
-    &["alpha", "darkpink", "darkteal", "darkyellow", "transparent"];
+/// Legacy engine color statics: `(lowercased name, packed 0xRRGGBBAA)` (alpha preserved).
+pub static LEGACY_COLORS: &[(&str, u32)] = &[
+    ("alpha", 0x00000000),
+    ("black", 0x000000FF),
+    ("blue", 0x0000FFFF),
+    ("darkblue", 0x000080FF),
+    ("darkgray", 0x808080FF),
+    ("darkgreen", 0x008000FF),
+    ("darkpink", 0x800080FF),
+    ("darkred", 0x800000FF),
+    ("darkteal", 0x008080FF),
+    ("darkyellow", 0x808000FF),
+    ("gray", 0xA0A0A0FF),
+    ("green", 0x00FF00FF),
+    ("lightgray", 0xC0C0C0FF),
+    ("orange", 0xFF8C00FF),
+    ("pink", 0xFF00FFFF),
+    ("red", 0xFF0000FF),
+    ("teal", 0x00FFFFFF),
+    ("white", 0xFFFFFFFF),
+    ("yellow", 0xFFFF00FF),
+];
+
+/// Recognized color names with no extractable RGB value (the `transparent` alias) (lowercased).
+pub static LEGACY_COLOR_NAMES: &[&str] = &["transparent"];

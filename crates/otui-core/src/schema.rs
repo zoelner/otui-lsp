@@ -320,15 +320,17 @@ pub fn is_known_event(name: &str) -> bool {
 }
 
 /// True if `name` is a named color the engine recognizes: a CSS-table color
-/// ([`crate::catalog::NAMED_COLORS`]) or a legacy engine color name / the `transparent` alias
+/// ([`crate::catalog::NAMED_COLORS`]), a legacy engine color static
+/// ([`crate::catalog::LEGACY_COLORS`]), or the `transparent` alias
 /// ([`crate::catalog::LEGACY_COLOR_NAMES`]). Case-insensitive, matching the engine's `css_lookup`,
-/// which lowercases the token before comparing. Both tables are machine-extracted from the engine's
+/// which lowercases the token before comparing. Every table is machine-extracted from the engine's
 /// color source, so a `false` here genuinely means the name is not an engine-recognized color.
 #[must_use]
 pub fn is_named_color(name: &str) -> bool {
     let needle = name.trim();
     crate::catalog::NAMED_COLORS
         .iter()
+        .chain(crate::catalog::LEGACY_COLORS)
         .any(|(n, _)| n.eq_ignore_ascii_case(needle))
         || contains_ascii_ci(crate::catalog::LEGACY_COLOR_NAMES, needle)
 }
@@ -336,11 +338,10 @@ pub fn is_named_color(name: &str) -> bool {
 /// The packed `0xRRGGBB` value of a CSS named color ([`crate::catalog::NAMED_COLORS`]), or `None`
 /// when `name` is not a valued CSS color. Case-insensitive, matching the engine's `css_lookup`.
 ///
-/// Legacy engine names with no CSS-table entry ([`crate::catalog::LEGACY_COLOR_NAMES`] — `alpha`,
-/// `darkPink`, `darkTeal`, `darkYellow`, `transparent`) return `None`: their RGB lives only in the
-/// engine's static `Color` constants, which the catalog does not extract, so they are recognized as
-/// names ([`is_named_color`]) but yield no swatch value. `transparent` is handled separately by
-/// [`color_value`] (it is fully transparent, not an RGB).
+/// This is the CSS-table lookup only; the engine's legacy color statics
+/// ([`crate::catalog::LEGACY_COLORS`], which carry alpha) and the `transparent` alias are resolved
+/// by [`color_value`] directly. A name absent from the CSS table returns `None` here even if it is a
+/// legacy color.
 #[must_use]
 pub fn named_color_value(name: &str) -> Option<u32> {
     let needle = name.trim();
@@ -397,9 +398,10 @@ pub fn is_valid_color(value: &str) -> bool {
 /// * **functional** `rgb()` / `rgba()` (byte-or-percent channels) and `hsl()` / `hsla()`
 ///   (converted via the engine's `hsl_to_rgb`), reusing the same validation as
 ///   [`is_valid_color`].
-/// * **named** — the `transparent` alias is fully transparent; any other name resolves through the
-///   CSS table ([`named_color_value`]). Legacy engine names with no CSS value yield `None` (no
-///   swatch); see [`named_color_value`].
+/// * **named** — the `transparent` alias is fully transparent; a legacy engine static
+///   ([`crate::catalog::LEGACY_COLORS`], alpha preserved) is tried next (the engine checks its
+///   statics before the CSS table, so e.g. `green` is the engine's bright `0x00ff00`); any other
+///   name resolves through the CSS table ([`named_color_value`]).
 #[must_use]
 pub fn color_value(value: &str) -> Option<Rgba> {
     let v = value.trim();
@@ -414,6 +416,14 @@ pub fn color_value(value: &str) -> Option<Rgba> {
     // Named colors. `transparent` is fully transparent (alpha 0), distinct from any RGB entry.
     if v.eq_ignore_ascii_case("transparent") {
         return Some(Rgba::from_u8(0, 0, 0, 0));
+    }
+    // Legacy engine statics first (engine precedence), unpacking the alpha-carrying 0xRRGGBBAA.
+    if let Some((_, rgba)) = crate::catalog::LEGACY_COLORS
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(v))
+    {
+        let [r, g, b, a] = unpack_rgba(*rgba);
+        return Some(Rgba::from_u8(r, g, b, a));
     }
     named_color_value(v).map(|rgb| {
         let [r, g, b] = unpack_rgb(rgb);
@@ -536,6 +546,16 @@ fn unpack_rgb(rgb: u32) -> [u8; 3] {
         ((rgb >> 16) & 0xFF) as u8,
         ((rgb >> 8) & 0xFF) as u8,
         (rgb & 0xFF) as u8,
+    ]
+}
+
+/// Unpack a packed `0xRRGGBBAA` (the legacy-color layout) into `[r, g, b, a]` bytes.
+fn unpack_rgba(rgba: u32) -> [u8; 4] {
+    [
+        ((rgba >> 24) & 0xFF) as u8,
+        ((rgba >> 16) & 0xFF) as u8,
+        ((rgba >> 8) & 0xFF) as u8,
+        (rgba & 0xFF) as u8,
     ]
 }
 
@@ -960,23 +980,29 @@ mod tests {
 
     #[test]
     fn named_color_values_from_catalog_case_insensitive() {
-        // A CSS-table color resolves to its packed RGB, case-insensitively.
+        // `red` is both a legacy static and a CSS name; legacy wins (engine precedence) — same RGB.
         assert_rgba(color_value("red").unwrap(), 255, 0, 0, 255);
         assert_rgba(color_value("RED").unwrap(), 255, 0, 0, 255);
+        // A CSS-only color resolves to its packed RGB (opaque), case-insensitively.
         assert_rgba(color_value("aliceblue").unwrap(), 0xF0, 0xF8, 0xFF, 255);
         // `transparent` is fully transparent.
         assert_rgba(color_value("transparent").unwrap(), 0, 0, 0, 0);
-        // A legacy-only name with no CSS value gets no swatch (recognized as a name, but valueless).
+        // Legacy engine statics now resolve (alpha preserved). `darkPink` is legacy-only; `alpha` is
+        // the fully-transparent legacy static.
         assert!(is_named_color("darkPink"));
-        assert!(color_value("darkPink").is_none());
-        assert!(color_value("alpha").is_none());
+        assert_rgba(color_value("darkPink").unwrap(), 0x80, 0x00, 0x80, 255);
+        assert_rgba(color_value("alpha").unwrap(), 0, 0, 0, 0);
+        // Engine precedence: legacy `green` is bright 0x00ff00, NOT the darker CSS `green` (0x008000).
+        assert_rgba(color_value("green").unwrap(), 0, 255, 0, 255);
     }
 
     #[test]
     fn named_color_value_lookup() {
+        // `named_color_value` is the CSS-table lookup only (packed 0xRRGGBB), independent of the
+        // legacy statics.
         assert_eq!(named_color_value("red"), Some(0xFF0000));
         assert_eq!(named_color_value("AliceBlue"), Some(0xF0F8FF));
-        assert_eq!(named_color_value("darkPink"), None);
+        assert_eq!(named_color_value("darkPink"), None); // legacy-only, not in CSS table
         assert_eq!(named_color_value("notacolor"), None);
     }
 
@@ -1115,6 +1141,24 @@ mod tests {
             crate::catalog::NAMED_COLORS.len() >= 140,
             "expected the full CSS named-color table (~150), got {}",
             crate::catalog::NAMED_COLORS.len()
+        );
+        // The color-typed property set is non-empty and contains the main `color` tag plus a
+        // `border-color*` family member (the value-validation work confirmed these are color-parsed).
+        assert!(!crate::catalog::COLOR_PROPERTIES.is_empty());
+        assert!(crate::catalog::COLOR_PROPERTIES.contains(&"color"));
+        assert!(crate::catalog::COLOR_PROPERTIES.contains(&"border-color"));
+        // Every color-typed tag is also a known property.
+        for tag in crate::catalog::COLOR_PROPERTIES {
+            assert!(
+                is_known_property(tag),
+                "color property `{tag}` should be in PROPERTIES"
+            );
+        }
+        // The legacy color statics were extracted with values (alpha-carrying).
+        assert!(
+            crate::catalog::LEGACY_COLORS.len() >= 15,
+            "expected the legacy engine color statics, got {}",
+            crate::catalog::LEGACY_COLORS.len()
         );
     }
 
