@@ -340,6 +340,26 @@ pub fn is_valid_color(value: &str) -> bool {
     parse_color(value).is_some()
 }
 
+/// True if `name` is a syntactically valid OTML identifier — the shape the grammar's `IDENT` rule
+/// accepts for a `style_name` / `property_key` / id token: `/[A-Za-z_][A-Za-z0-9_\-]*/`.
+///
+/// The rule is: **non-empty**, a leading ASCII letter or `_` (a digit or `-` may *not* start a
+/// name), then only ASCII letters, digits, `_` or `-`. Anything containing whitespace, `:`, `.`,
+/// `<`, `,`, or any other punctuation is rejected. Used to validate a proposed rename before
+/// rewriting occurrences: a new name that could not be re-parsed as an identifier would silently
+/// break the document, so a bad rename must be refused rather than applied.
+#[must_use]
+pub fn is_valid_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false; // empty is never a valid identifier
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 // --- internal helpers -------------------------------------------------------------------------
 
 /// Case-insensitive (ASCII) membership test against a `&[&str]` whose entries are the canonical
@@ -675,5 +695,40 @@ mod tests {
             "expected the full CSS named-color table (~150), got {}",
             crate::catalog::NAMED_COLORS.len()
         );
+    }
+
+    #[test]
+    fn valid_identifiers_are_accepted() {
+        // A leading letter or `_`, then letters/digits/`_`/`-` — the grammar's IDENT shape.
+        for name in [
+            "Panel",
+            "MyPanel",
+            "_hidden",
+            "a",
+            "A1",
+            "with-dash",
+            "mix_of-3",
+        ] {
+            assert!(is_valid_identifier(name), "`{name}` should be valid");
+        }
+    }
+
+    #[test]
+    fn invalid_identifiers_are_rejected() {
+        // Empty, digit/`-` start, or containing whitespace / `:` / `.` / `<` / other punctuation.
+        for name in [
+            "",
+            "1abc",
+            "-abc",
+            "has space",
+            "a:b",
+            "a.b",
+            "a<b",
+            "a,b",
+            "a/b",
+            "café",
+        ] {
+            assert!(!is_valid_identifier(name), "`{name}` should be rejected");
+        }
     }
 }

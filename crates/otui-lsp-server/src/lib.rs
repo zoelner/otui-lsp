@@ -32,11 +32,12 @@ use tower_lsp::lsp_types::{
     FoldingRangeProviderCapability, GotoDefinitionParams, GotoDefinitionResponse, Hover,
     HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
     InitializedParams, Location, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf,
-    PositionEncodingKind, ReferenceParams, SemanticTokens, SemanticTokensFullOptions,
-    SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SymbolInformation,
-    SymbolKind, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Url,
-    WorkDoneProgressOptions, WorkspaceEdit, WorkspaceSymbolParams,
+    PositionEncodingKind, PrepareRenameResponse, ReferenceParams, RenameOptions, RenameParams,
+    SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
+    SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
+    SymbolInformation, SymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextEdit, Url, WorkDoneProgressOptions, WorkspaceEdit,
+    WorkspaceSymbolParams,
 };
 use tower_lsp::{Client, LanguageServer};
 
@@ -213,9 +214,25 @@ fn classify_reference_target(
     text: &str,
     offset: usize,
 ) -> Option<ReferenceTarget> {
-    // Cursor on a base → the referenced style name.
+    classify_rename_target(service, text, offset).map(|(target, _span)| target)
+}
+
+/// Like [`classify_reference_target`], but also returns the byte span of the exact name/id token
+/// under the cursor — what `textDocument/prepareRename` echoes back so the client pre-selects the
+/// symbol to edit.
+///
+/// This is the single classifier both `references` and `rename` drive (via
+/// [`classify_reference_target`] for the former), so the two features always agree on what the cursor
+/// is on. The returned span is the base token (`X < Base`), the declared-name token (`Name < Base`),
+/// or the id token (`id:` value / `<id>.edge` prefix) respectively.
+fn classify_rename_target(
+    service: &OtuiService,
+    text: &str,
+    offset: usize,
+) -> Option<(ReferenceTarget, ByteSpan)> {
+    // Cursor on a base → the referenced style name; its span is the base token.
     if let Some(base_ref) = service.base_reference_at(text, offset) {
-        return Some(ReferenceTarget::StyleName(base_ref.name));
+        return Some((ReferenceTarget::StyleName(base_ref.name), base_ref.span));
     }
     // Cursor on a top-level `style_header`'s declared name → that style name. `base_span.is_some()`
     // distinguishes a real `style_header` (always has a base) from a bare `container` (base `None`),
@@ -223,13 +240,13 @@ fn classify_reference_target(
     if let Some(header) = service.style_header_at(text, offset) {
         let on_name = header.name_span.start <= offset && offset < header.name_span.end;
         if header.base_span.is_some() && on_name {
-            return Some(ReferenceTarget::StyleName(header.name));
+            return Some((ReferenceTarget::StyleName(header.name), header.name_span));
         }
     }
-    // Cursor on an `id:` value or an anchor-target id → that id.
+    // Cursor on an `id:` value or an anchor-target id → that id; its span is the id token.
     service
         .id_at(text, offset)
-        .map(|id_ref| ReferenceTarget::Id(id_ref.id))
+        .map(|id_ref| (ReferenceTarget::Id(id_ref.id), id_ref.span))
 }
 
 /// Collect the LSP [`Location`]s answering a `textDocument/references` request for `target` (spec
@@ -301,6 +318,98 @@ fn collect_references(
         }
     }
     out
+}
+
+/// The JSON-RPC error returned when a `textDocument/rename` carries a `new_name` that is not a valid
+/// OTML identifier (spec §rename). Rewriting occurrences with a name the grammar could not re-parse
+/// would silently corrupt the document, so a bad rename is rejected rather than applied.
+fn invalid_identifier_error(new_name: &str) -> tower_lsp::jsonrpc::Error {
+    tower_lsp::jsonrpc::Error::invalid_params(format!(
+        "`{new_name}` is not a valid OTML name: it must be non-empty, start with a letter or `_`, \
+         and contain only letters, digits, `_` or `-`."
+    ))
+}
+
+/// Build the [`WorkspaceEdit`] that renames `target` to `new_name` (spec §rename), or `None` when
+/// there is nothing to rename.
+///
+/// * **Validation.** `new_name` must be a valid OTML identifier (grammar `IDENT`, via
+///   [`is_valid_identifier`](otui_core::schema::is_valid_identifier)); otherwise an
+///   `Err(invalid_params)` is returned — a broken name must never be written into the document.
+/// * **Style name.** Workspace-global: every open document's declaration(s) **and** base references
+///   are rewritten. Unlike `references`' `include_declaration`, a rename **always** rewrites the
+///   definition. A native `UI*` base with no user definition in the index has no declaration to
+///   rename, so it yields `Ok(None)` (mirroring [`collect_references`]).
+/// * **Id.** Document-local: only the current document's id declaration + anchor references are
+///   rewritten. Ids repeat across files, so a cross-document id rename is ambiguous and out of scope
+///   (mirroring `references`).
+///
+/// Collision-checking (the new name already existing) is deliberately out of scope — this performs
+/// the purely textual rewrite. Kept as a `Client`-free function over borrowed state so it is
+/// unit-testable without a live `Client` (mirroring [`collect_references`]).
+fn build_rename_edits(
+    target: &ReferenceTarget,
+    current_uri: &Url,
+    documents: &HashMap<Url, Document>,
+    index: &StyleIndex,
+    service: &OtuiService,
+    new_name: &str,
+    encoding: PositionEncoding,
+) -> RpcResult<Option<WorkspaceEdit>> {
+    if !otui_core::schema::is_valid_identifier(new_name) {
+        return Err(invalid_identifier_error(new_name));
+    }
+
+    let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+    match target {
+        ReferenceTarget::StyleName(name) => {
+            // A native `UI*` base absent from the index has no user declaration to rename.
+            if is_native_base(name) && index.lookup(name).is_empty() {
+                return Ok(None);
+            }
+            for (uri, doc) in documents {
+                let occ = service.style_name_occurrences(&doc.text, name);
+                let line_index = LineIndex::new(&doc.text);
+                // Declarations first, then base refs — a rename rewrites *both* (the definition is
+                // always included).
+                let edits: Vec<TextEdit> = occ
+                    .declarations
+                    .iter()
+                    .chain(occ.base_refs.iter())
+                    .map(|span| convert::text_edit_of(*span, new_name, &line_index, encoding))
+                    .collect();
+                if !edits.is_empty() {
+                    changes.insert(uri.clone(), edits);
+                }
+            }
+        }
+        ReferenceTarget::Id(id) => {
+            let Some(doc) = documents.get(current_uri) else {
+                return Ok(None);
+            };
+            let occ = service.id_occurrences(&doc.text, id);
+            let line_index = LineIndex::new(&doc.text);
+            let mut edits = Vec::new();
+            if let Some(span) = occ.declaration {
+                edits.push(convert::text_edit_of(span, new_name, &line_index, encoding));
+            }
+            for span in occ.anchor_refs {
+                edits.push(convert::text_edit_of(span, new_name, &line_index, encoding));
+            }
+            if !edits.is_empty() {
+                changes.insert(current_uri.clone(), edits);
+            }
+        }
+    }
+
+    if changes.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(WorkspaceEdit {
+        changes: Some(changes),
+        document_changes: None,
+        change_annotations: None,
+    }))
 }
 
 /// Collect the workspace's `Name < Base` style definitions that match `query`, as a flat
@@ -556,6 +665,12 @@ impl LanguageServer for Backend {
                 // References: uses of a style name (workspace-global) or an `id:` (document-local)
                 // (spec §5.4).
                 references_provider: Some(OneOf::Left(true)),
+                // Rename: a style name (workspace-global) or an `id:` (document-local), with
+                // client-side prepare support so the editor pre-selects the token (spec §rename).
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: WorkDoneProgressOptions::default(),
+                })),
                 // Hover: style names and `Name < Base` bases (spec §5.5).
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 // Formatting: whole-document, conservative whitespace normalization (spec §8).
@@ -751,6 +866,88 @@ impl LanguageServer for Backend {
             encoding,
         );
         Ok(Some(locations))
+    }
+
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> RpcResult<Option<PrepareRenameResponse>> {
+        let uri = params.text_document.uri;
+        let position = params.position;
+        let encoding = self.encoding();
+
+        // Read the request document's text (unknown document → not renameable). Cloned so the
+        // documents lock is released before we take the index lock, keeping the two locks unnested.
+        let Some(text) = self
+            .documents
+            .read()
+            .await
+            .get(&uri)
+            .map(|doc| doc.text.clone())
+        else {
+            return Ok(None);
+        };
+
+        // Map the cursor Position to a byte offset, then classify the token under it. A cursor on
+        // neither a style name nor an id is not renameable here → `None`.
+        let line_index = LineIndex::new(&text);
+        let offset = line_index.offset_at(position, encoding);
+        let Some((target, span)) = classify_rename_target(&self.service, &text, offset) else {
+            return Ok(None);
+        };
+
+        // A native `UI*` base has no user declaration to rename → not user-renameable, so report it
+        // as unrenameable (`None`) rather than pre-selecting a token that a rename would refuse.
+        if let ReferenceTarget::StyleName(name) = &target {
+            let index = self.style_index.read().await;
+            if is_native_base(name) && index.lookup(name).is_empty() {
+                return Ok(None);
+            }
+        }
+
+        // Echo the exact name/id token range so the client pre-selects it for editing.
+        let range = line_index.range(span.start, span.end, encoding);
+        Ok(Some(PrepareRenameResponse::Range(range)))
+    }
+
+    async fn rename(&self, params: RenameParams) -> RpcResult<Option<WorkspaceEdit>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let new_name = params.new_name;
+        let encoding = self.encoding();
+
+        // Read the request document's text (unknown document → nothing to rename). Cloned so the
+        // documents lock is released before we take the index lock, keeping the two locks unnested.
+        let Some(text) = self
+            .documents
+            .read()
+            .await
+            .get(&uri)
+            .map(|doc| doc.text.clone())
+        else {
+            return Ok(None);
+        };
+
+        // Classify what the cursor is on; a cursor on neither a style name nor an id has nothing to
+        // rename.
+        let offset = LineIndex::new(&text).offset_at(position, encoding);
+        let Some((target, _span)) = classify_rename_target(&self.service, &text, offset) else {
+            return Ok(None);
+        };
+
+        // Build the edits: style names fan out across the workspace; ids stay document-local. An
+        // invalid `new_name` surfaces as a JSON-RPC error (never a broken edit).
+        let index = self.style_index.read().await;
+        let documents = self.documents.read().await;
+        build_rename_edits(
+            &target,
+            &uri,
+            &documents,
+            &index,
+            &self.service,
+            &new_name,
+            encoding,
+        )
     }
 
     async fn symbol(
@@ -1360,6 +1557,188 @@ mod tests {
             PositionEncoding::Utf16,
         );
         assert_eq!(locs.len(), 2);
+    }
+
+    #[test]
+    fn prepare_rename_target_gives_the_token_range_for_a_style_name() {
+        let svc = OtuiService::new();
+        let src = "Child < MyPanel\n";
+        // Cursor on the base `MyPanel`: the target is the style name and the span is that token.
+        let off = src.find("MyPanel").expect("present");
+        let (target, span) = classify_rename_target(&svc, src, off).expect("renameable");
+        assert_eq!(target, ReferenceTarget::StyleName("MyPanel".to_owned()));
+        assert_eq!(&src[span.start..span.end], "MyPanel");
+        // Cursor on the declared name `Child`: the target is that style name, span the name token.
+        let off = src.find("Child").expect("present");
+        let (target, span) = classify_rename_target(&svc, src, off).expect("renameable");
+        assert_eq!(target, ReferenceTarget::StyleName("Child".to_owned()));
+        assert_eq!(&src[span.start..span.end], "Child");
+    }
+
+    #[test]
+    fn prepare_rename_target_gives_the_token_range_for_an_id() {
+        let svc = OtuiService::new();
+        let src = "Panel\n  id: header\n";
+        let off = src.find("header").expect("present");
+        let (target, span) = classify_rename_target(&svc, src, off).expect("renameable");
+        assert_eq!(target, ReferenceTarget::Id("header".to_owned()));
+        assert_eq!(&src[span.start..span.end], "header");
+    }
+
+    #[test]
+    fn prepare_rename_target_is_none_off_symbol() {
+        let svc = OtuiService::new();
+        // A property value is neither a style name nor an id → not renameable.
+        let src = "Panel\n  width: 10\n";
+        let off = src.find("10").expect("present");
+        assert!(classify_rename_target(&svc, src, off).is_none());
+    }
+
+    #[test]
+    fn rename_style_name_rewrites_declaration_and_every_base_across_docs() {
+        // `MyPanel` is declared in one doc and used as a base in two others.
+        let (index, docs) = workspace(&[
+            ("file:///defs.otui", "MyPanel < UIWidget\n"),
+            ("file:///a.otui", "ChildA < MyPanel\n"),
+            ("file:///b.otui", "ChildB < MyPanel\n"),
+        ]);
+        let svc = OtuiService::new();
+        let uri = Url::parse("file:///a.otui").expect("uri");
+        let target = ReferenceTarget::StyleName("MyPanel".to_owned());
+        let edit = build_rename_edits(
+            &target,
+            &uri,
+            &docs,
+            &index,
+            &svc,
+            "Renamed",
+            PositionEncoding::Utf16,
+        )
+        .expect("valid new name")
+        .expect("some edits");
+        let changes = edit.changes.expect("changes keyed by URI");
+        // All three docs are edited: the declaration in defs, plus a base ref in each of a/b.
+        assert_eq!(changes.len(), 3);
+        // The declaration is always rewritten (a rename includes the definition).
+        let defs = &changes[&Url::parse("file:///defs.otui").expect("uri")];
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].new_text, "Renamed");
+        assert_eq!(defs[0].range.start, Position::new(0, 0));
+        assert_eq!(defs[0].range.end, Position::new(0, 7));
+        // Each base reference (`ChildX < MyPanel`) is rewritten at columns 9..16.
+        for name in ["file:///a.otui", "file:///b.otui"] {
+            let e = &changes[&Url::parse(name).expect("uri")];
+            assert_eq!(e.len(), 1);
+            assert_eq!(e[0].new_text, "Renamed");
+            assert_eq!(e[0].range.start, Position::new(0, 9));
+            assert_eq!(e[0].range.end, Position::new(0, 16));
+        }
+    }
+
+    #[test]
+    fn rename_id_is_document_local() {
+        // The current doc declares `header` and references it once; another doc also declares
+        // `header` but must not be touched (ids are per-document).
+        let (index, docs) = workspace(&[
+            (
+                "file:///a.otui",
+                "Panel\n  id: header\nOther\n  anchors.top: header.bottom\n",
+            ),
+            ("file:///b.otui", "Elsewhere\n  id: header\n"),
+        ]);
+        let svc = OtuiService::new();
+        let uri = Url::parse("file:///a.otui").expect("uri");
+        let target = ReferenceTarget::Id("header".to_owned());
+        let edit = build_rename_edits(
+            &target,
+            &uri,
+            &docs,
+            &index,
+            &svc,
+            "footer",
+            PositionEncoding::Utf16,
+        )
+        .expect("valid new name")
+        .expect("some edits");
+        let changes = edit.changes.expect("changes keyed by URI");
+        // Only a.otui is edited; b.otui's identically-named id is left alone.
+        assert_eq!(changes.len(), 1);
+        let e = &changes[&uri];
+        // The declaration + the single anchor reference are both rewritten.
+        assert_eq!(e.len(), 2);
+        assert!(e.iter().all(|t| t.new_text == "footer"));
+    }
+
+    #[test]
+    fn rename_rejects_an_invalid_new_name() {
+        let (index, docs) = workspace(&[("file:///a.otui", "MyPanel < UIWidget\n")]);
+        let svc = OtuiService::new();
+        let uri = Url::parse("file:///a.otui").expect("uri");
+        let target = ReferenceTarget::StyleName("MyPanel".to_owned());
+        // A name containing a space is not a valid identifier → a JSON-RPC error, never an edit.
+        let err = build_rename_edits(
+            &target,
+            &uri,
+            &docs,
+            &index,
+            &svc,
+            "bad name",
+            PositionEncoding::Utf16,
+        )
+        .expect_err("an invalid new name is rejected");
+        assert_eq!(err.code, tower_lsp::jsonrpc::ErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn rename_of_a_native_base_is_refused() {
+        // `UIWidget` is a native built-in with no user definition → no declaration to rename.
+        let (index, docs) = workspace(&[("file:///a.otui", "MyPanel < UIWidget\n")]);
+        let svc = OtuiService::new();
+        let uri = Url::parse("file:///a.otui").expect("uri");
+        let target = ReferenceTarget::StyleName("UIWidget".to_owned());
+        let out = build_rename_edits(
+            &target,
+            &uri,
+            &docs,
+            &index,
+            &svc,
+            "Renamed",
+            PositionEncoding::Utf16,
+        )
+        .expect("a valid new name is not itself an error");
+        assert!(out.is_none(), "a native base has nothing to rename");
+    }
+
+    #[test]
+    fn full_flow_from_cursor_to_rename_edits() {
+        // Position → offset → classify → build, the same path the `rename` handler drives.
+        let (index, docs) = workspace(&[
+            ("file:///defs.otui", "MyPanel < UIWidget\n"),
+            ("file:///use.otui", "Child < MyPanel\n"),
+        ]);
+        let svc = OtuiService::new();
+        let request_text = "Child < MyPanel\n";
+        // Cursor on the `M` of `MyPanel` (line 0, column 8).
+        let position = Position::new(0, 8);
+        let offset = LineIndex::new(request_text).offset_at(position, PositionEncoding::Utf16);
+        let (target, span) =
+            classify_rename_target(&svc, request_text, offset).expect("renameable");
+        assert_eq!(target, ReferenceTarget::StyleName("MyPanel".to_owned()));
+        assert_eq!(&request_text[span.start..span.end], "MyPanel");
+        let uri = Url::parse("file:///use.otui").expect("uri");
+        let edit = build_rename_edits(
+            &target,
+            &uri,
+            &docs,
+            &index,
+            &svc,
+            "Renamed",
+            PositionEncoding::Utf16,
+        )
+        .expect("valid new name")
+        .expect("some edits");
+        // Both the defining doc and the using doc are rewritten.
+        assert_eq!(edit.changes.expect("changes").len(), 2);
     }
 
     /// Names of the symbols in `syms`, sorted for order-independent assertions (the index iterates
