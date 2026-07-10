@@ -8,9 +8,9 @@
 
 use std::error::Error;
 
-use lsp_server::{Connection, Message, Notification};
+use lsp_server::{Connection, Notification};
 use lsp_types::InitializeParams;
-use otui_lsp_server::Backend;
+use otui_lsp_server::{serve, Backend};
 
 fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
     // The transport: a pair of crossbeam channels wired to stdin/stdout by dedicated I/O threads.
@@ -36,25 +36,11 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
 
     // Single-threaded main loop: one message at a time (correct and simplest for our low
     // message-rate server). The only offloaded work is the initial workspace scan, spawned onto its
-    // own `std::thread` inside the `initialized` handler.
-    for message in &connection.receiver {
-        match message {
-            Message::Request(request) => {
-                // `handle_shutdown` answers a `shutdown` request and then blocks for the client's
-                // `exit`, returning `true` once seen; we break cleanly (process exit 0).
-                if connection.handle_shutdown(&request)? {
-                    break;
-                }
-                let response = backend.handle_request(request);
-                connection.sender.send(Message::Response(response))?;
-            }
-            Message::Notification(note) => backend.handle_notification(note),
-            // A `Message::Response` is the client's reply to one of OUR server→client requests
-            // (the `client/registerCapability` acks); we do not track them.
-            Message::Response(_) => {}
-        }
-    }
+    // own `std::thread` inside the `initialized` handler. `serve` runs until the LSP lifecycle ends
+    // and reports how to terminate: a clean `shutdown` → `exit` exits 0, a standalone `exit` (or a
+    // dropped connection) exits 1, as the spec requires.
+    let termination = serve(&backend, &connection)?;
 
     io_threads.join()?;
-    Ok(())
+    std::process::exit(termination.exit_code());
 }

@@ -27,7 +27,9 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crossbeam_channel::Sender;
 use lang_api::{ByteSpan, LanguageService};
-use lsp_server::{ErrorCode, ExtractError, Message, Notification, Request, RequestId, Response};
+use lsp_server::{
+    Connection, ErrorCode, ExtractError, Message, Notification, Request, RequestId, Response,
+};
 use lsp_types::request::{
     GotoImplementationParams, GotoImplementationResponse, GotoTypeDefinitionParams,
     GotoTypeDefinitionResponse,
@@ -112,6 +114,18 @@ pub struct Backend {
     /// folder — the server then falls back to open-docs-only indexing. Guarded by a [`Mutex`]
     /// because it is written once and read once.
     roots: Mutex<Vec<Uri>>,
+    /// Serializes the "check whether a URI is open, then write its index entry" critical section so
+    /// an open buffer's index always wins over stale disk text. The background scan
+    /// ([`run_initialized`](Self::run_initialized)) runs concurrently with the main loop, and both
+    /// it and `did_open`/`did_change` do a check-then-write against [`documents`](Self::documents) +
+    /// [`style_index`](Self::style_index)/[`disk_texts`](Self::disk_texts). Without a shared guard a
+    /// `did_open` could land *between* the scan's open-check and its disk write and be clobbered.
+    /// Both sides take this dedicated guard across their whole check-and-write, so they can never
+    /// interleave — either the buffer index wins or the disk index writes, never a torn mix. It is a
+    /// separate lock (not [`documents`](Self::documents)) so the data locks stay short-lived and
+    /// unnested; the guard is always the outermost lock, so no opposing nesting can deadlock.
+    /// [`Arc`] so the scan thread holds a clone.
+    reindex_guard: Arc<Mutex<()>>,
 }
 
 /// Largest `.otui` file the workspace scan / watcher will read into the index. A style file is a few
@@ -132,6 +146,7 @@ impl Backend {
             style_index: Arc::new(RwLock::new(StyleIndex::new())),
             disk_texts: Arc::new(RwLock::new(HashMap::new())),
             roots: Mutex::new(workspace_roots(params)),
+            reindex_guard: Arc::new(Mutex::new(())),
         }
     }
 
@@ -207,6 +222,30 @@ impl Backend {
             .write()
             .expect("style_index lock poisoned")
             .set_document(DocId::from(uri.to_string()), defs);
+    }
+
+    /// Record `uri`'s open buffer (`text`/`version`) and re-index its styles as one atomic
+    /// critical section, held under [`reindex_guard`](Self::reindex_guard).
+    ///
+    /// Shared by `did_open`/`did_change`. Taking the guard across BOTH the [`documents`](Self::documents)
+    /// insert and the [`style_index`](Self::style_index) write closes the race with the background
+    /// workspace scan: the scan holds the same guard across its open-check + disk-index write, so it
+    /// can never observe "not open" and then overwrite this buffer's index entry with stale disk
+    /// text. The individual data locks are still taken and released one at a time (never nested), and
+    /// the guard is always the outermost lock, so the ordering stays deadlock-free.
+    fn set_open_document(&self, uri: &Uri, text: &str, version: i32) {
+        let _guard = self.reindex_guard.lock().expect("reindex_guard poisoned");
+        {
+            let mut docs = self.documents.write().expect("documents lock poisoned");
+            docs.insert(
+                uri.clone(),
+                Document {
+                    text: text.to_owned(),
+                    version,
+                },
+            );
+        }
+        self.reindex_styles(uri, text);
     }
 
     /// The unified text view every span→range aggregator resolves against: the OPEN buffers overlaid
@@ -1403,6 +1442,7 @@ impl Backend {
             let style_index = Arc::clone(&self.style_index);
             let disk_texts = Arc::clone(&self.disk_texts);
             let documents = Arc::clone(&self.documents);
+            let reindex_guard = Arc::clone(&self.reindex_guard);
             let sender = self.sender.clone();
             std::thread::spawn(move || {
                 let entries = scan_workspace(&roots);
@@ -1410,6 +1450,10 @@ impl Backend {
                 let service = OtuiService::new();
                 let mut indexed = 0usize;
                 for (uri, text) in entries {
+                    // Hold the reindex guard across the open-check AND the disk-index writes so a
+                    // concurrent `did_open`/`did_change` cannot slip between them and be clobbered by
+                    // stale disk text: an open buffer's index entry always wins (see `reindex_guard`).
+                    let _guard = reindex_guard.lock().expect("reindex_guard poisoned");
                     // An open buffer is authoritative: if the file was opened while the scan ran, do
                     // not overwrite its buffer-derived index entry with disk text.
                     if documents
@@ -1950,17 +1994,9 @@ impl Backend {
         let doc = params.text_document;
         let uri = doc.uri;
         let version = doc.version;
-        {
-            let mut docs = self.documents.write().expect("documents lock poisoned");
-            docs.insert(
-                uri.clone(),
-                Document {
-                    text: doc.text.clone(),
-                    version,
-                },
-            );
-        }
-        self.reindex_styles(&uri, &doc.text);
+        // Insert the buffer and re-index atomically w.r.t. the background scan (see
+        // `set_open_document`), so a scan in flight cannot clobber this open buffer's index entry.
+        self.set_open_document(&uri, &doc.text, version);
         self.publish(uri, &doc.text, version);
     }
 
@@ -1972,17 +2008,8 @@ impl Backend {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
         let text = change.text;
-        {
-            let mut docs = self.documents.write().expect("documents lock poisoned");
-            docs.insert(
-                uri.clone(),
-                Document {
-                    text: text.clone(),
-                    version,
-                },
-            );
-        }
-        self.reindex_styles(&uri, &text);
+        // Same atomic buffer-insert + re-index as `did_open` (see `set_open_document`).
+        self.set_open_document(&uri, &text, version);
         self.publish(uri, &text, version);
     }
 
@@ -2009,6 +2036,64 @@ impl Backend {
         // Clear diagnostics for the closed document.
         self.send_diagnostics(uri, Vec::new(), None);
     }
+}
+
+/// The exit status the server process should terminate with, per the LSP lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Termination {
+    /// A clean `shutdown` request followed by `exit`: exit the process with status 0.
+    Shutdown,
+    /// An `exit` notification with no preceding `shutdown` (or the peer closing the connection):
+    /// the LSP spec requires terminating with a non-zero status (1).
+    Aborted,
+}
+
+impl Termination {
+    /// The process exit code for this termination (`0` clean, `1` aborted).
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Termination::Shutdown => 0,
+            Termination::Aborted => 1,
+        }
+    }
+}
+
+/// Run the server's blocking, single-threaded receive loop until the LSP lifecycle ends, returning
+/// how the process should terminate. Shared by the `otui-lsp` binary and the transport test.
+///
+/// [`Connection::handle_shutdown`] answers a `shutdown` request and then blocks for the client's
+/// paired `exit`, so the clean `shutdown` → `exit` handshake resolves there and yields
+/// [`Termination::Shutdown`] (exit 0). A bare `exit` notification reaching the notification arm is
+/// therefore a *standalone* exit (no prior `shutdown`); per the spec the server must terminate with
+/// a non-zero status, so we stop and report [`Termination::Aborted`] (exit 1) instead of silently
+/// dropping it in `handle_notification`. A closed receiver (peer hung up) is likewise abnormal.
+pub fn serve(
+    backend: &Backend,
+    connection: &Connection,
+) -> Result<Termination, Box<dyn std::error::Error + Sync + Send>> {
+    for message in &connection.receiver {
+        match message {
+            Message::Request(request) => {
+                if connection.handle_shutdown(&request)? {
+                    return Ok(Termination::Shutdown);
+                }
+                let response = backend.handle_request(request);
+                connection.sender.send(Message::Response(response))?;
+            }
+            Message::Notification(note) => {
+                // A standalone `exit` (the paired `shutdown` → `exit` is consumed by
+                // `handle_shutdown` above) must terminate the server with a non-zero status.
+                if note.method == "exit" {
+                    return Ok(Termination::Aborted);
+                }
+                backend.handle_notification(note);
+            }
+            // A `Message::Response` is the client's reply to one of OUR server→client requests
+            // (the `client/registerCapability` acks); we do not track them.
+            Message::Response(_) => {}
+        }
+    }
+    Ok(Termination::Aborted)
 }
 
 #[cfg(test)]

@@ -11,7 +11,7 @@ use lsp_types::{
     TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Uri,
     WorkDoneProgressParams,
 };
-use otui_lsp_server::Backend;
+use otui_lsp_server::{serve, Backend, Termination};
 
 /// Read from the client end until the [`Response`] for `id` arrives, skipping anything else the
 /// server pushed in the meantime (log notifications, `client/registerCapability` requests, …).
@@ -24,44 +24,58 @@ fn recv_response(client: &Connection, id: &RequestId) -> Response {
     }
 }
 
+/// The server side, mirroring the binary's `main`: handshake, drive post-init once, then run the
+/// shared [`serve`] receive loop. Returns how the loop terminated so the test can assert the exit
+/// classification (clean shutdown vs. standalone exit).
+fn run_server(server: Connection) -> Termination {
+    let (id, params) = server.initialize_start().expect("initialize_start");
+    let init_params: InitializeParams =
+        serde_json::from_value(params).expect("deserialize InitializeParams");
+    let backend = Backend::new(server.sender.clone(), &init_params);
+    let result = serde_json::to_value(backend.initialize_result()).expect("serialize result");
+    server
+        .initialize_finish(id, result)
+        .expect("initialize_finish");
+
+    // `initialize_finish` consumed the `initialized` notification; drive post-init work once.
+    backend.handle_notification(Notification {
+        method: "initialized".to_owned(),
+        params: serde_json::Value::Null,
+    });
+
+    serve(&backend, &server).expect("serve loop")
+}
+
+/// Drive the client half of the handshake: `initialize` request/response, then `initialized`.
+fn client_handshake(client: &Connection) {
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(1),
+            "initialize".to_owned(),
+            InitializeParams::default(),
+        )))
+        .expect("send initialize");
+    let init_resp = recv_response(client, &RequestId::from(1));
+    assert!(
+        init_resp.error.is_none(),
+        "initialize errored: {init_resp:?}"
+    );
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "initialized".to_owned(),
+            InitializedParams {},
+        )))
+        .expect("send initialized");
+}
+
 #[test]
 fn memory_connection_drives_initialize_open_hover_shutdown() {
     let (server, client) = Connection::memory();
 
-    // The server side mirrors the binary's `main`: handshake, then a single-threaded receive loop.
-    let server_thread = thread::spawn(move || {
-        let (id, params) = server.initialize_start().expect("initialize_start");
-        let init_params: InitializeParams =
-            serde_json::from_value(params).expect("deserialize InitializeParams");
-        let backend = Backend::new(server.sender.clone(), &init_params);
-        let result = serde_json::to_value(backend.initialize_result()).expect("serialize result");
-        server
-            .initialize_finish(id, result)
-            .expect("initialize_finish");
-
-        // `initialize_finish` consumed the `initialized` notification; drive post-init work once.
-        backend.handle_notification(Notification {
-            method: "initialized".to_owned(),
-            params: serde_json::Value::Null,
-        });
-
-        for message in &server.receiver {
-            match message {
-                Message::Request(request) => {
-                    if server.handle_shutdown(&request).expect("handle_shutdown") {
-                        break;
-                    }
-                    let response = backend.handle_request(request);
-                    server
-                        .sender
-                        .send(Message::Response(response))
-                        .expect("send response");
-                }
-                Message::Notification(note) => backend.handle_notification(note),
-                Message::Response(_) => {}
-            }
-        }
-    });
+    // The server side mirrors the binary's `main`: handshake, then the shared `serve` receive loop.
+    let server_thread = thread::spawn(move || run_server(server));
 
     // 1. initialize → expect an InitializeResult carrying our capabilities.
     client
@@ -157,5 +171,31 @@ fn memory_connection_drives_initialize_open_hover_shutdown() {
         )))
         .expect("send exit");
 
-    server_thread.join().expect("server thread joined");
+    // The clean `shutdown` → `exit` handshake terminates with status 0.
+    let termination = server_thread.join().expect("server thread joined");
+    assert_eq!(termination, Termination::Shutdown);
+    assert_eq!(termination.exit_code(), 0);
+}
+
+/// A standalone `exit` notification (no preceding `shutdown`) must terminate the loop and be
+/// classified as an abnormal exit (process status 1), never silently dropped.
+#[test]
+fn standalone_exit_terminates_with_nonzero_status() {
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+
+    client_handshake(&client);
+
+    // No `shutdown` first — send a bare `exit`. `serve` must stop and report an abnormal exit.
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "exit".to_owned(),
+            serde_json::Value::Null,
+        )))
+        .expect("send exit");
+
+    let termination = server_thread.join().expect("server thread joined");
+    assert_eq!(termination, Termination::Aborted);
+    assert_eq!(termination.exit_code(), 1);
 }
