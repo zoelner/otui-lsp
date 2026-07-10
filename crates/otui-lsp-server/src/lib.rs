@@ -1739,11 +1739,13 @@ impl Backend {
         let index = LineIndex::new(&text);
         let mut links = Vec::new();
         for PathRef { span, path } in self.service.document_links(&text) {
-            // Pure resolution → candidate filesystem paths; the `.exists()` I/O is the only fs work,
-            // kept thin here (a handful of links per document).
+            // Pure resolution → candidate filesystem paths; the `.is_file()` I/O is the only fs work,
+            // kept thin here (a handful of links per document). `is_file()` (not `exists()`) so a path
+            // resolving to a directory is not linked — a directory target isn't openable and would be
+            // the very dead link this feature avoids.
             let Some(target_path) = resolve_asset_candidates(&path, &doc_dir, &workspace_roots)
                 .into_iter()
-                .find(|candidate| candidate.exists())
+                .find(|candidate| candidate.is_file())
             else {
                 // No candidate resolves to an existing file → skip (no dead link).
                 continue;
@@ -4026,6 +4028,15 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let backend = Backend::new(tx, &InitializeParams::default());
         let uri = Uri::from_str("file:///nope.otui").expect("uri");
+        assert!(backend.document_link(link_params(&uri)).is_none());
+    }
+
+    #[test]
+    fn document_link_on_a_non_file_uri_is_none() {
+        // A document open under a non-`file://` scheme has no filesystem path, so links can't be
+        // resolved: `uri_to_file_path` returns None early and no links are produced.
+        let uri = Uri::from_str("untitled:Untitled-1").expect("uri");
+        let backend = backend_with_doc(&uri, "Panel\n  image-source: images/x.png\n", Vec::new());
         assert!(backend.document_link(link_params(&uri)).is_none());
     }
 }
