@@ -39,20 +39,26 @@
 //! end
 //! ```
 //!
-//! The scanner finds the `for <key>, … in pairs(styleNode)` loop variable and collects every
-//! `<key> == '<prop>'` (or `"<prop>"`, or the reversed `'<prop>' == <key>`) comparison in the
-//! method body.
+//! Two read forms inside the `onStyleApply` body are recognized (both are how a widget pulls a
+//! custom attribute out of the applied style):
+//!
+//! * the **equality chain** — `<key> == '<prop>'` (or `"<prop>"`, or the reversed
+//!   `'<prop>' == <key>`) over the `for <key>, … in pairs(styleNode)` loop variable; and
+//! * **direct style-node reads** — a `styleNode.<field>` field access (a non-hyphenated key, e.g.
+//!   `styleNode.options` on `UIComboBox`) or a `styleNode['<key>']` / `styleNode["<key>"]` index
+//!   access (which may be hyphenated, e.g. `styleNode['tab-spacing']` on `UIMoveableTabBar`). The
+//!   style-node parameter name is read from the `onStyleApply` signature, defaulting to `styleNode`.
 //!
 //! ## Deliberately not (yet) covered — the fidelity gap
 //!
-//! `onStyleApply` with an equality chain is the dominant but not the only way widgets read custom
-//! attributes. These are **not** recognized here, and are left for later widening as real false
-//! positives surface (see the module TODO):
+//! `onStyleApply` is the dominant but not the only place a widget reads custom attributes. These are
+//! **not** recognized here, and are left for later widening as real false positives surface (see the
+//! module TODO):
 //!
-//! * direct field/index reads — `styleNode.options`, `styleNode['tab-spacing']` — rather than an
-//!   `== '<prop>'` comparison (e.g. `UIComboBox`, `UIMoveableTabBar`);
 //! * custom attributes applied via `mergeStyle`/`applyStyle` elsewhere in the class;
-//! * a loop key variable that is compared indirectly (aliased through another local).
+//! * a style-node read routed through another local (the table aliased to a different variable);
+//! * the `onWidgetStyleApply` signal handler (a global `rootWidget` hook, not a widget method) and
+//!   C++-side `onStyleApply` overrides.
 //!
 //! Keeping the covered set explicit means the gap is visible rather than silently assumed complete.
 //!
@@ -203,15 +209,78 @@ fn starts_with_end_keyword(line: &str) -> bool {
 
 /// Collect the custom property literals from an `onStyleApply` body (the slice of lines from the
 /// `function …:onStyleApply` header through its closing marker).
+///
+/// Two read forms are recognized: the `<key> == '<prop>'` equality chain over the loop key
+/// variable, and direct reads of the style-node table — `<styleNode>.<field>` and
+/// `<styleNode>['<key>']`. Both are how a widget pulls a custom attribute out of the applied style.
 fn collect_props(body: &[&str]) -> BTreeSet<String> {
     let key_var = style_key_variable(body);
+    let node_var = body.first().map_or_else(
+        || "styleNode".to_owned(),
+        |header| style_node_variable(header),
+    );
     let mut props = BTreeSet::new();
     for line in body {
         if let Some(prop) = comparison_literal(line, &key_var) {
             props.insert(prop);
         }
+        collect_style_node_reads(line, &node_var, &mut props);
     }
     props
+}
+
+/// The style-node table parameter of an `onStyleApply` header, i.e. the `styleNode` in
+/// `function W:onStyleApply(styleName, styleNode)` — the second argument. Falls back to the
+/// conventional `styleNode` when the argument list cannot be read, so a direct read still resolves.
+fn style_node_variable(header: &str) -> String {
+    let default = || "styleNode".to_owned();
+    let Some(open) = header.find('(') else {
+        return default();
+    };
+    let Some(close_rel) = header[open..].find(')') else {
+        return default();
+    };
+    let args = &header[open + 1..open + close_rel];
+    // The style node is the second parameter (after the style name).
+    match args
+        .split(',')
+        .nth(1)
+        .and_then(|a| last_identifier(a.trim()))
+    {
+        Some(var) => var,
+        None => default(),
+    }
+}
+
+/// Collect every direct style-node read on `line` into `props`: a `<var>.<field>` field access
+/// contributes `<field>` (a non-hyphenated key), and a `<var>['<key>']` / `<var>["<key>"]` index
+/// access contributes the quoted key (which may be hyphenated). Only whole-word matches of `var`
+/// count, so `myStyleNode` does not match `styleNode`.
+fn collect_style_node_reads(line: &str, var: &str, props: &mut BTreeSet<String>) {
+    let mut search = 0;
+    while let Some(rel) = line[search..].find(var) {
+        let start = search + rel;
+        let end = start + var.len();
+        search = end;
+        // Whole-word match: the char before `var` must not be part of a longer identifier.
+        if line[..start].chars().next_back().is_some_and(is_ident_char) {
+            continue;
+        }
+        let rest = &line[end..];
+        if let Some(after_dot) = rest.strip_prefix('.') {
+            let field: String = after_dot
+                .chars()
+                .take_while(|&c| is_ident_char(c))
+                .collect();
+            if !field.is_empty() {
+                props.insert(field);
+            }
+        } else if let Some(after_bracket) = rest.strip_prefix('[') {
+            if let Some(key) = leading_string_literal(after_bracket.trim_start()) {
+                props.insert(key);
+            }
+        }
+    }
 }
 
 /// The loop key variable iterating `styleNode`, i.e. the `k` in `for k, v in pairs(styleNode)`.
@@ -646,6 +715,83 @@ end
 ";
         let defs = scan_widgets(src);
         assert_eq!(props(&defs[0]), ["real-prop"]);
+    }
+
+    #[test]
+    fn captures_direct_dot_field_reads() {
+        // The UIComboBox shape: `options`/`data` are read as direct fields (before and inside the
+        // loop), the rest through `name == '...'`. All are custom props.
+        let src = "\
+function UIComboBox:onStyleApply(styleName, styleNode)
+  if styleNode.options then
+    for k, option in pairs(styleNode.options) do
+    end
+  end
+  if styleNode.data then
+  end
+  for name, value in pairs(styleNode) do
+    if name == 'mouse-scroll' then
+    elseif name == 'menu-height' then
+    end
+  end
+end
+";
+        let defs = scan_widgets(src);
+        assert_eq!(
+            props(&defs[0]),
+            ["data", "menu-height", "mouse-scroll", "options"]
+        );
+    }
+
+    #[test]
+    fn captures_bracket_index_reads_including_hyphenated_keys() {
+        // The UIMoveableTabBar shape: everything is read via `styleNode['...']`, and the keys are
+        // hyphenated — which a bare field access cannot express.
+        let src = "\
+function UIMoveableTabBar:onStyleApply(styleName, styleNode)
+  if styleNode['movable'] then
+    self.tabsMoveable = styleNode['movable']
+  end
+  if styleNode['tab-spacing'] then
+    self:setTabSpacing(styleNode['tab-spacing'])
+  end
+end
+";
+        let defs = scan_widgets(src);
+        assert_eq!(props(&defs[0]), ["movable", "tab-spacing"]);
+    }
+
+    #[test]
+    fn honors_a_non_default_style_node_parameter_name() {
+        // The style-node parameter is `sn`, not `styleNode`; direct reads must key off it.
+        let src = "\
+function W:onStyleApply(sname, sn)
+  if sn.foo then
+  end
+  if sn['bar-baz'] then
+  end
+end
+";
+        let defs = scan_widgets(src);
+        assert_eq!(props(&defs[0]), ["bar-baz", "foo"]);
+    }
+
+    #[test]
+    fn style_node_iteration_and_similar_names_are_not_field_reads() {
+        // `pairs(styleNode)` is not a `.`/`[` read, and `myStyleNode` is a different variable — the
+        // only real prop here is the `== '...'` one.
+        let src = "\
+function W:onStyleApply(styleName, styleNode)
+  local myStyleNode = something()
+  if myStyleNode.ignored then end
+  for name, value in pairs(styleNode) do
+    if name == 'real' then
+    end
+  end
+end
+";
+        let defs = scan_widgets(src);
+        assert_eq!(props(&defs[0]), ["real"]);
     }
 
     #[test]
