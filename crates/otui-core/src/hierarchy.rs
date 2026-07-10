@@ -1,50 +1,42 @@
-//! Style-inheritance graph primitives (spec §5.2/§5.3): the pure core behind
-//! `textDocument/typeDefinition` and `textDocument/implementation`, and the substrate a later
+//! The style-inheritance **cursor locator** (spec §5.2/§5.3): the pure core behind
+//! `textDocument/typeDefinition` and `textDocument/implementation`, and the classifier a later
 //! `textDocument/typeHierarchy` node will reuse.
 //!
-//! OTML expresses inheritance as `Name < Base` (a top-level [`style_header`]). This module maps that
-//! `Name < Base` graph onto the two navigation directions:
-//!
-//! * **Up the graph — "what type is this?"** [`style_type_at`] answers *which style name the symbol
-//!   under the cursor resolves to* — the tag of a **widget instance** (a `container`, at any depth),
-//!   or the declared-name / base token of a **top-level** `style_header`. The server then resolves
-//!   that name to its declaration(s) via [`style_declarations`] (the typeDefinition target).
-//! * **Down the graph — "who derives from this?"** [`direct_subtypes`] lists the styles in one
-//!   document whose base equals a given name (the implementation target).
+//! OTML expresses inheritance as `Name < Base` (a top-level `style_header`). This module answers a
+//! single question — *which style name does the symbol under the cursor resolve to?* — via
+//! [`style_type_at`]: the tag of a **widget instance** (a `container`, at any depth), or the
+//! declared-name / base token of a **top-level** `style_header`. The server then resolves that name
+//! against the workspace [`StyleIndex`](crate::style_index::StyleIndex): to its declaration(s) for
+//! typeDefinition ([`lookup`](crate::style_index::StyleIndex::lookup)), or to the styles deriving from
+//! it for implementation ([`subtypes`](crate::style_index::StyleIndex::subtypes)). Those cross-document
+//! answers come from the cached index — this module never reparses documents; it only locates the
+//! token under a byte offset.
 //!
 //! ## Fidelity notes (mirroring [`references`](crate::references) / [`style_index`](crate::style_index))
 //!
-//! * **Exact, case-sensitive name match.** Inheritance is keyed by exact string equality (the engine's
-//!   `UIManager::m_styles`), so `Panel` and `panel` are different types. [`direct_subtypes`] compares
-//!   bases with `==`, exactly like [`extract_style_defs`](crate::style_index::extract_style_defs).
-//! * **Only top-level `Name < Base` headers are style declarations / subtypes.** A `Name < Base`
-//!   nested in a widget block is an instance, not an inheritance declaration; only the document root's
-//!   direct children are scanned as `style_header`s (matching `extract_style_defs` and
-//!   [`style_name_occurrences`](crate::references::style_name_occurrences)).
+//! * **Only top-level `Name < Base` headers are style declarations.** A `Name < Base` nested in a
+//!   widget block is an instance, not an inheritance declaration; only the document root's direct
+//!   children are considered `style_header`s here (matching
+//!   [`extract_style_defs`](crate::style_index::extract_style_defs)).
 //! * **Widget instances nest at any depth.** A `container` tag is an instance wherever it appears, so
 //!   [`style_type_at`] searches containers recursively (unlike the top-level-only `style_header` case).
 //! * **Native `UI*` names are still returned.** [`style_type_at`] returns a native `UI*` tag/base as a
 //!   plain name (it is a real style-ish token); whether it has a *user* declaration is the server's
-//!   decision — a native name simply has no declaration in any document, so it resolves to nothing,
-//!   exactly as a native base does in go-to-definition. (See [`is_native_base`] — used by the server,
-//!   not here: this module never classifies, it only locates.)
+//!   decision — a native name simply has no declaration in the index, so it resolves to nothing,
+//!   exactly as a native base does in go-to-definition. (See
+//!   [`is_native_base`](crate::style_index::is_native_base) — used by the server, not here: this
+//!   module never classifies, it only locates.)
 //!
 //! Everything here is byte-offset based. No I/O, no `lsp-types`.
-//!
-//! [`style_header`]: crate::style_index
-//! [`is_native_base`]: crate::style_index::is_native_base
 
-use crate::references::style_name_occurrences;
-use crate::style_index::extract_style_defs;
 use crate::syntax::SyntaxTree;
 use lang_api::ByteSpan;
 use tree_sitter::Node;
 
-/// A named style-graph node the cursor resolved to, or a subtype found in a document.
+/// The style name the cursor resolved to, plus the byte span of the token it came from.
 ///
-/// [`name`](Self::name) is the style name text; [`span`](Self::span) is the byte span of the token it
-/// came from — the container tag / header name / base token under the cursor (for [`style_type_at`]),
-/// or a subtype's declared-name token (for [`direct_subtypes`]).
+/// [`name`](Self::name) is the style name text; [`span`](Self::span) is the byte span of the token the
+/// cursor was on — the container tag, or the header name / base token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StyleRef {
     /// The style name.
@@ -127,39 +119,6 @@ fn ref_if_inside(node: Node<'_>, source: &str, offset: usize) -> Option<StyleRef
     }
 }
 
-/// The name span(s) where `name` is declared as a top-level style in `source` (the typeDefinition
-/// target per document).
-///
-/// Reuses [`style_name_occurrences`]'s declaration finder, so it inherits its exact, case-sensitive,
-/// top-level-only semantics. Duplicate declarations of the same name (legal in the engine) are all
-/// returned. Returns empty when `source` cannot be parsed or `name` is declared nowhere here (a native
-/// `UI*` name has no declaration, so it naturally yields nothing).
-#[must_use]
-pub fn style_declarations(source: &str, name: &str) -> Vec<ByteSpan> {
-    style_name_occurrences(source, name).declarations
-}
-
-/// The styles in `source` that directly derive from `name` — every top-level `X < name` header,
-/// returned as its declared name + name span (the implementation target per document).
-///
-/// Reuses [`extract_style_defs`] (top-level headers only) and keeps those whose base equals `name` by
-/// **exact, case-sensitive** comparison, mirroring [`style_index`](crate::style_index). Returns empty
-/// when `source` cannot be parsed or nothing derives from `name`.
-#[must_use]
-pub fn direct_subtypes(source: &str, name: &str) -> Vec<StyleRef> {
-    let Some(tree) = SyntaxTree::parse(source) else {
-        return Vec::new();
-    };
-    extract_style_defs(&tree)
-        .into_iter()
-        .filter(|def| def.base.as_deref() == Some(name))
-        .map(|def| StyleRef {
-            name: def.name,
-            span: def.name_span,
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,11 +126,6 @@ mod tests {
     /// Byte offset of the first occurrence of `needle` in `src` (panics if absent).
     fn at(src: &str, needle: &str) -> usize {
         src.find(needle).expect("needle present")
-    }
-
-    /// The substrings `source` covers for each span, for readable assertions.
-    fn texts<'a>(source: &'a str, spans: &[ByteSpan]) -> Vec<&'a str> {
-        spans.iter().map(|s| &source[s.start..s.end]).collect()
     }
 
     #[test]
@@ -223,66 +177,8 @@ mod tests {
     }
 
     #[test]
-    fn declarations_find_the_decl_including_duplicates() {
-        // Two top-level declarations of `Panel` (legal); both name spans are returned. The nested
-        // `Panel` instance is not a declaration.
-        let src = "Panel < UIWidget\nOther\n  Panel\nPanel < UIWindow\n";
-        let decls = style_declarations(src, "Panel");
-        assert_eq!(texts(src, &decls), ["Panel", "Panel"]);
-        // The first is the top-level declaration, not the nested instance.
-        assert_eq!(decls[0].start, at(src, "Panel"));
-    }
-
-    #[test]
-    fn declarations_of_absent_or_native_name_are_empty() {
-        let src = "Panel < UIWidget\n";
-        // A native base with no user `UIWidget < …` declaration resolves to nothing.
-        assert!(style_declarations(src, "UIWidget").is_empty());
-        assert!(style_declarations(src, "Missing").is_empty());
-    }
-
-    #[test]
-    fn direct_subtypes_finds_only_styles_whose_base_equals_the_name() {
-        let src = "A < UIWidget\nB < A\nC < A\nD < B\n";
-        let subs = direct_subtypes(src, "A");
-        let names: Vec<&str> = subs.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["B", "C"], "only direct derivations of A");
-        // Each span points at the derived style's declared name.
-        assert_eq!(&src[subs[0].span.start..subs[0].span.end], "B");
-    }
-
-    #[test]
-    fn direct_subtypes_match_is_exact_and_case_sensitive() {
-        let src = "Real < Base\nOther < base\n";
-        // `base` (lowercase) is a different type than `Base`.
-        let subs = direct_subtypes(src, "Base");
-        let names: Vec<&str> = subs.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["Real"]);
-    }
-
-    #[test]
-    fn direct_subtypes_ignores_nested_headers() {
-        // The nested `Inner < Base` is a widget instance, not a top-level derivation.
-        let src = "Outer < UIWidget\n  Inner < Base\nReal < Base\n";
-        let subs = direct_subtypes(src, "Base");
-        let names: Vec<&str> = subs.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["Real"], "only the top-level derivation counts");
-    }
-
-    #[test]
-    fn direct_subtypes_of_native_base_are_still_found() {
-        // Many user styles derive from a native `UI*` base; implementation on that base lists them.
-        let src = "A < UIWidget\nB < UIWidget\nC < UIWindow\n";
-        let subs = direct_subtypes(src, "UIWidget");
-        let names: Vec<&str> = subs.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["A", "B"]);
-    }
-
-    #[test]
-    fn primitives_handle_unparseable_source_gracefully() {
-        // Never panic on a tab-indented (scanner-rejected) document; return empty.
-        let junk = "\t\t< <\n";
-        assert!(direct_subtypes(junk, "X").is_empty());
-        assert!(style_declarations(junk, "X").is_empty());
+    fn type_at_unparseable_source_is_none() {
+        // Never panic on a tab-indented (scanner-rejected) document; return `None`.
+        assert!(style_type_at("\t\t< <\n", 1).is_none());
     }
 }

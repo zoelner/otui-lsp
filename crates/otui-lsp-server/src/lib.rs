@@ -198,25 +198,24 @@ fn resolve_base_definition(
 /// Resolve a style/type name to its declaration site(s) for `textDocument/typeDefinition` (spec §5.2).
 ///
 /// The name — the type of the widget instance / style under the cursor (from
-/// [`style_type_at`](OtuiService::style_type_at)) — is fanned out across **every** open document (the
-/// style namespace is global), and each top-level declaration of it (from
-/// [`style_declarations`](OtuiService::style_declarations)) becomes an LSP [`Location`] built against
-/// **that** document's own text. A native `UI*` type has no user declaration in any document and so
-/// resolves to `None`, exactly like a native base in go-to-definition. Duplicate declarations (legal)
-/// each become a location — zero is `None`, one a `Scalar`, several an `Array`.
+/// [`style_type_at`](OtuiService::style_type_at)) — is looked up in the cached workspace index
+/// ([`StyleIndex::lookup`]); each declaration's `name_span` becomes an LSP [`Location`] built against
+/// **that** target document's own text. Answering from the cache avoids reparsing every open document.
+/// A native `UI*` type has no user declaration in the index and so resolves to `None`, exactly like a
+/// native base in go-to-definition. Duplicate declarations (legal) each become a location — zero is
+/// `None`, one a `Scalar`, several an `Array`. This is the same shape as [`resolve_base_definition`].
 ///
-/// Kept as a free function over borrowed state so it can be unit-tested without a live `Client`
-/// (mirroring [`resolve_base_definition`]).
+/// Kept as a free function over borrowed state so it can be unit-tested without a live `Client`.
 fn resolve_type_definition(
+    index: &StyleIndex,
     documents: &HashMap<Url, Document>,
-    service: &OtuiService,
     name: &str,
     encoding: PositionEncoding,
 ) -> Option<GotoDefinitionResponse> {
     let mut locations = Vec::new();
-    for (uri, doc) in documents {
-        for span in service.style_declarations(&doc.text, name) {
-            locations.push(convert::location_of(uri.clone(), &doc.text, span, encoding));
+    for (doc_id, def) in index.lookup(name) {
+        if let Some(loc) = resolve_location(doc_id, def.name_span, documents, encoding) {
+            locations.push(loc);
         }
     }
 
@@ -231,30 +230,26 @@ fn resolve_type_definition(
 
 /// Collect the styles that derive from `name` for `textDocument/implementation` (spec §5.2).
 ///
-/// Aggregates each open document's direct subtypes of `name` (from
-/// [`direct_subtypes`](OtuiService::direct_subtypes) — every top-level `X < name` header) into
-/// [`Location`]s built against that document's own text. The style namespace is global, so this fans
-/// out across the whole workspace. Unlike typeDefinition, a native `UI*` name is *not* suppressed:
-/// user styles commonly derive from a native base, and listing those derivations is exactly the point.
-/// Returns an empty vector when nothing derives from `name`; the handler maps empty to `None`.
+/// Reads the styles whose base is `name` from the cached workspace index ([`StyleIndex::subtypes`] —
+/// every top-level `X < name` header) and maps each one's `name_span` to a [`Location`] against that
+/// target document's own text. Answering from the cache avoids reparsing every open document. The
+/// style namespace is global, so this spans the whole workspace. Unlike typeDefinition, a native `UI*`
+/// name is *not* suppressed: user styles commonly derive from a native base, and listing those
+/// derivations is exactly the point. Returns an empty vector when nothing derives from `name`; the
+/// handler maps empty to `None`.
 ///
 /// Kept as a free function over borrowed state so it can be unit-tested without a live `Client`
-/// (mirroring [`collect_references`]).
+/// (mirroring [`resolve_base_definition`] / [`collect_references`]).
 fn collect_implementations(
+    index: &StyleIndex,
     documents: &HashMap<Url, Document>,
-    service: &OtuiService,
     name: &str,
     encoding: PositionEncoding,
 ) -> Vec<Location> {
     let mut out = Vec::new();
-    for (uri, doc) in documents {
-        for sub in service.direct_subtypes(&doc.text, name) {
-            out.push(convert::location_of(
-                uri.clone(),
-                &doc.text,
-                sub.span,
-                encoding,
-            ));
+    for (doc_id, def) in index.subtypes(name) {
+        if let Some(loc) = resolve_location(doc_id, def.name_span, documents, encoding) {
+            out.push(loc);
         }
     }
     out
@@ -930,12 +925,13 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        // Fan out its declaration(s) across every open document (the namespace is global). A native
-        // `UI*` type has no user declaration and so resolves to nothing.
+        // Resolve its declaration(s) from the cached workspace index (the namespace is global). A
+        // native `UI*` type has no user declaration and so resolves to nothing.
+        let index = self.style_index.read().await;
         let documents = self.documents.read().await;
         Ok(resolve_type_definition(
+            &index,
             &documents,
-            &self.service,
             &type_ref.name,
             encoding,
         ))
@@ -968,11 +964,11 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        // Aggregate the derivations across every open document (the namespace is global). No user
-        // derivations → `None` (mirroring go-to-definition's empty-is-None convention).
+        // Aggregate the derivations from the cached workspace index (the namespace is global). No
+        // user derivations → `None` (mirroring go-to-definition's empty-is-None convention).
+        let index = self.style_index.read().await;
         let documents = self.documents.read().await;
-        let locations =
-            collect_implementations(&documents, &self.service, &type_ref.name, encoding);
+        let locations = collect_implementations(&index, &documents, &type_ref.name, encoding);
         if locations.is_empty() {
             return Ok(None);
         }
@@ -1523,16 +1519,15 @@ mod tests {
     #[test]
     fn type_definition_of_an_instance_resolves_to_its_style_decl_across_docs() {
         // `Panel` is declared in one file and used as a widget instance in another; typeDefinition
-        // from the instance lands on the declaration's name span.
-        let (_index, docs) = workspace(&[
+        // from the instance lands on the declaration's name span (resolved from the cached index).
+        let (index, docs) = workspace(&[
             ("file:///defs.otui", "Panel < UIWidget\n"),
             (
                 "file:///use.otui",
                 "MainWindow < UIWindow\n  Panel\n    id: p\n",
             ),
         ]);
-        let svc = OtuiService::new();
-        let resp = resolve_type_definition(&docs, &svc, "Panel", PositionEncoding::Utf16)
+        let resp = resolve_type_definition(&index, &docs, "Panel", PositionEncoding::Utf16)
             .expect("resolves");
         match resp {
             GotoDefinitionResponse::Scalar(loc) => {
@@ -1546,24 +1541,22 @@ mod tests {
 
     #[test]
     fn type_definition_of_a_native_type_resolves_to_nothing() {
-        // `UIWidget` is native: no user declaration in any document → `None`.
-        let (_index, docs) = workspace(&[("file:///a.otui", "Panel < UIWidget\n")]);
-        let svc = OtuiService::new();
+        // `UIWidget` is native: no user declaration in the index → `None`.
+        let (index, docs) = workspace(&[("file:///a.otui", "Panel < UIWidget\n")]);
         assert!(
-            resolve_type_definition(&docs, &svc, "UIWidget", PositionEncoding::Utf16).is_none()
+            resolve_type_definition(&index, &docs, "UIWidget", PositionEncoding::Utf16).is_none()
         );
     }
 
     #[test]
     fn type_definition_with_duplicate_decls_is_an_array() {
         // The same style declared in two files: typeDefinition surfaces both declaration sites.
-        let (_index, docs) = workspace(&[
+        let (index, docs) = workspace(&[
             ("file:///a.otui", "Dup < UIWidget\n"),
             ("file:///b.otui", "Dup < UIWindow\n"),
         ]);
-        let svc = OtuiService::new();
-        let resp =
-            resolve_type_definition(&docs, &svc, "Dup", PositionEncoding::Utf16).expect("resolves");
+        let resp = resolve_type_definition(&index, &docs, "Dup", PositionEncoding::Utf16)
+            .expect("resolves");
         match resp {
             GotoDefinitionResponse::Array(locs) => assert_eq!(locs.len(), 2),
             other => panic!("expected an array of locations, got {other:?}"),
@@ -1572,14 +1565,13 @@ mod tests {
 
     #[test]
     fn implementation_lists_derivations_across_two_docs() {
-        // `Base` is derived from in two separate files; implementation aggregates both.
-        let (_index, docs) = workspace(&[
+        // `Base` is derived from in two separate files; implementation aggregates both from the index.
+        let (index, docs) = workspace(&[
             ("file:///base.otui", "Base < UIWidget\n"),
             ("file:///a.otui", "ChildA < Base\n"),
             ("file:///b.otui", "ChildB < Base\n"),
         ]);
-        let svc = OtuiService::new();
-        let locs = collect_implementations(&docs, &svc, "Base", PositionEncoding::Utf16);
+        let locs = collect_implementations(&index, &docs, "Base", PositionEncoding::Utf16);
         assert_eq!(
             sorted_locs(&locs),
             vec![
@@ -1600,9 +1592,8 @@ mod tests {
     #[test]
     fn implementation_of_a_leaf_style_is_empty() {
         // Nothing derives from `Leaf` → an empty list (the handler maps this to `None`).
-        let (_index, docs) = workspace(&[("file:///a.otui", "Leaf < UIWidget\n")]);
-        let svc = OtuiService::new();
-        assert!(collect_implementations(&docs, &svc, "Leaf", PositionEncoding::Utf16).is_empty());
+        let (index, docs) = workspace(&[("file:///a.otui", "Leaf < UIWidget\n")]);
+        assert!(collect_implementations(&index, &docs, "Leaf", PositionEncoding::Utf16).is_empty());
     }
 
     /// The `(uri, range)` of each location, sorted, for order-independent assertions (the document

@@ -187,6 +187,20 @@ impl StyleIndex {
         self.iter().filter(|(_, def)| def.name == name).collect()
     }
 
+    /// Look up every style whose **base** is `name` across **all** documents — the styles that
+    /// directly derive from `name` (`X < name`).
+    ///
+    /// Returns each such def paired with the document that declares it. Base matching is exact and
+    /// case-sensitive, mirroring [`lookup`](Self::lookup) and [`extract_style_defs`]. The order across
+    /// documents is unspecified (the backing map is unordered). This is the substrate for
+    /// `textDocument/implementation` (the derivations of the style under the cursor).
+    #[must_use]
+    pub fn subtypes(&self, name: &str) -> Vec<(&DocId, &StyleDef)> {
+        self.iter()
+            .filter(|(_, def)| def.base.as_deref() == Some(name))
+            .collect()
+    }
+
     /// Iterate every `(document, def)` pair in the index — the substrate for `workspace/symbol`.
     pub fn iter(&self) -> impl Iterator<Item = (&DocId, &StyleDef)> {
         self.by_doc
@@ -296,6 +310,44 @@ mod tests {
         assert!(index.lookup("Missing").is_empty());
         // Every (doc, def) pair is iterable for workspace/symbol.
         assert_eq!(index.iter().count(), 2);
+    }
+
+    #[test]
+    fn subtypes_finds_only_styles_whose_base_matches_across_docs() {
+        // `A` is derived from in two different documents; unrelated styles are not returned.
+        let mut index = StyleIndex::new();
+        index.set_document("a.otui", defs_of("A < UIWidget\nB < A\n"));
+        index.set_document("b.otui", defs_of("C < A\nD < UIWidget\n"));
+
+        let mut names: Vec<&str> = index
+            .subtypes("A")
+            .iter()
+            .map(|(_, d)| d.name.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["B", "C"], "only styles whose base == A");
+    }
+
+    #[test]
+    fn subtypes_match_is_exact_and_case_sensitive() {
+        let mut index = StyleIndex::new();
+        index.set_document("a.otui", defs_of("Real < Base\nOther < base\n"));
+        // `base` (lowercase) is a different type than `Base`.
+        let names: Vec<&str> = index
+            .subtypes("Base")
+            .iter()
+            .map(|(_, d)| d.name.as_str())
+            .collect();
+        assert_eq!(names, ["Real"]);
+    }
+
+    #[test]
+    fn subtypes_is_empty_when_nothing_derives() {
+        let mut index = StyleIndex::new();
+        index.set_document("a.otui", defs_of("Leaf < UIWidget\n"));
+        // Nothing derives from `Leaf`, and a native base with no user derivation is empty too.
+        assert!(index.subtypes("Leaf").is_empty());
+        assert!(index.subtypes("Missing").is_empty());
     }
 
     #[test]
