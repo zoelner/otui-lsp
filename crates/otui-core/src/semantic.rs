@@ -11,12 +11,16 @@
 //! | grammar node kind                                                    | token kind   |
 //! |----------------------------------------------------------------------|--------------|
 //! | `comment`                                                            | `Comment`    |
-//! | `style_name`, `style_base`, `tag`                                    | `Type`       |
-//! | `property_key`, `id_key`, `anchor_keyword`, `anchor_edge`, `event_name`, `alias_name`, `expr_name` | `Property` |
+//! | `style_name`, `tag`                                                  | `Type`       |
+//! | `style_base` beginning with `UI`                                     | `BuiltinType` |
+//! | `style_base` not beginning with `UI`                                 | `InheritedType` |
+//! | `event_name`                                                         | `Event`      |
+//! | `property_key`, `id_key`, `anchor_keyword`, `anchor_edge`, `alias_name`, `expr_name` | `Property` |
 //! | `string`, `hash_literal`, `color`                                    | `String`     |
 //! | `number`                                                             | `Number`     |
 //! | `boolean`                                                            | `Boolean`    |
-//! | `state_name`                                                         | `EnumMember` |
+//! | `state_name` in the known set                                        | `EnumMember` |
+//! | `state_name` outside the known set                                   | `UnknownState` |
 //! | `variable`                                                           | `Variable`   |
 //! | `state_negation` (the `!`)                                           | `Operator`   |
 //! | `null` (the `~`)                                                     | `Keyword`    |
@@ -32,6 +36,7 @@
 //! `color` is classed as `String` (not `Number`) so the whole `#rrggbb` / `rgba(...)` literal
 //! reads as one atom rather than a number with punctuation.
 
+use crate::schema;
 use crate::syntax::SyntaxTree;
 use lang_api::{SemanticToken, SemanticTokenKind};
 use tree_sitter::Node;
@@ -44,7 +49,7 @@ pub fn tokens(source: &str) -> Vec<SemanticToken> {
     };
 
     let mut raw = Vec::new();
-    collect(tree.root(), &mut raw);
+    collect(tree.root(), source, &mut raw);
 
     // LSP requires tokens sorted by start and non-overlapping. Leaves already don't overlap, but
     // sort defensively and drop any token that starts before the previous kept token ends.
@@ -67,17 +72,36 @@ pub fn tokens(source: &str) -> Vec<SemanticToken> {
 /// A couple of kinds are context-sensitive: a `plain_value` is a `Variable` when it is an `id:`
 /// value (the id being defined) and a `String` otherwise, and an `identifier` is a `Variable` when
 /// it is an anchor target and a `String` (a bare inline-array word) otherwise.
-fn kind_for(node: Node<'_>) -> Option<SemanticTokenKind> {
+fn kind_for(node: Node<'_>, source: &str) -> Option<SemanticTokenKind> {
     use SemanticTokenKind::*;
+    let text = || node.utf8_text(source.as_bytes()).unwrap_or_default();
     let kind = match node.kind() {
         "comment" => Comment,
-        "style_name" | "style_base" | "tag" => Type,
-        "property_key" | "id_key" | "anchor_keyword" | "anchor_edge" | "event_name"
-        | "alias_name" | "expr_name" => Property,
+        "style_name" | "tag" => Type,
+        // A `< Base` beginning with `UI` names a built-in native widget class; anything else is a
+        // file-defined parent style. Same `^UI` split the grammar and diagnostics use.
+        "style_base" => {
+            if text().starts_with("UI") {
+                BuiltinType
+            } else {
+                InheritedType
+            }
+        }
+        "event_name" => Event,
+        "property_key" | "id_key" | "anchor_keyword" | "anchor_edge" | "alias_name"
+        | "expr_name" => Property,
         "string" | "hash_literal" | "color" => String,
         "number" => Number,
         "boolean" => Boolean,
-        "state_name" => EnumMember,
+        // A recognised engine state vs one outside the closed 14-name set (which silently never
+        // matches at runtime) — the same distinction the state-name hint diagnostic makes.
+        "state_name" => {
+            if schema::is_known_state(text()) {
+                EnumMember
+            } else {
+                UnknownState
+            }
+        }
         "variable" => Variable,
         "state_negation" => Operator,
         "null" => Keyword,
@@ -96,8 +120,8 @@ fn kind_for(node: Node<'_>) -> Option<SemanticTokenKind> {
 
 /// Depth-first walk emitting a token for every mapped leaf. Mapped nodes are all token (leaf)
 /// nodes, so recursing into children after emitting can never produce a nested/overlapping token.
-fn collect(node: Node<'_>, out: &mut Vec<SemanticToken>) {
-    if let Some(kind) = kind_for(node) {
+fn collect(node: Node<'_>, source: &str, out: &mut Vec<SemanticToken>) {
+    if let Some(kind) = kind_for(node, source) {
         out.push(SemanticToken {
             span: SyntaxTree::span_of(node),
             kind,
@@ -105,7 +129,7 @@ fn collect(node: Node<'_>, out: &mut Vec<SemanticToken>) {
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect(child, out);
+        collect(child, source, out);
     }
 }
 
@@ -149,14 +173,14 @@ MainWindow < UIWindow
             token_for(SNIPPET, &toks, "// header comment").kind,
             SemanticTokenKind::Comment
         );
-        // Style header name + base are both types.
+        // The style name is a Type; a `UI`-prefixed base is a built-in widget class.
         assert_eq!(
             token_for(SNIPPET, &toks, "MainWindow").kind,
             SemanticTokenKind::Type
         );
         assert_eq!(
             token_for(SNIPPET, &toks, "UIWindow").kind,
-            SemanticTokenKind::Type
+            SemanticTokenKind::BuiltinType
         );
         // A property key.
         assert_eq!(
@@ -211,6 +235,43 @@ MainWindow < UIWindow
     }
 
     #[test]
+    fn distinguishes_builtin_and_inherited_bases_events_and_unknown_states() {
+        let src = "\
+MyButton < UIButton
+  @onClick: doThing()
+Derived < BaseThing
+  $hover:
+    color: red
+  $wat:
+    color: blue
+";
+        let toks = tokens(src);
+        // A `UI`-prefixed base is a built-in widget class; a file-defined base is an inherited type.
+        assert_eq!(
+            token_for(src, &toks, "UIButton").kind,
+            SemanticTokenKind::BuiltinType
+        );
+        assert_eq!(
+            token_for(src, &toks, "BaseThing").kind,
+            SemanticTokenKind::InheritedType
+        );
+        // An `@event` key is its own kind, not a generic property.
+        assert_eq!(
+            token_for(src, &toks, "onClick").kind,
+            SemanticTokenKind::Event
+        );
+        // A recognised state vs one outside the closed set.
+        assert_eq!(
+            token_for(src, &toks, "hover").kind,
+            SemanticTokenKind::EnumMember
+        );
+        assert_eq!(
+            token_for(src, &toks, "wat").kind,
+            SemanticTokenKind::UnknownState
+        );
+    }
+
+    #[test]
     fn tokens_are_sorted_and_non_overlapping() {
         let toks = tokens(SNIPPET);
         assert!(!toks.is_empty());
@@ -248,10 +309,10 @@ Panel
     }
 
     #[test]
-    fn event_alias_expr_keys_are_properties() {
-        // `@event:` / `&alias:` / `!expr:` key names are all classed as `Property`, same as a
-        // generic `property_key` — only their Lua-bearing values differ (and those values are
-        // untokenized `lua_value`/`hash_literal` bodies, not exercised here).
+    fn event_key_is_an_event_alias_and_expr_keys_are_properties() {
+        // An `@event:` key is its own `Event` kind; `&alias:` / `!expr:` key names stay `Property`,
+        // same as a generic `property_key` — only their Lua-bearing values differ (and those values
+        // are untokenized `lua_value`/`hash_literal` bodies, not exercised here).
         let src = "\
 Button
   @onClick: g_game.talk(1, 2)
@@ -261,7 +322,7 @@ Button
         let toks = tokens(src);
         assert_eq!(
             token_for(src, &toks, "onClick").kind,
-            SemanticTokenKind::Property
+            SemanticTokenKind::Event
         );
         assert_eq!(
             token_for(src, &toks, "primaryColor").kind,
