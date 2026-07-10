@@ -23,6 +23,10 @@ use otui_core::style_index::{is_native_base, DocId, StyleIndex};
 use otui_core::OtuiService;
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result as RpcResult;
+use tower_lsp::lsp_types::request::{
+    GotoImplementationParams, GotoImplementationResponse, GotoTypeDefinitionParams,
+    GotoTypeDefinitionResponse,
+};
 use tower_lsp::lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
     CodeActionProviderCapability, CodeActionResponse, CompletionOptions, CompletionParams,
@@ -30,13 +34,14 @@ use tower_lsp::lsp_types::{
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
     DocumentSymbolParams, DocumentSymbolResponse, FoldingRange, FoldingRangeParams,
     FoldingRangeProviderCapability, GotoDefinitionParams, GotoDefinitionResponse, Hover,
-    HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
-    InitializedParams, Location, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf,
-    PositionEncodingKind, PrepareRenameResponse, ReferenceParams, RenameOptions, RenameParams,
-    SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
-    SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
-    SymbolInformation, SymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextEdit, Url, WorkDoneProgressOptions, WorkspaceEdit,
+    HoverContents, HoverParams, HoverProviderCapability, ImplementationProviderCapability,
+    InitializeParams, InitializeResult, InitializedParams, Location, MarkupContent, MarkupKind,
+    MessageType, NumberOrString, OneOf, PositionEncodingKind, PrepareRenameResponse,
+    ReferenceParams, RenameOptions, RenameParams, SemanticTokens, SemanticTokensFullOptions,
+    SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SymbolInformation,
+    SymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextEdit, TypeDefinitionProviderCapability, Url, WorkDoneProgressOptions, WorkspaceEdit,
     WorkspaceSymbolParams,
 };
 use tower_lsp::{Client, LanguageServer};
@@ -188,6 +193,66 @@ fn resolve_base_definition(
         )),
         _ => Some(GotoDefinitionResponse::Array(locations)),
     }
+}
+
+/// Resolve a style/type name to its declaration site(s) for `textDocument/typeDefinition` (spec §5.2).
+///
+/// The name — the type of the widget instance / style under the cursor (from
+/// [`style_type_at`](OtuiService::style_type_at)) — is looked up in the cached workspace index
+/// ([`StyleIndex::lookup`]); each declaration's `name_span` becomes an LSP [`Location`] built against
+/// **that** target document's own text. Answering from the cache avoids reparsing every open document.
+/// A native `UI*` type has no user declaration in the index and so resolves to `None`, exactly like a
+/// native base in go-to-definition. Duplicate declarations (legal) each become a location — zero is
+/// `None`, one a `Scalar`, several an `Array`. This is the same shape as [`resolve_base_definition`].
+///
+/// Kept as a free function over borrowed state so it can be unit-tested without a live `Client`.
+fn resolve_type_definition(
+    index: &StyleIndex,
+    documents: &HashMap<Url, Document>,
+    name: &str,
+    encoding: PositionEncoding,
+) -> Option<GotoDefinitionResponse> {
+    let mut locations = Vec::new();
+    for (doc_id, def) in index.lookup(name) {
+        if let Some(loc) = resolve_location(doc_id, def.name_span, documents, encoding) {
+            locations.push(loc);
+        }
+    }
+
+    match locations.len() {
+        0 => None,
+        1 => Some(GotoDefinitionResponse::Scalar(
+            locations.pop().expect("len 1"),
+        )),
+        _ => Some(GotoDefinitionResponse::Array(locations)),
+    }
+}
+
+/// Collect the styles that derive from `name` for `textDocument/implementation` (spec §5.2).
+///
+/// Reads the styles whose base is `name` from the cached workspace index ([`StyleIndex::subtypes`] —
+/// every top-level `X < name` header) and maps each one's `name_span` to a [`Location`] against that
+/// target document's own text. Answering from the cache avoids reparsing every open document. The
+/// style namespace is global, so this spans the whole workspace. Unlike typeDefinition, a native `UI*`
+/// name is *not* suppressed: user styles commonly derive from a native base, and listing those
+/// derivations is exactly the point. Returns an empty vector when nothing derives from `name`; the
+/// handler maps empty to `None`.
+///
+/// Kept as a free function over borrowed state so it can be unit-tested without a live `Client`
+/// (mirroring [`resolve_base_definition`] / [`collect_references`]).
+fn collect_implementations(
+    index: &StyleIndex,
+    documents: &HashMap<Url, Document>,
+    name: &str,
+    encoding: PositionEncoding,
+) -> Vec<Location> {
+    let mut out = Vec::new();
+    for (doc_id, def) in index.subtypes(name) {
+        if let Some(loc) = resolve_location(doc_id, def.name_span, documents, encoding) {
+            out.push(loc);
+        }
+    }
+    out
 }
 
 /// What the cursor is on for a `textDocument/references` request (spec §5.4).
@@ -660,6 +725,12 @@ impl LanguageServer for Backend {
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 // Go-to-definition: `Name < Base` inheritance references (spec §5.3).
                 definition_provider: Some(OneOf::Left(true)),
+                // Go-to-type-definition: from a widget instance / style to the style it is an
+                // instance of — its declaration in the `Name < Base` graph (spec §5.2).
+                type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
+                // Go-to-implementation: from a style to every style that derives from it
+                // (`X < ThisStyle`) across the workspace (spec §5.2).
+                implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
                 // Workspace symbols: the global `Name < Base` style namespace (spec §5.2).
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 // References: uses of a style name (workspace-global) or an `id:` (document-local)
@@ -826,6 +897,82 @@ impl LanguageServer for Backend {
             &base_ref.name,
             encoding,
         ))
+    }
+
+    async fn goto_type_definition(
+        &self,
+        params: GotoTypeDefinitionParams,
+    ) -> RpcResult<Option<GotoTypeDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let encoding = self.encoding();
+
+        // Read the request document's text (unknown document → nothing to resolve). Cloned so the
+        // documents lock is released before we take it again for aggregation.
+        let Some(text) = self
+            .documents
+            .read()
+            .await
+            .get(&uri)
+            .map(|doc| doc.text.clone())
+        else {
+            return Ok(None);
+        };
+
+        // Classify the symbol under the cursor into the style name it is an instance of / declares.
+        let offset = LineIndex::new(&text).offset_at(position, encoding);
+        let Some(type_ref) = self.service.style_type_at(&text, offset) else {
+            return Ok(None);
+        };
+
+        // Resolve its declaration(s) from the cached workspace index (the namespace is global). A
+        // native `UI*` type has no user declaration and so resolves to nothing.
+        let index = self.style_index.read().await;
+        let documents = self.documents.read().await;
+        Ok(resolve_type_definition(
+            &index,
+            &documents,
+            &type_ref.name,
+            encoding,
+        ))
+    }
+
+    async fn goto_implementation(
+        &self,
+        params: GotoImplementationParams,
+    ) -> RpcResult<Option<GotoImplementationResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let encoding = self.encoding();
+
+        // Read the request document's text (unknown document → nothing to resolve). Cloned so the
+        // documents lock is released before we take it again for aggregation.
+        let Some(text) = self
+            .documents
+            .read()
+            .await
+            .get(&uri)
+            .map(|doc| doc.text.clone())
+        else {
+            return Ok(None);
+        };
+
+        // Classify the style name under the cursor (a header name/base, or a widget instance treated
+        // as its type); implementation lists who derives from that name.
+        let offset = LineIndex::new(&text).offset_at(position, encoding);
+        let Some(type_ref) = self.service.style_type_at(&text, offset) else {
+            return Ok(None);
+        };
+
+        // Aggregate the derivations from the cached workspace index (the namespace is global). No
+        // user derivations → `None` (mirroring go-to-definition's empty-is-None convention).
+        let index = self.style_index.read().await;
+        let documents = self.documents.read().await;
+        let locations = collect_implementations(&index, &documents, &type_ref.name, encoding);
+        if locations.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(GotoImplementationResponse::Array(locations)))
     }
 
     async fn references(&self, params: ReferenceParams) -> RpcResult<Option<Vec<Location>>> {
@@ -1367,6 +1514,86 @@ mod tests {
             resolve_base_definition(&index, &documents, "MyPanel", PositionEncoding::Utf16)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn type_definition_of_an_instance_resolves_to_its_style_decl_across_docs() {
+        // `Panel` is declared in one file and used as a widget instance in another; typeDefinition
+        // from the instance lands on the declaration's name span (resolved from the cached index).
+        let (index, docs) = workspace(&[
+            ("file:///defs.otui", "Panel < UIWidget\n"),
+            (
+                "file:///use.otui",
+                "MainWindow < UIWindow\n  Panel\n    id: p\n",
+            ),
+        ]);
+        let resp = resolve_type_definition(&index, &docs, "Panel", PositionEncoding::Utf16)
+            .expect("resolves");
+        match resp {
+            GotoDefinitionResponse::Scalar(loc) => {
+                assert_eq!(loc.uri.as_str(), "file:///defs.otui");
+                assert_eq!(loc.range.start, Position::new(0, 0));
+                assert_eq!(loc.range.end, Position::new(0, 5));
+            }
+            other => panic!("expected a scalar location, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn type_definition_of_a_native_type_resolves_to_nothing() {
+        // `UIWidget` is native: no user declaration in the index → `None`.
+        let (index, docs) = workspace(&[("file:///a.otui", "Panel < UIWidget\n")]);
+        assert!(
+            resolve_type_definition(&index, &docs, "UIWidget", PositionEncoding::Utf16).is_none()
+        );
+    }
+
+    #[test]
+    fn type_definition_with_duplicate_decls_is_an_array() {
+        // The same style declared in two files: typeDefinition surfaces both declaration sites.
+        let (index, docs) = workspace(&[
+            ("file:///a.otui", "Dup < UIWidget\n"),
+            ("file:///b.otui", "Dup < UIWindow\n"),
+        ]);
+        let resp = resolve_type_definition(&index, &docs, "Dup", PositionEncoding::Utf16)
+            .expect("resolves");
+        match resp {
+            GotoDefinitionResponse::Array(locs) => assert_eq!(locs.len(), 2),
+            other => panic!("expected an array of locations, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn implementation_lists_derivations_across_two_docs() {
+        // `Base` is derived from in two separate files; implementation aggregates both from the index.
+        let (index, docs) = workspace(&[
+            ("file:///base.otui", "Base < UIWidget\n"),
+            ("file:///a.otui", "ChildA < Base\n"),
+            ("file:///b.otui", "ChildB < Base\n"),
+        ]);
+        let locs = collect_implementations(&index, &docs, "Base", PositionEncoding::Utf16);
+        assert_eq!(
+            sorted_locs(&locs),
+            vec![
+                (
+                    "file:///a.otui".to_owned(),
+                    Position::new(0, 0),
+                    Position::new(0, 6)
+                ),
+                (
+                    "file:///b.otui".to_owned(),
+                    Position::new(0, 0),
+                    Position::new(0, 6)
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn implementation_of_a_leaf_style_is_empty() {
+        // Nothing derives from `Leaf` → an empty list (the handler maps this to `None`).
+        let (index, docs) = workspace(&[("file:///a.otui", "Leaf < UIWidget\n")]);
+        assert!(collect_implementations(&index, &docs, "Leaf", PositionEncoding::Utf16).is_empty());
     }
 
     /// The `(uri, range)` of each location, sorted, for order-independent assertions (the document

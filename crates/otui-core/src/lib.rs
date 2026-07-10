@@ -17,6 +17,7 @@ pub mod diagnostics;
 pub mod fixes;
 pub mod folding;
 pub mod format;
+pub mod hierarchy;
 pub mod hover;
 pub mod navigation;
 pub mod references;
@@ -27,6 +28,7 @@ pub mod symbols;
 pub mod syntax;
 
 use fixes::Fix;
+use hierarchy::StyleRef;
 use hover::StyleHover;
 use lang_api::{
     ByteSpan, CompletionItem, Diagnostic, DocumentSymbol, LanguageService, SemanticToken,
@@ -140,6 +142,22 @@ impl OtuiService {
         index: &StyleIndex,
     ) -> Option<StyleHover> {
         hover::style_hover_at(source, offset, index)
+    }
+
+    /// Locate the style name the symbol under `offset` resolves to for type navigation
+    /// (`textDocument/typeDefinition` / `textDocument/implementation`): the tag of a widget instance
+    /// (a `container`, at any depth) or the declared-name / base token of a top-level `Name < Base`
+    /// header. Returns the name + its token span, or `None` off any such token. Native `UI*` names are
+    /// returned as-is; the server decides they have no user declaration.
+    ///
+    /// This is only the cursor **locator**; resolving the name to declarations or derivations is the
+    /// server's job, answered from the cached workspace [`style_index::StyleIndex`]
+    /// ([`lookup`](style_index::StyleIndex::lookup) / [`subtypes`](style_index::StyleIndex::subtypes)),
+    /// not by reparsing documents. Inherent (not on the [`LanguageService`] trait) like
+    /// [`base_reference_at`](Self::base_reference_at).
+    #[must_use]
+    pub fn style_type_at(&self, source: &str, offset: usize) -> Option<StyleRef> {
+        hierarchy::style_type_at(source, offset)
     }
 
     /// Compute completion candidates for the cursor at byte `offset` (spec §6). Returns the OTML
