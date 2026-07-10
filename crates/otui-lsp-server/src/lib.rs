@@ -2204,17 +2204,26 @@ impl Backend {
             .get(&uri)
             .map(|doc| doc.text.clone())?;
 
+        // LSP ranges are END-EXCLUSIVE, but `format_line_edits` takes an INCLUSIVE end line. A
+        // selection that ends at `{ line: M, character: 0 }` (the shape editors produce when the
+        // selection stops at the very start of line M — e.g. selecting through the end of line M-1)
+        // does NOT include line M, so exclude it. `saturating_sub` keeps the end valid; if this makes
+        // the inclusive end fall below the start, `format_line_edits` yields no edits.
+        let inclusive_end_line = if params.range.end.character == 0 {
+            params.range.end.line.saturating_sub(1)
+        } else {
+            params.range.end.line
+        };
+
         // Format the whole document (the formatter needs the full CST for structural depth) and keep
         // only the edits for lines that intersect the requested range and actually changed. `None`
         // means the document does not parse cleanly (parse error / `ERROR`/`MISSING` node); per the
         // same safety gate as whole-document formatting we then return no edits. A range that only
         // partially covers a line still reformats that whole line — line granularity is the correct
         // unit for an indentation-structured language.
-        let line_edits = self.service.format_line_edits(
-            &text,
-            params.range.start.line,
-            params.range.end.line,
-        )?;
+        let line_edits =
+            self.service
+                .format_line_edits(&text, params.range.start.line, inclusive_end_line)?;
 
         // Map each line edit onto a `TextEdit` whose range covers that whole original line, from
         // column 0 to the line's end (a huge column clamps to the line end, before any `\r\n`, via
@@ -4136,6 +4145,29 @@ mod tests {
             Position::new(1, "    id: main".len() as u32)
         );
         assert_eq!(edit.new_text, "  id: main");
+    }
+
+    #[test]
+    fn range_formatting_end_at_next_line_column_zero_excludes_that_line() {
+        use lsp_types::{Position, Range};
+        // LSP end-exclusive selection: selecting line 1 in full leaves the cursor at the START of
+        // line 2 (`{line: 2, character: 0}`). Line 2, though it would also change under a whole-doc
+        // format, is NOT part of the selection and must be excluded — only line 1 is edited.
+        let uri = Uri::from_str("file:///x.otui").expect("uri");
+        let text = "Panel\n    id: main\n    width: 10\n";
+        let backend = backend_with_doc(&uri, text, Vec::new());
+
+        let range = Range {
+            start: Position::new(1, 0),
+            end: Position::new(2, 0),
+        };
+        let edits = backend
+            .range_formatting(range_formatting_params(&uri, range))
+            .expect("known, parseable document");
+
+        assert_eq!(edits.len(), 1, "line 2 must be excluded; got {edits:?}");
+        assert_eq!(edits[0].range.start, Position::new(1, 0));
+        assert_eq!(edits[0].new_text, "  id: main");
     }
 
     #[test]
