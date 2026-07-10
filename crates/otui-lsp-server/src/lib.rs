@@ -14,7 +14,8 @@ pub mod position;
 pub mod semantic;
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use lang_api::{ByteSpan, LanguageService};
 use otui_core::fixes::Fix;
@@ -31,19 +32,20 @@ use tower_lsp::lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
     CodeActionProviderCapability, CodeActionResponse, CompletionOptions, CompletionParams,
     CompletionResponse, Diagnostic as LspDiagnostic, DidChangeTextDocumentParams,
+    DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
-    DocumentSymbolParams, DocumentSymbolResponse, FoldingRange, FoldingRangeParams,
-    FoldingRangeProviderCapability, GotoDefinitionParams, GotoDefinitionResponse, Hover,
-    HoverContents, HoverParams, HoverProviderCapability, ImplementationProviderCapability,
-    InitializeParams, InitializeResult, InitializedParams, Location, MarkupContent, MarkupKind,
-    MessageType, NumberOrString, OneOf, PositionEncodingKind, PrepareRenameResponse,
-    ReferenceParams, Registration, RenameOptions, RenameParams, SemanticTokens,
-    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SymbolInformation,
-    SymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextEdit, TypeDefinitionProviderCapability, TypeHierarchyItem, TypeHierarchyPrepareParams,
-    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Url, WorkDoneProgressOptions,
-    WorkspaceEdit, WorkspaceSymbolParams,
+    DocumentSymbolParams, DocumentSymbolResponse, FileChangeType, FileSystemWatcher, FoldingRange,
+    FoldingRangeParams, FoldingRangeProviderCapability, GlobPattern, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
+    ImplementationProviderCapability, InitializeParams, InitializeResult, InitializedParams,
+    Location, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf, PositionEncodingKind,
+    PrepareRenameResponse, ReferenceParams, Registration, RenameOptions, RenameParams,
+    SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
+    SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
+    SymbolInformation, SymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextEdit, TypeDefinitionProviderCapability, TypeHierarchyItem,
+    TypeHierarchyPrepareParams, TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Url,
+    WorkDoneProgressOptions, WorkspaceEdit, WorkspaceSymbolParams,
 };
 use tower_lsp::{Client, LanguageServer};
 
@@ -72,15 +74,38 @@ pub struct Backend {
     /// decides the `textDocument/documentSymbol` response shape (nested vs. flat). Defaults to
     /// `false` (the LSP default when the capability is absent). Guarded like [`encoding`].
     hierarchical_symbols: Mutex<bool>,
-    /// Open documents by URL, full text (text document sync = FULL) plus sync version.
-    documents: RwLock<HashMap<Url, Document>>,
+    /// Open documents by URL, full text (text document sync = FULL) plus sync version. An open
+    /// buffer is authoritative for its URI — it may carry unsaved edits — so it always wins over the
+    /// on-disk copy cached in [`disk_texts`](Self::disk_texts). Wrapped in an [`Arc`] so the
+    /// background workspace scan can consult it (to skip files that became open mid-scan) from a
+    /// spawned task.
+    documents: Arc<RwLock<HashMap<Url, Document>>>,
     /// The workspace-wide `Name < Base` style index (spec §5.2), keyed by document URL string.
-    /// Kept in sync with the document lifecycle (open/change re-index, close removes) and consumed
-    /// by go-to-definition (spec §5.3). Guarded independently of [`documents`](Self::documents):
-    /// the two locks are never held nested in a way that could deadlock — each is taken and released
-    /// cleanly around its critical section.
-    style_index: RwLock<StyleIndex>,
+    /// Populated at startup by scanning every `.otui` file in the workspace roots and kept in sync
+    /// via the document lifecycle (open/change re-index) and file watching
+    /// ([`did_change_watched_files`](LanguageServer::did_change_watched_files)). Consumed by
+    /// go-to-definition (spec §5.3) and the other cross-file features. Guarded independently of
+    /// [`documents`](Self::documents): the two locks are never held nested in a way that could
+    /// deadlock — each is taken and released cleanly around its critical section. [`Arc`] so the
+    /// background scan can write into it from a spawned task.
+    style_index: Arc<RwLock<StyleIndex>>,
+    /// On-disk text of every **indexed closed** `.otui` file, keyed by its `file://` URL. This is
+    /// the content store that lets the aggregators map a closed file's byte span → LSP range without
+    /// the file being open. For any URI also present in [`documents`](Self::documents) the open
+    /// buffer wins (it may have unsaved edits); see [`merge_documents`]. [`Arc`] so the background
+    /// scan can populate it from a spawned task.
+    disk_texts: Arc<RwLock<HashMap<Url, String>>>,
+    /// The workspace root URLs captured during `initialize` (`workspace_folders`, else `root_uri`),
+    /// consumed once by the background scan in `initialized`. Empty when the client opened no folder
+    /// — the server then falls back to open-docs-only indexing. Guarded by a std [`Mutex`] because it
+    /// is written once and read once, never across an `.await`.
+    roots: Mutex<Vec<Url>>,
 }
+
+/// Largest `.otui` file the workspace scan / watcher will read into the index. A style file is a few
+/// KiB in practice; anything past this is almost certainly not a hand-authored style sheet, so it is
+/// skipped rather than pulled wholesale into memory.
+const MAX_INDEXED_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 impl Backend {
     /// Construct a backend bound to `client`, backed by a fresh [`OtuiService`].
@@ -90,8 +115,10 @@ impl Backend {
             service: OtuiService::new(),
             encoding: Mutex::new(PositionEncoding::Utf16),
             hierarchical_symbols: Mutex::new(false),
-            documents: RwLock::new(HashMap::new()),
-            style_index: RwLock::new(StyleIndex::new()),
+            documents: Arc::new(RwLock::new(HashMap::new())),
+            style_index: Arc::new(RwLock::new(StyleIndex::new())),
+            disk_texts: Arc::new(RwLock::new(HashMap::new())),
+            roots: Mutex::new(Vec::new()),
         }
     }
 
@@ -140,16 +167,189 @@ impl Backend {
             .await
             .set_document(DocId::from(uri.to_string()), defs);
     }
+
+    /// The unified text view every span→range aggregator resolves against: the OPEN buffers overlaid
+    /// on the on-disk cache of closed files, open winning (see [`merge_documents`]).
+    ///
+    /// Built fresh per request — references/rename/etc. are user-initiated, not hot paths, so the
+    /// clone cost is acceptable; it also lets us pass the merged map to the existing pure aggregators
+    /// (`resolve_base_definition`, `collect_references`, …) unchanged. Both read locks are taken and
+    /// released here (the returned map is owned), so no document/disk lock is held across the
+    /// subsequent `style_index` read — preserving the unnested-lock discipline.
+    async fn merged_documents(&self) -> HashMap<Url, Document> {
+        let open = self.documents.read().await;
+        let disk = self.disk_texts.read().await;
+        merge_documents(&open, &disk)
+    }
+
+    /// Index `uri` from its on-disk text (the closed-file path used by the initial scan, the file
+    /// watcher, and `did_close`): parse `text`, store its style defs in the index and cache the text
+    /// in [`disk_texts`](Self::disk_texts) so its spans stay resolvable while the file is closed.
+    async fn index_from_disk(&self, uri: &Url, text: String) {
+        let defs = self.service.style_defs(&text);
+        self.style_index
+            .write()
+            .await
+            .set_document(DocId::from(uri.to_string()), defs);
+        self.disk_texts.write().await.insert(uri.clone(), text);
+    }
+
+    /// Read `uri` from disk **off the async runtime**.
+    ///
+    /// [`read_otui_from_disk`] does blocking `std::fs` I/O (plus the size cap and UTF-8/binary skip);
+    /// calling it inline in an `async fn` would stall a tokio worker — and every LSP request shares
+    /// that runtime — on a slow/large/networked read. So the blocking read is offloaded to a
+    /// `spawn_blocking` thread and awaited. A `JoinError` (the blocking task panicked/was cancelled)
+    /// is treated exactly like an unreadable file: logged and mapped to `None`, so the caller falls
+    /// back to its graceful skip/remove path. No lock is held across this await.
+    async fn read_otui_off_runtime(&self, uri: &Url) -> Option<String> {
+        let uri_owned = uri.clone();
+        match tokio::task::spawn_blocking(move || read_otui_from_disk(&uri_owned)).await {
+            Ok(text) => text,
+            Err(err) => {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("otui-lsp: disk read task failed for {uri}: {err}"),
+                    )
+                    .await;
+                None
+            }
+        }
+    }
+
+    /// Whether `uri` is currently an open buffer. Takes the `documents` read lock briefly and
+    /// releases it before returning, so callers can re-check open-state after an `.await` without
+    /// holding a lock across the subsequent `style_index`/`disk_texts` write.
+    async fn is_open(&self, uri: &Url) -> bool {
+        self.documents.read().await.contains_key(uri)
+    }
+
+    /// Drop `uri` from both the style index and the disk-text cache (a deleted / vanished file).
+    async fn deindex(&self, uri: &Url) {
+        self.style_index
+            .write()
+            .await
+            .remove_document(&DocId::from(uri.to_string()));
+        self.disk_texts.write().await.remove(uri);
+    }
+}
+
+/// Merge the open buffers over the on-disk cache into a single `URI → Document` view for one
+/// request.
+///
+/// The on-disk cache seeds the map (every indexed closed file), then each open buffer is inserted on
+/// top — so **an open buffer always wins over the on-disk copy for the same URI** (it may hold
+/// unsaved edits that are authoritative over what is on disk). Closed files carry `version` 0, which
+/// is irrelevant here: the aggregators only read `.text`.
+///
+/// Pure over borrowed state so the open-vs-disk precedence is unit-testable without any real I/O.
+fn merge_documents(
+    open: &HashMap<Url, Document>,
+    disk: &HashMap<Url, String>,
+) -> HashMap<Url, Document> {
+    let mut merged: HashMap<Url, Document> = disk
+        .iter()
+        .map(|(uri, text)| {
+            (
+                uri.clone(),
+                Document {
+                    text: text.clone(),
+                    version: 0,
+                },
+            )
+        })
+        .collect();
+    // Open buffers override any stale on-disk entry for the same URI.
+    for (uri, doc) in open {
+        merged.insert(uri.clone(), doc.clone());
+    }
+    merged
+}
+
+/// Read a `file://` `.otui` document from disk for indexing, or `None` when it cannot / should not be
+/// indexed.
+///
+/// Returns `None` — and the caller skips it — for a non-`file:` URI, an unreadable path, a file
+/// larger than [`MAX_INDEXED_FILE_BYTES`], or content that is not valid UTF-8 (a binary/garbage file
+/// must never crash the server or land bogus entries in the index). This is the single disk-read seam
+/// shared by the scan, the watcher and `did_close`.
+fn read_otui_from_disk(uri: &Url) -> Option<String> {
+    let path = uri.to_file_path().ok()?;
+    let meta = std::fs::metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_INDEXED_FILE_BYTES {
+        return None;
+    }
+    // `read_to_string` fails on non-UTF-8 bytes, which cleanly rejects binary files.
+    std::fs::read_to_string(&path).ok()
+}
+
+/// Recursively collect every `*.otui` file under `roots`, reading each into `(url, text)`.
+///
+/// Blocking filesystem work — run inside `spawn_blocking`, never on an async worker thread. Symlinks
+/// are **not** followed (so the walk cannot escape the root or loop), unreadable directories are
+/// skipped, and each file is read through [`read_otui_from_disk`] (so oversized/binary files are
+/// dropped). Duplicate roots (or nested roots) are de-duplicated by URL at the end.
+fn scan_workspace(roots: &[Url]) -> Vec<(Url, String)> {
+    let mut out: HashMap<Url, String> = HashMap::new();
+    for root in roots {
+        let Ok(dir) = root.to_file_path() else {
+            continue;
+        };
+        collect_otui_under(&dir, &mut out);
+    }
+    out.into_iter().collect()
+}
+
+/// Depth-first walk of `dir`, pushing every readable `*.otui` file into `out` keyed by its
+/// `file://` URL. Does not follow symlinks (checked via the dir entry's own metadata) and silently
+/// skips entries it cannot stat/read.
+fn collect_otui_under(dir: &Path, out: &mut HashMap<Url, String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path: PathBuf = entry.path();
+        // `symlink_metadata` does not traverse the link, so a symlink is classified as a symlink and
+        // skipped — the walk cannot follow one out of the root or into a cycle.
+        let Ok(meta) = path.symlink_metadata() else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            collect_otui_under(&path, out);
+        } else if meta.is_file() && path.extension().is_some_and(|e| e == "otui") {
+            if let Ok(uri) = Url::from_file_path(&path) {
+                if let Some(text) = read_otui_from_disk(&uri) {
+                    out.insert(uri, text);
+                }
+            }
+        }
+    }
+}
+
+/// The workspace roots carried by an `initialize` request: `workspace_folders` when present (each
+/// folder's URI), else the single legacy `root_uri`, else empty. Empty means the client opened no
+/// folder, and the server falls back to open-docs-only indexing.
+fn workspace_roots(params: &InitializeParams) -> Vec<Url> {
+    if let Some(folders) = &params.workspace_folders {
+        if !folders.is_empty() {
+            return folders.iter().map(|f| f.uri.clone()).collect();
+        }
+    }
+    params.root_uri.clone().into_iter().collect()
 }
 
 /// Build an LSP [`Location`] for `span` in the document identified by `doc_id`.
 ///
 /// A style def's spans are byte offsets into **its own** document's text, so the range must be
-/// mapped against that text. Returns `None` — and the caller skips the entry — when `doc_id` is not
-/// a parseable URL or its document is not currently open (its span cannot be mapped to a range; the
-/// index only holds open documents today, so a workspace file-scan for closed files is a later node).
-/// Shared by [`resolve_base_definition`] (go-to-definition) and [`collect_workspace_symbols`]
-/// (workspace symbols).
+/// mapped against that text. `documents` is the merged open+disk view (see [`merge_documents`]), so
+/// both open buffers and indexed closed files resolve here. Returns `None` — and the caller skips the
+/// entry — when `doc_id` is not a parseable URL or its text is in neither view (its span cannot be
+/// mapped to a range). Shared by [`resolve_base_definition`] (go-to-definition) and
+/// [`collect_workspace_symbols`] (workspace symbols).
 fn resolve_location(
     doc_id: &DocId,
     span: ByteSpan,
@@ -266,9 +466,9 @@ fn collect_implementations(
 /// recover the exact style the item stands for (see [`item_style_name`]).
 ///
 /// Returns `None` — and the caller skips the entry — when `doc_id` is not a parseable URL or its
-/// document is not currently open (its spans cannot be mapped to ranges; the index only holds open
-/// documents today). Mirrors [`resolve_location`]'s span→range mapping, and is kept `Client`-free so
-/// it is unit-testable without a live server.
+/// text is in neither the open nor the disk view (its spans cannot be mapped to ranges). Mirrors
+/// [`resolve_location`]'s span→range mapping, and is kept `Client`-free so it is unit-testable
+/// without a live server.
 fn build_type_hierarchy_item(
     doc_id: &DocId,
     def: &StyleDef,
@@ -453,8 +653,9 @@ fn classify_rename_target(
 /// Collect the LSP [`Location`]s answering a `textDocument/references` request for `target` (spec
 /// §5.4), honoring `include_declaration`.
 ///
-/// * A [`StyleName`](ReferenceTarget::StyleName) fans out across **every** open document (the style
-///   namespace is global): each document's declarations (only when `include_declaration`) and base
+/// * A [`StyleName`](ReferenceTarget::StyleName) fans out across **every** document in the merged
+///   open+disk view (the style namespace is global, and closed workspace files are indexed too):
+///   each document's declarations (only when `include_declaration`) and base
 ///   references become locations, mapped against that document's own text. A native `UI*` base with
 ///   no user definition in the index is skipped — it has no declaration and listing all its uses is
 ///   low value; a name that *is* in the index (even a `UI*`-shaped user style) is collected normally.
@@ -621,8 +822,8 @@ fn build_rename_edits(
 /// everything**, so the picker opens showing all styles. Each surviving def maps its [`DocId`] back
 /// to a [`Url`] and builds a [`Location`](tower_lsp::lsp_types::Location) for its `name_span` against
 /// **that** target document's own text (via [`convert::location_of`]), exactly as
-/// [`resolve_base_definition`] does. A def whose document is not currently open is skipped — its span
-/// cannot be mapped to a range (the index only holds open documents today anyway). The widget's base
+/// [`resolve_base_definition`] does. A def whose document is in neither the open nor the disk view is
+/// skipped — its span cannot be mapped to a range. The widget's base
 /// becomes the entry's `container_name`, giving the picker useful context; native `UI*` bases are
 /// never symbols of their own (they have no def, so are absent from the index) — they surface only as
 /// the `container_name` of a widget that inherits them.
@@ -834,6 +1035,9 @@ impl LanguageServer for Backend {
             .expect("hierarchical_symbols mutex poisoned") =
             client_supports_hierarchical_symbols(&params);
 
+        // Capture the workspace roots now; the background scan in `initialized` consumes them.
+        *self.roots.lock().expect("roots mutex poisoned") = workspace_roots(&params);
+
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 position_encoding: Some(encoding.to_kind()),
@@ -931,9 +1135,135 @@ impl LanguageServer for Backend {
                 .await;
         }
 
+        // Watch every `.otui` in the workspace so the index tracks files edited/created/deleted on
+        // disk outside the editor (or in files the user never opens). Registered dynamically for the
+        // same reason as type hierarchy above: it is the portable way to request
+        // `workspace/didChangeWatchedFiles`, and a client that cannot honor it simply errors (logged,
+        // otherwise ignored).
+        let watch_registration = Registration {
+            id: "otui-watched-files".to_owned(),
+            method: "workspace/didChangeWatchedFiles".to_owned(),
+            register_options: serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                watchers: vec![FileSystemWatcher {
+                    glob_pattern: GlobPattern::String("**/*.otui".to_owned()),
+                    kind: None, // default: create | change | delete
+                }],
+            })
+            .ok(),
+        };
+        if let Err(err) = self
+            .client
+            .register_capability(vec![watch_registration])
+            .await
+        {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("failed to register file-watching capability: {err}"),
+                )
+                .await;
+        }
+
+        // Initial workspace scan: index every `.otui` on disk so cross-file features
+        // (references/rename/definition/…) see closed files, not only open buffers. Spawned as a
+        // background task so `initialized` returns promptly; it walks the roots off the async worker
+        // threads (`spawn_blocking`) and writes into the index incrementally. With no workspace root
+        // (client opened a loose file, not a folder) there is nothing to scan, and the server falls
+        // back to today's open-docs-only indexing.
+        let roots = self.roots.lock().expect("roots mutex poisoned").clone();
+        if roots.is_empty() {
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    "otui-lsp: no workspace root; indexing open documents only",
+                )
+                .await;
+        } else {
+            let style_index = Arc::clone(&self.style_index);
+            let disk_texts = Arc::clone(&self.disk_texts);
+            let documents = Arc::clone(&self.documents);
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                let entries =
+                    match tokio::task::spawn_blocking(move || scan_workspace(&roots)).await {
+                        Ok(entries) => entries,
+                        Err(err) => {
+                            client
+                                .log_message(
+                                    MessageType::WARNING,
+                                    format!("otui-lsp: workspace scan failed: {err}"),
+                                )
+                                .await;
+                            return;
+                        }
+                    };
+                // The scan is stateless, so a fresh service suffices for extraction.
+                let service = OtuiService::new();
+                let mut indexed = 0usize;
+                for (uri, text) in entries {
+                    // An open buffer is authoritative: if the file was opened while the scan ran, do
+                    // not overwrite its buffer-derived index entry with disk text.
+                    if documents.read().await.contains_key(&uri) {
+                        continue;
+                    }
+                    let defs = service.style_defs(&text);
+                    // Incremental: take the write locks per file and release them immediately, so the
+                    // scan never blocks request handlers for long.
+                    style_index
+                        .write()
+                        .await
+                        .set_document(DocId::from(uri.to_string()), defs);
+                    disk_texts.write().await.insert(uri, text);
+                    indexed += 1;
+                }
+                client
+                    .log_message(
+                        MessageType::INFO,
+                        format!("otui-lsp: indexed {indexed} workspace .otui file(s)"),
+                    )
+                    .await;
+            });
+        }
+
         self.client
             .log_message(MessageType::INFO, "otui-lsp server ready")
             .await;
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        for change in params.changes {
+            let uri = change.uri;
+            // Open buffer wins: a document open in the editor is authoritative over its on-disk copy,
+            // so a disk event for it must never clobber the buffer-derived index entry. did_close
+            // re-syncs it from disk once the buffer goes away.
+            if self.documents.read().await.contains_key(&uri) {
+                continue;
+            }
+            if change.typ == FileChangeType::DELETED {
+                self.deindex(&uri).await;
+            } else if change.typ == FileChangeType::CREATED || change.typ == FileChangeType::CHANGED
+            {
+                // Re-read from disk (off the runtime — see `read_otui_off_runtime`) and re-index; skip
+                // (with a log) an unreadable/oversized/binary file.
+                let disk = self.read_otui_off_runtime(&uri).await;
+                // Post-await race guard: the read yields the executor, so the file may have been
+                // opened DURING the await (the pre-await open-check above cannot see that). If it is
+                // open now, its buffer is authoritative and `did_open`/`did_change` already indexed
+                // it — skip the disk-index write so we do not clobber the fresh buffer entry.
+                if self.is_open(&uri).await {
+                    // Opened mid-await: leave the buffer-derived index entry untouched.
+                } else if let Some(text) = disk {
+                    self.index_from_disk(&uri, text).await;
+                } else {
+                    self.client
+                        .log_message(
+                            MessageType::INFO,
+                            format!("otui-lsp: skipped unreadable watched file {uri}"),
+                        )
+                        .await;
+                }
+            }
+        }
     }
 
     async fn shutdown(&self) -> RpcResult<()> {
@@ -1048,8 +1378,8 @@ impl LanguageServer for Backend {
         };
 
         // Resolve against the workspace index, building each target range from its own document.
+        let documents = self.merged_documents().await;
         let index = self.style_index.read().await;
-        let documents = self.documents.read().await;
         Ok(resolve_base_definition(
             &index,
             &documents,
@@ -1086,8 +1416,8 @@ impl LanguageServer for Backend {
 
         // Resolve its declaration(s) from the cached workspace index (the namespace is global). A
         // native `UI*` type has no user declaration and so resolves to nothing.
+        let documents = self.merged_documents().await;
         let index = self.style_index.read().await;
-        let documents = self.documents.read().await;
         Ok(resolve_type_definition(
             &index,
             &documents,
@@ -1125,8 +1455,8 @@ impl LanguageServer for Backend {
 
         // Aggregate the derivations from the cached workspace index (the namespace is global). No
         // user derivations → `None` (mirroring go-to-definition's empty-is-None convention).
+        let documents = self.merged_documents().await;
         let index = self.style_index.read().await;
-        let documents = self.documents.read().await;
         let locations = collect_implementations(&index, &documents, &type_ref.name, encoding);
         if locations.is_empty() {
             return Ok(None);
@@ -1162,8 +1492,8 @@ impl LanguageServer for Backend {
 
         // Root the hierarchy on that style's declaration in the cached workspace index. A native
         // `UI*` name (or any name with no user declaration) has nothing to root on → `None`.
+        let documents = self.merged_documents().await;
         let index = self.style_index.read().await;
-        let documents = self.documents.read().await;
         Ok(
             prepare_type_hierarchy_item(&index, &documents, &type_ref.name, encoding)
                 .map(|item| vec![item]),
@@ -1178,8 +1508,8 @@ impl LanguageServer for Backend {
         // The style name travels in the item's `data` (falling back to its `name`); the direct
         // supertype is its base, resolved fresh from the cached index (the namespace is global).
         let name = item_style_name(&params.item);
+        let documents = self.merged_documents().await;
         let index = self.style_index.read().await;
-        let documents = self.documents.read().await;
         // An empty list is the LSP "no supertypes" answer (a native/absent base ends the chain).
         Ok(Some(resolve_supertypes(
             &index, &documents, &name, encoding,
@@ -1194,8 +1524,8 @@ impl LanguageServer for Backend {
         // The style name travels in the item's `data` (falling back to its `name`); the direct
         // subtypes are the styles deriving from it, read from the cached workspace index.
         let name = item_style_name(&params.item);
+        let documents = self.merged_documents().await;
         let index = self.style_index.read().await;
-        let documents = self.documents.read().await;
         // An empty list is a valid answer (nothing derives from this style).
         Ok(Some(resolve_subtypes(&index, &documents, &name, encoding)))
     }
@@ -1226,8 +1556,8 @@ impl LanguageServer for Backend {
         };
 
         // Aggregate: style names fan out across the workspace; ids stay in the current document.
+        let documents = self.merged_documents().await;
         let index = self.style_index.read().await;
-        let documents = self.documents.read().await;
         let locations = collect_references(
             &target,
             &uri,
@@ -1309,8 +1639,8 @@ impl LanguageServer for Backend {
 
         // Build the edits: style names fan out across the workspace; ids stay document-local. An
         // invalid `new_name` surfaces as a JSON-RPC error (never a broken edit).
+        let documents = self.merged_documents().await;
         let index = self.style_index.read().await;
-        let documents = self.documents.read().await;
         build_rename_edits(
             &target,
             &uri,
@@ -1328,8 +1658,8 @@ impl LanguageServer for Backend {
     ) -> RpcResult<Option<Vec<SymbolInformation>>> {
         let encoding = self.encoding();
         // Take both read locks (mirroring `goto_definition`'s discipline: never nest a write lock).
+        let documents = self.merged_documents().await;
         let index = self.style_index.read().await;
-        let documents = self.documents.read().await;
         let symbols = collect_workspace_symbols(&index, &documents, &params.query, encoding);
         // Always return a list (empty is fine and conventional); never `None` for "no matches".
         Ok(Some(symbols))
@@ -1496,11 +1826,25 @@ impl LanguageServer for Backend {
             let mut docs = self.documents.write().await;
             docs.remove(&uri);
         }
-        // Drop the closed document's style defs from the workspace index.
-        self.style_index
-            .write()
-            .await
-            .remove_document(&DocId::from(uri.to_string()));
+        // Semantics change (workspace index): closing a file no longer drops it from the index.
+        // Under open-only indexing that was correct; now a closed `.otui` still lives on disk and
+        // must stay indexed as a closed file. Re-read it from disk and re-index from that text (the
+        // buffer's unsaved edits, if any, are discarded on close — disk is now authoritative). If the
+        // disk read fails (the file was deleted while open), drop it from the index + cache instead.
+        // The read runs off the async runtime (see `read_otui_off_runtime`) so a slow/large read
+        // never stalls the tokio worker shared by all LSP requests.
+        let disk = self.read_otui_off_runtime(&uri).await;
+        // Post-await race guard: `read_otui_off_runtime` yields the executor, so a concurrent
+        // `did_open` for this URI can reinsert its buffer AND index it from that (authoritative)
+        // buffer while we were awaiting. If the file is open again now, do nothing — the open buffer
+        // wins and is already correctly indexed; writing stale disk text (or removing the entry a
+        // `did_open` just created) would clobber it.
+        if !self.is_open(&uri).await {
+            match disk {
+                Some(text) => self.index_from_disk(&uri, text).await,
+                None => self.deindex(&uri).await,
+            }
+        }
         // Clear diagnostics for the closed document.
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
@@ -1661,6 +2005,295 @@ mod tests {
             );
         }
         (index, documents)
+    }
+
+    /// Build a `StyleIndex` + `disk_texts` map from `(uri, text)` entries, indexing each the way the
+    /// workspace scan / did_close does (as a *closed* file: index its defs, cache its disk text).
+    fn disk_workspace(entries: &[(&str, &str)]) -> (StyleIndex, HashMap<Url, String>) {
+        let svc = OtuiService::new();
+        let mut index = StyleIndex::new();
+        let mut disk = HashMap::new();
+        for (uri_str, text) in entries {
+            let uri = Url::parse(uri_str).expect("valid uri");
+            index.set_document(DocId::from(uri.to_string()), svc.style_defs(text));
+            disk.insert(uri, (*text).to_owned());
+        }
+        (index, disk)
+    }
+
+    #[test]
+    fn merge_prefers_the_open_buffer_over_a_stale_disk_entry() {
+        // Same URI in both views: the open buffer (unsaved edits) must win over the on-disk copy.
+        let uri = Url::parse("file:///a.otui").expect("uri");
+        let mut open = HashMap::new();
+        open.insert(
+            uri.clone(),
+            Document {
+                text: "Buffer < UIWidget\n".to_owned(),
+                version: 7,
+            },
+        );
+        let mut disk = HashMap::new();
+        disk.insert(uri.clone(), "Disk < UIWidget\n".to_owned());
+
+        let merged = merge_documents(&open, &disk);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[&uri].text, "Buffer < UIWidget\n");
+        assert_eq!(merged[&uri].version, 7);
+    }
+
+    #[test]
+    fn merge_resolves_a_closed_uri_to_its_disk_text() {
+        // A URI present only on disk (never opened) resolves to the disk text.
+        let open = HashMap::new();
+        let disk_uri = Url::parse("file:///closed.otui").expect("uri");
+        let mut disk = HashMap::new();
+        disk.insert(disk_uri.clone(), "Closed < UIWidget\n".to_owned());
+
+        let merged = merge_documents(&open, &disk);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[&disk_uri].text, "Closed < UIWidget\n");
+    }
+
+    #[test]
+    fn merge_unions_open_and_disk_only_uris() {
+        // One URI open, a different one only on disk: the merged view contains both.
+        let open_uri = Url::parse("file:///open.otui").expect("uri");
+        let disk_uri = Url::parse("file:///disk.otui").expect("uri");
+        let mut open = HashMap::new();
+        open.insert(
+            open_uri.clone(),
+            Document {
+                text: "Open < UIWidget\n".to_owned(),
+                version: 1,
+            },
+        );
+        let mut disk = HashMap::new();
+        disk.insert(disk_uri.clone(), "Disk < UIWidget\n".to_owned());
+
+        let merged = merge_documents(&open, &disk);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[&open_uri].text, "Open < UIWidget\n");
+        assert_eq!(merged[&disk_uri].text, "Disk < UIWidget\n");
+    }
+
+    #[test]
+    fn references_resolve_across_a_mix_of_open_and_disk_only_files() {
+        // `MyPanel` is declared in a CLOSED (disk-only) file and used as a base in an OPEN one. With
+        // the merged view, references must span both — the whole point of a workspace-wide index.
+        let (index, disk) = disk_workspace(&[("file:///defs.otui", "MyPanel < UIWidget\n")]);
+        let mut open = HashMap::new();
+        let use_uri = Url::parse("file:///use.otui").expect("uri");
+        open.insert(
+            use_uri.clone(),
+            Document {
+                text: "Child < MyPanel\n".to_owned(),
+                version: 1,
+            },
+        );
+        let documents = merge_documents(&open, &disk);
+
+        let svc = OtuiService::new();
+        let target = ReferenceTarget::StyleName("MyPanel".to_owned());
+        let locs = collect_references(
+            &target,
+            &use_uri,
+            &documents,
+            &index,
+            &svc,
+            true,
+            PositionEncoding::Utf16,
+        );
+        // The declaration site (closed defs.otui) and the base reference (open use.otui) both resolve.
+        assert_eq!(
+            sorted_locs(&locs),
+            vec![
+                (
+                    "file:///defs.otui".to_owned(),
+                    Position::new(0, 0),
+                    Position::new(0, 7)
+                ),
+                (
+                    "file:///use.otui".to_owned(),
+                    Position::new(0, 8),
+                    Position::new(0, 15)
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn rename_rewrites_across_open_and_disk_only_files() {
+        // Declaration on disk, base ref open: a workspace rename must edit both files.
+        let (index, disk) = disk_workspace(&[("file:///defs.otui", "MyPanel < UIWidget\n")]);
+        let mut open = HashMap::new();
+        let use_uri = Url::parse("file:///use.otui").expect("uri");
+        open.insert(
+            use_uri.clone(),
+            Document {
+                text: "Child < MyPanel\n".to_owned(),
+                version: 1,
+            },
+        );
+        let documents = merge_documents(&open, &disk);
+
+        let svc = OtuiService::new();
+        let target = ReferenceTarget::StyleName("MyPanel".to_owned());
+        let edit = build_rename_edits(
+            &target,
+            &use_uri,
+            &documents,
+            &index,
+            &svc,
+            "Renamed",
+            PositionEncoding::Utf16,
+        )
+        .expect("valid new name")
+        .expect("some edits");
+        let changes = edit.changes.expect("changes keyed by URI");
+        assert_eq!(
+            changes.len(),
+            2,
+            "both the closed def and the open use are edited"
+        );
+        assert!(changes.contains_key(&Url::parse("file:///defs.otui").expect("uri")));
+        assert!(changes.contains_key(&use_uri));
+    }
+
+    #[test]
+    fn open_buffer_wins_when_the_same_uri_is_also_on_disk() {
+        // A stale disk entry for `Old` plus an open buffer redefining it as `New`. The merged view
+        // must resolve the URI to the buffer, so definition lookup sees `New`, not `Old`.
+        let (_stale_index, disk) = disk_workspace(&[("file:///a.otui", "Old < UIWidget\n")]);
+        let uri = Url::parse("file:///a.otui").expect("uri");
+        let mut open = HashMap::new();
+        open.insert(
+            uri.clone(),
+            Document {
+                text: "New < UIWidget\n".to_owned(),
+                version: 2,
+            },
+        );
+        // The index reflects the open buffer (as did_open would have re-indexed it).
+        let svc = OtuiService::new();
+        let mut index = StyleIndex::new();
+        index.set_document(
+            DocId::from(uri.to_string()),
+            svc.style_defs("New < UIWidget\n"),
+        );
+
+        let documents = merge_documents(&open, &disk);
+        // `New` resolves (against the buffer text); the stale `Old` no longer exists anywhere.
+        assert!(
+            resolve_base_definition(&index, &documents, "New", PositionEncoding::Utf16).is_some()
+        );
+        assert!(
+            resolve_base_definition(&index, &documents, "Old", PositionEncoding::Utf16).is_none()
+        );
+    }
+
+    #[test]
+    fn did_close_reindexes_from_disk_text_via_the_pure_path() {
+        // Simulate the did_close semantics on the pure indexing path: a doc that was open is closed,
+        // so it is re-indexed from its *disk* text (fed here directly). The closed file stays in the
+        // index and its span still resolves against the cached disk text.
+        let uri = Url::parse("file:///a.otui").expect("uri");
+        let disk_text = "Panel < UIWidget\n"; // what is on disk at close time
+        let svc = OtuiService::new();
+        let mut index = StyleIndex::new();
+        index.set_document(DocId::from(uri.to_string()), svc.style_defs(disk_text));
+        let mut disk = HashMap::new();
+        disk.insert(uri.clone(), disk_text.to_owned());
+
+        // No open buffers now (the file was closed): the merged view is disk-only.
+        let documents = merge_documents(&HashMap::new(), &disk);
+        let resp = resolve_base_definition(&index, &documents, "Panel", PositionEncoding::Utf16)
+            .expect("closed file still resolves");
+        match resp {
+            GotoDefinitionResponse::Scalar(loc) => assert_eq!(loc.uri, uri),
+            other => panic!("expected a scalar location, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn indexing_an_unparseable_or_binary_text_adds_no_bogus_entries() {
+        // A garbage/binary-looking string must never crash extraction nor land spurious style defs:
+        // it simply contributes no `Name < Base` headers.
+        let svc = OtuiService::new();
+        let mut index = StyleIndex::new();
+        let uri = Url::parse("file:///junk.otui").expect("uri");
+        // Replacement char + NUL + brackets, and crucially no top-level `Name < Base` header.
+        let junk = "\u{fffd}\u{0}not-a-style {{{ ][ \n\t\t garbage bytes";
+        // Extraction is total: it returns whatever headers it finds (here, none) without panicking.
+        let defs = svc.style_defs(junk);
+        index.set_document(DocId::from(uri.to_string()), defs);
+        // No top-level `Name < Base` header → no entries for this document.
+        assert!(index
+            .document(&DocId::from(uri.to_string()))
+            .map_or(true, <[StyleDef]>::is_empty));
+        // And a lookup of anything finds nothing from it.
+        assert!(index.lookup("garbage").is_empty());
+    }
+
+    #[test]
+    fn scan_workspace_indexes_otui_and_skips_binary_and_non_otui() {
+        // A thin end-to-end check of the disk seam (walk + read + filters) against a real temp tree.
+        let base = std::env::temp_dir().join(format!("otui-scan-{}", std::process::id()));
+        let nested = base.join("sub");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+        // A good style file (nested, to exercise recursion).
+        std::fs::write(nested.join("good.otui"), "Panel < UIWidget\n").expect("write good");
+        // A binary `.otui` (invalid UTF-8) must be skipped, not crash the walk.
+        std::fs::write(base.join("binary.otui"), [0xff, 0xfe, 0x00, 0x01]).expect("write binary");
+        // A non-`.otui` file is ignored entirely.
+        std::fs::write(base.join("notes.txt"), "Ignore < UIWidget\n").expect("write txt");
+
+        let root = Url::from_file_path(&base).expect("root url");
+        let mut entries = scan_workspace(&[root]);
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Only the good, valid-UTF-8 `.otui` file comes back.
+        assert_eq!(
+            entries.len(),
+            1,
+            "only good.otui is indexed, got {entries:?}"
+        );
+        assert!(entries[0].0.as_str().ends_with("good.otui"));
+        assert_eq!(entries[0].1, "Panel < UIWidget\n");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn workspace_roots_prefers_folders_then_falls_back_to_root_uri() {
+        use tower_lsp::lsp_types::WorkspaceFolder;
+        // workspace_folders present → its URIs win over root_uri.
+        let params = InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: Url::parse("file:///ws/").expect("uri"),
+                name: "ws".to_owned(),
+            }]),
+            root_uri: Some(Url::parse("file:///legacy/").expect("uri")),
+            ..InitializeParams::default()
+        };
+        assert_eq!(
+            workspace_roots(&params),
+            vec![Url::parse("file:///ws/").expect("uri")]
+        );
+
+        // No folders → the legacy root_uri is used.
+        let params = InitializeParams {
+            workspace_folders: None,
+            root_uri: Some(Url::parse("file:///legacy/").expect("uri")),
+            ..InitializeParams::default()
+        };
+        assert_eq!(
+            workspace_roots(&params),
+            vec![Url::parse("file:///legacy/").expect("uri")]
+        );
+
+        // Neither → empty (fall back to open-docs-only indexing).
+        assert!(workspace_roots(&InitializeParams::default()).is_empty());
     }
 
     #[test]
