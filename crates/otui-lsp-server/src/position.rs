@@ -8,7 +8,7 @@
 //! records the byte offset of every line start, so locating the line for an offset is a binary
 //! search, and the column is a single scan of the (usually short) line prefix.
 
-use tower_lsp::lsp_types::{Position, PositionEncodingKind, Range};
+use lsp_types::{Position, PositionEncodingKind, Range};
 
 /// The unit in which LSP `character` columns are counted.
 ///

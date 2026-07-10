@@ -8,14 +8,14 @@ use lang_api::{
     Diagnostic as CoreDiagnostic, DocumentSymbol as CoreSymbol, Severity,
     SymbolKind as CoreSymbolKind,
 };
-use otui_core::folding::{FoldKind as CoreFoldKind, FoldRange as CoreFoldRange};
-use otui_core::schema::Rgba;
-use tower_lsp::lsp_types::{
+use lsp_types::{
     Color, ColorInformation, CompletionItem as LspCompletionItem,
     CompletionItemKind as LspCompletionItemKind, Diagnostic as LspDiagnostic, DiagnosticSeverity,
     DocumentSymbol as LspSymbol, FoldingRange, FoldingRangeKind, Location, NumberOrString,
     Position, Range, SymbolInformation, SymbolKind as LspSymbolKind, TextEdit, Url,
 };
+use otui_core::folding::{FoldKind as CoreFoldKind, FoldRange as CoreFoldRange};
+use otui_core::schema::Rgba;
 
 use crate::position::{LineIndex, PositionEncoding};
 
@@ -315,8 +315,8 @@ pub fn folds_to_lsp(folds: &[CoreFoldRange]) -> Vec<FoldingRange> {
 mod tests {
     use super::*;
     use lang_api::{ByteSpan, CompletionKind as CoreCompletionKind, LanguageService};
+    use lsp_types::Position;
     use otui_core::OtuiService;
-    use tower_lsp::lsp_types::Position;
 
     #[test]
     fn maps_tab_indentation_diagnostic_from_the_engine() {
@@ -373,7 +373,7 @@ mod tests {
 
     #[test]
     fn converts_nested_symbol_tree_with_ranges_and_kinds() {
-        use tower_lsp::lsp_types::Position;
+        use lsp_types::Position;
 
         // Text laid out so both spans are exercised:
         //   line 0: "Panel"

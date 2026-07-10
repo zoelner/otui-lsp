@@ -11,7 +11,7 @@
 //!    [`LineIndex`].
 
 use lang_api::{SemanticToken as CoreToken, SemanticTokenKind};
-use tower_lsp::lsp_types::{SemanticToken as LspToken, SemanticTokenType, SemanticTokensLegend};
+use lsp_types::{SemanticToken as LspToken, SemanticTokenType, SemanticTokensLegend};
 
 use crate::position::{LineIndex, PositionEncoding};
 

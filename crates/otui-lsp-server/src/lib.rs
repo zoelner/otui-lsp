@@ -5,9 +5,10 @@
 //! in-memory document store, byte-offset ↔ [position](position) conversion, and pushing
 //! [diagnostics](convert) to the client.
 //!
-//! The [`Backend`] type implements [`tower_lsp::LanguageServer`]; the `otui-lsp` binary wires it
-//! over stdio. The pure conversion/mapping logic in [`position`] and [`convert`] is unit-tested
-//! without any real I/O.
+//! The [`Backend`] type holds the synchronous request/notification dispatch; the `otui-lsp` binary
+//! wires it over stdio using the low-level [`lsp_server`] transport (a single blocking receive
+//! loop). The pure conversion/mapping logic in [`position`] and [`convert`] is unit-tested without
+//! any real I/O.
 
 pub mod convert;
 pub mod position;
@@ -15,20 +16,16 @@ pub mod semantic;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
+use crossbeam_channel::Sender;
 use lang_api::{ByteSpan, LanguageService};
-use otui_core::fixes::Fix;
-use otui_core::hover::{Inheritance, StyleHover, StyleHoverKind};
-use otui_core::style_index::{is_native_base, DocId, StyleDef, StyleIndex};
-use otui_core::OtuiService;
-use tokio::sync::RwLock;
-use tower_lsp::jsonrpc::Result as RpcResult;
-use tower_lsp::lsp_types::request::{
+use lsp_server::{ErrorCode, ExtractError, Message, Notification, Request, RequestId, Response};
+use lsp_types::request::{
     GotoImplementationParams, GotoImplementationResponse, GotoTypeDefinitionParams,
     GotoTypeDefinitionResponse,
 };
-use tower_lsp::lsp_types::{
+use lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
     CodeActionProviderCapability, CodeActionResponse, ColorInformation, ColorPresentation,
     ColorPresentationParams, ColorProviderCapability, CompletionOptions, CompletionParams,
@@ -39,17 +36,20 @@ use tower_lsp::lsp_types::{
     FileSystemWatcher, FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability,
     GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
     HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
-    InitializedParams, Location, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf,
-    PositionEncodingKind, PrepareRenameResponse, ReferenceParams, Registration, RenameOptions,
-    RenameParams, SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions,
-    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, ServerInfo, SymbolInformation, SymbolKind, TextDocumentPositionParams,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, TypeDefinitionProviderCapability,
-    TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
-    TypeHierarchySupertypesParams, Url, WorkDoneProgressOptions, WorkspaceEdit,
-    WorkspaceSymbolParams,
+    Location, LogMessageParams, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf,
+    PositionEncodingKind, PrepareRenameResponse, PublishDiagnosticsParams, ReferenceParams,
+    Registration, RegistrationParams, RenameOptions, RenameParams, SemanticTokens,
+    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SymbolInformation,
+    SymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextEdit, TypeDefinitionProviderCapability, TypeHierarchyItem, TypeHierarchyPrepareParams,
+    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Url, WorkDoneProgressOptions,
+    WorkspaceEdit, WorkspaceSymbolParams,
 };
-use tower_lsp::{Client, LanguageServer};
+use otui_core::fixes::Fix;
+use otui_core::hover::{Inheritance, StyleHover, StyleHoverKind};
+use otui_core::style_index::{is_native_base, DocId, StyleDef, StyleIndex};
+use otui_core::OtuiService;
 
 use crate::position::{LineIndex, PositionEncoding};
 
@@ -63,14 +63,17 @@ struct Document {
     version: i32,
 }
 
-/// The LSP backend: holds the client handle, the language engine, the negotiated position
-/// encoding, and the in-memory document store (full text per open URL).
+/// The LSP backend: holds the server→client message sender, the language engine, the negotiated
+/// position encoding, and the in-memory document store (full text per open URL).
 #[derive(Debug)]
 pub struct Backend {
-    client: Client,
+    /// The server→client channel (the write half of the [`lsp_server::Connection`]). Server-pushed
+    /// messages — diagnostics, log messages, and the dynamic `client/registerCapability` requests —
+    /// are sent here; the transport's writer thread serializes them onto stdout.
+    sender: Sender<Message>,
     service: OtuiService,
-    /// Chosen during `initialize`; UTF-16 until then. Guarded by a std [`Mutex`] because it is
-    /// only ever read/written for a fleeting moment, never across an `.await`.
+    /// Chosen during `initialize`; UTF-16 until then. Guarded by a [`Mutex`] because it is
+    /// read/written only for a fleeting moment, never held across other work.
     encoding: Mutex<PositionEncoding>,
     /// Whether the client negotiated `hierarchicalDocumentSymbolSupport` during `initialize`;
     /// decides the `textDocument/documentSymbol` response shape (nested vs. flat). Defaults to
@@ -85,7 +88,7 @@ pub struct Backend {
     /// The workspace-wide `Name < Base` style index (spec §5.2), keyed by document URL string.
     /// Populated at startup by scanning every `.otui` file in the workspace roots and kept in sync
     /// via the document lifecycle (open/change re-index) and file watching
-    /// ([`did_change_watched_files`](LanguageServer::did_change_watched_files)). Consumed by
+    /// (`did_change_watched_files`). Consumed by
     /// go-to-definition (spec §5.3) and the other cross-file features. Guarded independently of
     /// [`documents`](Self::documents): the two locks are never held nested in a way that could
     /// deadlock — each is taken and released cleanly around its critical section. [`Arc`] so the
@@ -98,9 +101,9 @@ pub struct Backend {
     /// scan can populate it from a spawned task.
     disk_texts: Arc<RwLock<HashMap<Url, String>>>,
     /// The workspace root URLs captured during `initialize` (`workspace_folders`, else `root_uri`),
-    /// consumed once by the background scan in `initialized`. Empty when the client opened no folder
-    /// — the server then falls back to open-docs-only indexing. Guarded by a std [`Mutex`] because it
-    /// is written once and read once, never across an `.await`.
+    /// consumed once by the background scan in `run_initialized`. Empty when the client opened no
+    /// folder — the server then falls back to open-docs-only indexing. Guarded by a [`Mutex`]
+    /// because it is written once and read once.
     roots: Mutex<Vec<Url>>,
 }
 
@@ -110,17 +113,18 @@ pub struct Backend {
 const MAX_INDEXED_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 impl Backend {
-    /// Construct a backend bound to `client`, backed by a fresh [`OtuiService`].
-    pub fn new(client: Client) -> Self {
+    /// Construct a backend that sends server→client messages on `sender`, negotiating position
+    /// encoding, hierarchical-symbol support and workspace roots from the client's `params`.
+    pub fn new(sender: Sender<Message>, params: &InitializeParams) -> Self {
         Self {
-            client,
+            sender,
             service: OtuiService::new(),
-            encoding: Mutex::new(PositionEncoding::Utf16),
-            hierarchical_symbols: Mutex::new(false),
+            encoding: Mutex::new(negotiate_encoding(params)),
+            hierarchical_symbols: Mutex::new(client_supports_hierarchical_symbols(params)),
             documents: Arc::new(RwLock::new(HashMap::new())),
             style_index: Arc::new(RwLock::new(StyleIndex::new())),
             disk_texts: Arc::new(RwLock::new(HashMap::new())),
-            roots: Mutex::new(Vec::new()),
+            roots: Mutex::new(workspace_roots(params)),
         }
     }
 
@@ -135,26 +139,54 @@ impl Backend {
             .expect("hierarchical_symbols mutex poisoned")
     }
 
+    /// Send a `window/logMessage` notification to the client (the sync replacement for the old
+    /// `Client::log_message`). Fire-and-forget: a closed channel at shutdown is ignored.
+    fn log(&self, typ: MessageType, message: impl Into<String>) {
+        let params = LogMessageParams {
+            typ,
+            message: message.into(),
+        };
+        let _ = self.sender.send(Message::Notification(Notification::new(
+            "window/logMessage".to_owned(),
+            params,
+        )));
+    }
+
+    /// Push a `textDocument/publishDiagnostics` notification for `uri`. `version` is echoed so the
+    /// client can drop stale results.
+    fn send_diagnostics(&self, uri: Url, diagnostics: Vec<LspDiagnostic>, version: Option<i32>) {
+        let params = PublishDiagnosticsParams {
+            uri,
+            diagnostics,
+            version,
+        };
+        let _ = self.sender.send(Message::Notification(Notification::new(
+            "textDocument/publishDiagnostics".to_owned(),
+            params,
+        )));
+    }
+
     /// Run the engine over `text` and push the resulting diagnostics for `uri`, unless a newer
     /// edit has since superseded `version`.
     ///
-    /// `did_open`/`did_change` can run concurrently, and diagnostics are computed here after the
-    /// document lock has been released — so a slower computation for an older edit could
-    /// otherwise overwrite diagnostics for a newer one. Guard against that by checking `version`
-    /// against the latest version stored for `uri` right before publishing, and discarding stale
-    /// results.
-    async fn publish(&self, uri: Url, text: &str, version: i32) {
+    /// The single-threaded loop processes `did_open`/`did_change` to completion one at a time, so
+    /// the version check here is belt-and-braces: it still discards diagnostics computed for an
+    /// older `version` than the one currently stored for `uri`.
+    fn publish(&self, uri: Url, text: &str, version: i32) {
         let core_diags = self.service.diagnostics(text);
         let lsp_diags = convert::all_to_lsp(text, &core_diags, self.encoding());
 
-        let latest = self.documents.read().await.get(&uri).map(|doc| doc.version);
+        let latest = self
+            .documents
+            .read()
+            .expect("documents lock poisoned")
+            .get(&uri)
+            .map(|doc| doc.version);
         if !is_current_version(latest, version) {
             return;
         }
 
-        self.client
-            .publish_diagnostics(uri, lsp_diags, Some(version))
-            .await;
+        self.send_diagnostics(uri, lsp_diags, Some(version));
     }
 
     /// Re-index `uri`'s style definitions from `text` into the workspace [`StyleIndex`].
@@ -162,11 +194,11 @@ impl Backend {
     /// Run on open/change; extraction is pure and cheap. The index lock is taken only for the
     /// insert, never while any document lock is held (see the [`style_index`](Self::style_index)
     /// note), so the two locks cannot deadlock.
-    async fn reindex_styles(&self, uri: &Url, text: &str) {
+    fn reindex_styles(&self, uri: &Url, text: &str) {
         let defs = self.service.style_defs(text);
         self.style_index
             .write()
-            .await
+            .expect("style_index lock poisoned")
             .set_document(DocId::from(uri.to_string()), defs);
     }
 
@@ -178,62 +210,45 @@ impl Backend {
     /// (`resolve_base_definition`, `collect_references`, …) unchanged. Both read locks are taken and
     /// released here (the returned map is owned), so no document/disk lock is held across the
     /// subsequent `style_index` read — preserving the unnested-lock discipline.
-    async fn merged_documents(&self) -> HashMap<Url, Document> {
-        let open = self.documents.read().await;
-        let disk = self.disk_texts.read().await;
+    fn merged_documents(&self) -> HashMap<Url, Document> {
+        let open = self.documents.read().expect("documents lock poisoned");
+        let disk = self.disk_texts.read().expect("disk_texts lock poisoned");
         merge_documents(&open, &disk)
     }
 
     /// Index `uri` from its on-disk text (the closed-file path used by the initial scan, the file
     /// watcher, and `did_close`): parse `text`, store its style defs in the index and cache the text
     /// in [`disk_texts`](Self::disk_texts) so its spans stay resolvable while the file is closed.
-    async fn index_from_disk(&self, uri: &Url, text: String) {
+    fn index_from_disk(&self, uri: &Url, text: String) {
         let defs = self.service.style_defs(&text);
         self.style_index
             .write()
-            .await
+            .expect("style_index lock poisoned")
             .set_document(DocId::from(uri.to_string()), defs);
-        self.disk_texts.write().await.insert(uri.clone(), text);
+        self.disk_texts
+            .write()
+            .expect("disk_texts lock poisoned")
+            .insert(uri.clone(), text);
     }
 
-    /// Read `uri` from disk **off the async runtime**.
-    ///
-    /// [`read_otui_from_disk`] does blocking `std::fs` I/O (plus the size cap and UTF-8/binary skip);
-    /// calling it inline in an `async fn` would stall a tokio worker — and every LSP request shares
-    /// that runtime — on a slow/large/networked read. So the blocking read is offloaded to a
-    /// `spawn_blocking` thread and awaited. A `JoinError` (the blocking task panicked/was cancelled)
-    /// is treated exactly like an unreadable file: logged and mapped to `None`, so the caller falls
-    /// back to its graceful skip/remove path. No lock is held across this await.
-    async fn read_otui_off_runtime(&self, uri: &Url) -> Option<String> {
-        let uri_owned = uri.clone();
-        match tokio::task::spawn_blocking(move || read_otui_from_disk(&uri_owned)).await {
-            Ok(text) => text,
-            Err(err) => {
-                self.client
-                    .log_message(
-                        MessageType::WARNING,
-                        format!("otui-lsp: disk read task failed for {uri}: {err}"),
-                    )
-                    .await;
-                None
-            }
-        }
-    }
-
-    /// Whether `uri` is currently an open buffer. Takes the `documents` read lock briefly and
-    /// releases it before returning, so callers can re-check open-state after an `.await` without
-    /// holding a lock across the subsequent `style_index`/`disk_texts` write.
-    async fn is_open(&self, uri: &Url) -> bool {
-        self.documents.read().await.contains_key(uri)
+    /// Whether `uri` is currently an open buffer.
+    fn is_open(&self, uri: &Url) -> bool {
+        self.documents
+            .read()
+            .expect("documents lock poisoned")
+            .contains_key(uri)
     }
 
     /// Drop `uri` from both the style index and the disk-text cache (a deleted / vanished file).
-    async fn deindex(&self, uri: &Url) {
+    fn deindex(&self, uri: &Url) {
         self.style_index
             .write()
-            .await
+            .expect("style_index lock poisoned")
             .remove_document(&DocId::from(uri.to_string()));
-        self.disk_texts.write().await.remove(uri);
+        self.disk_texts
+            .write()
+            .expect("disk_texts lock poisoned")
+            .remove(uri);
     }
 }
 
@@ -288,7 +303,8 @@ fn read_otui_from_disk(uri: &Url) -> Option<String> {
 
 /// Recursively collect every `*.otui` file under `roots`, reading each into `(url, text)`.
 ///
-/// Blocking filesystem work — run inside `spawn_blocking`, never on an async worker thread. Symlinks
+/// Blocking filesystem work — run on the dedicated scan thread spawned in `run_initialized`, never
+/// on the single-threaded main loop. Symlinks
 /// are **not** followed (so the walk cannot escape the root or loop), unreadable directories are
 /// skipped, and each file is read through [`read_otui_from_disk`] (so oversized/binary files are
 /// dropped). Duplicate roots (or nested roots) are de-duplicated by URL at the end.
@@ -724,22 +740,24 @@ fn collect_references(
     out
 }
 
-/// The JSON-RPC error returned when a `textDocument/rename` carries a `new_name` that is not a valid
+/// The error message returned when a `textDocument/rename` carries a `new_name` that is not a valid
 /// OTML identifier (spec §rename). Rewriting occurrences with a name the grammar could not re-parse
-/// would silently corrupt the document, so a bad rename is rejected rather than applied.
-fn invalid_identifier_error(new_name: &str) -> tower_lsp::jsonrpc::Error {
-    tower_lsp::jsonrpc::Error::invalid_params(format!(
+/// would silently corrupt the document, so a bad rename is rejected rather than applied. The
+/// dispatch arm turns this message into a JSON-RPC `InvalidParams` [`Response`].
+fn invalid_identifier_message(new_name: &str) -> String {
+    format!(
         "`{new_name}` is not a valid OTML name: it must be non-empty, start with a letter or `_`, \
          and contain only letters, digits, `_` or `-`."
-    ))
+    )
 }
 
 /// Build the [`WorkspaceEdit`] that renames `target` to `new_name` (spec §rename), or `None` when
 /// there is nothing to rename.
 ///
 /// * **Validation.** `new_name` must be a valid OTML identifier (grammar `IDENT`, via
-///   [`is_valid_identifier`](otui_core::schema::is_valid_identifier)); otherwise an
-///   `Err(invalid_params)` is returned — a broken name must never be written into the document.
+///   [`is_valid_identifier`](otui_core::schema::is_valid_identifier)); otherwise an `Err(message)`
+///   is returned (the dispatch arm maps it to a JSON-RPC `InvalidParams` error) — a broken name must
+///   never be written into the document.
 /// * **Style name.** Workspace-global: every open document's declaration(s) **and** base references
 ///   are rewritten. Unlike `references`' `include_declaration`, a rename **always** rewrites the
 ///   definition. A native `UI*` base with no user definition in the index has no declaration to
@@ -759,9 +777,9 @@ fn build_rename_edits(
     service: &OtuiService,
     new_name: &str,
     encoding: PositionEncoding,
-) -> RpcResult<Option<WorkspaceEdit>> {
+) -> Result<Option<WorkspaceEdit>, String> {
     if !otui_core::schema::is_valid_identifier(new_name) {
-        return Err(invalid_identifier_error(new_name));
+        return Err(invalid_identifier_message(new_name));
     }
 
     let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
@@ -822,7 +840,7 @@ fn build_rename_edits(
 /// Matching is **case-insensitive substring** over the style name — simple and predictable, and the
 /// convention the client expects (it filters further as the user types). An **empty query matches
 /// everything**, so the picker opens showing all styles. Each surviving def maps its [`DocId`] back
-/// to a [`Url`] and builds a [`Location`](tower_lsp::lsp_types::Location) for its `name_span` against
+/// to a [`Url`] and builds a [`Location`] for its `name_span` against
 /// **that** target document's own text (via [`convert::location_of`]), exactly as
 /// [`resolve_base_definition`] does. A def whose document is in neither the open nor the disk view is
 /// skipped — its span cannot be mapped to a range. The widget's base
@@ -1026,21 +1044,210 @@ fn client_supports_hierarchical_symbols(params: &InitializeParams) -> bool {
         .unwrap_or(false)
 }
 
-#[tower_lsp::async_trait]
-impl LanguageServer for Backend {
-    async fn initialize(&self, params: InitializeParams) -> RpcResult<InitializeResult> {
-        let encoding = negotiate_encoding(&params);
-        *self.encoding.lock().expect("encoding mutex poisoned") = encoding;
-        *self
-            .hierarchical_symbols
-            .lock()
-            .expect("hierarchical_symbols mutex poisoned") =
-            client_supports_hierarchical_symbols(&params);
+/// Build a JSON-RPC [`Response`] for a request whose handler returns a serializable value.
+///
+/// Extracts the typed params (the `$method` string was already matched, so only a JSON shape
+/// mismatch can fail — reported as `InvalidParams`) and wraps the handler's return value in
+/// `Response::new_ok`. `$handler` is a closure `|params| -> impl Serialize`.
+macro_rules! reply {
+    ($req:expr, $method:literal, $ty:ty, $handler:expr) => {{
+        let req = $req;
+        let fallback_id = req.id.clone();
+        match req.extract::<$ty>($method) {
+            Ok((id, params)) => {
+                let handler = $handler;
+                Response::new_ok(id, handler(params))
+            }
+            Err(ExtractError::JsonError { error, .. }) => Response::new_err(
+                fallback_id,
+                ErrorCode::InvalidParams as i32,
+                error.to_string(),
+            ),
+            Err(ExtractError::MethodMismatch(_)) => Response::new_err(
+                fallback_id,
+                ErrorCode::InternalError as i32,
+                format!("method mismatch dispatching {}", $method),
+            ),
+        }
+    }};
+}
 
-        // Capture the workspace roots now; the background scan in `initialized` consumes them.
-        *self.roots.lock().expect("roots mutex poisoned") = workspace_roots(&params);
+impl Backend {
+    /// Dispatch a client→server [`Request`] to the matching sync handler and build its [`Response`].
+    /// An unknown method yields a `MethodNotFound` error response. (`initialize`/`shutdown` are
+    /// handled by the transport scaffold in `main`, not here.)
+    pub fn handle_request(&self, req: Request) -> Response {
+        let method = req.method.clone();
+        match method.as_str() {
+            "textDocument/hover" => {
+                reply!(req, "textDocument/hover", HoverParams, |p| self.hover(p))
+            }
+            "textDocument/definition" => {
+                reply!(req, "textDocument/definition", GotoDefinitionParams, |p| {
+                    self.goto_definition(p)
+                })
+            }
+            "textDocument/typeDefinition" => reply!(
+                req,
+                "textDocument/typeDefinition",
+                GotoTypeDefinitionParams,
+                |p| self.goto_type_definition(p)
+            ),
+            "textDocument/implementation" => reply!(
+                req,
+                "textDocument/implementation",
+                GotoImplementationParams,
+                |p| self.goto_implementation(p)
+            ),
+            "textDocument/references" => {
+                reply!(req, "textDocument/references", ReferenceParams, |p| self
+                    .references(p))
+            }
+            "textDocument/documentSymbol" => reply!(
+                req,
+                "textDocument/documentSymbol",
+                DocumentSymbolParams,
+                |p| self.document_symbol(p)
+            ),
+            "workspace/symbol" => reply!(req, "workspace/symbol", WorkspaceSymbolParams, |p| self
+                .symbol(p)),
+            "textDocument/completion" => {
+                reply!(req, "textDocument/completion", CompletionParams, |p| self
+                    .completion(p))
+            }
+            "textDocument/codeAction" => {
+                reply!(req, "textDocument/codeAction", CodeActionParams, |p| self
+                    .code_action(p))
+            }
+            "textDocument/formatting" => reply!(
+                req,
+                "textDocument/formatting",
+                DocumentFormattingParams,
+                |p| self.formatting(p)
+            ),
+            "textDocument/foldingRange" => {
+                reply!(req, "textDocument/foldingRange", FoldingRangeParams, |p| {
+                    self.folding_range(p)
+                })
+            }
+            "textDocument/semanticTokens/full" => reply!(
+                req,
+                "textDocument/semanticTokens/full",
+                SemanticTokensParams,
+                |p| self.semantic_tokens_full(p)
+            ),
+            "textDocument/documentColor" => reply!(
+                req,
+                "textDocument/documentColor",
+                DocumentColorParams,
+                |p| self.document_color(p)
+            ),
+            "textDocument/colorPresentation" => reply!(
+                req,
+                "textDocument/colorPresentation",
+                ColorPresentationParams,
+                |p| self.color_presentation(p)
+            ),
+            "textDocument/prepareRename" => reply!(
+                req,
+                "textDocument/prepareRename",
+                TextDocumentPositionParams,
+                |p| self.prepare_rename(p)
+            ),
+            "textDocument/prepareTypeHierarchy" => reply!(
+                req,
+                "textDocument/prepareTypeHierarchy",
+                TypeHierarchyPrepareParams,
+                |p| self.prepare_type_hierarchy(p)
+            ),
+            "typeHierarchy/supertypes" => reply!(
+                req,
+                "typeHierarchy/supertypes",
+                TypeHierarchySupertypesParams,
+                |p| self.supertypes(p)
+            ),
+            "typeHierarchy/subtypes" => reply!(
+                req,
+                "typeHierarchy/subtypes",
+                TypeHierarchySubtypesParams,
+                |p| self.subtypes(p)
+            ),
+            // `rename` is the one handler that can fail with a JSON-RPC error (an invalid new name),
+            // so it is dispatched by hand rather than through `reply!`.
+            "textDocument/rename" => {
+                let fallback_id = req.id.clone();
+                match req.extract::<RenameParams>("textDocument/rename") {
+                    Ok((id, params)) => match self.rename(params) {
+                        Ok(edit) => Response::new_ok(id, edit),
+                        Err(message) => {
+                            Response::new_err(id, ErrorCode::InvalidParams as i32, message)
+                        }
+                    },
+                    Err(ExtractError::JsonError { error, .. }) => Response::new_err(
+                        fallback_id,
+                        ErrorCode::InvalidParams as i32,
+                        error.to_string(),
+                    ),
+                    Err(ExtractError::MethodMismatch(_)) => Response::new_err(
+                        fallback_id,
+                        ErrorCode::InternalError as i32,
+                        "method mismatch dispatching textDocument/rename".to_owned(),
+                    ),
+                }
+            }
+            other => Response::new_err(
+                req.id,
+                ErrorCode::MethodNotFound as i32,
+                format!("unhandled request method: {other}"),
+            ),
+        }
+    }
 
-        Ok(InitializeResult {
+    /// Dispatch a client→server [`Notification`] to the matching sync handler. Unknown methods are
+    /// ignored (per the LSP spec a server may drop notifications it does not implement).
+    pub fn handle_notification(&self, note: Notification) {
+        match note.method.as_str() {
+            // The transport's `initialize_finish` consumes the real `initialized` notification, so
+            // `main` feeds a synthetic one through here after the handshake; the handler needs no
+            // params.
+            "initialized" => self.run_initialized(),
+            "textDocument/didOpen" => {
+                if let Ok(p) = note.extract::<DidOpenTextDocumentParams>("textDocument/didOpen") {
+                    self.did_open(p);
+                }
+            }
+            "textDocument/didChange" => {
+                if let Ok(p) = note.extract::<DidChangeTextDocumentParams>("textDocument/didChange")
+                {
+                    self.did_change(p);
+                }
+            }
+            "textDocument/didClose" => {
+                if let Ok(p) = note.extract::<DidCloseTextDocumentParams>("textDocument/didClose") {
+                    self.did_close(p);
+                }
+            }
+            "workspace/didChangeWatchedFiles" => {
+                if let Ok(p) =
+                    note.extract::<DidChangeWatchedFilesParams>("workspace/didChangeWatchedFiles")
+                {
+                    self.did_change_watched_files(p);
+                }
+            }
+            // `$/cancelRequest` is intentionally unhandled: the single-threaded loop finishes each
+            // request before reading the next, so our (fast) requests are never in flight to cancel.
+            // Honoring cancellation is a future nicety, safe to skip per the LSP spec / rust-analyzer
+            // practice. Any other unknown notification is likewise ignored.
+            _ => {}
+        }
+    }
+
+    /// The `InitializeResult` advertised during the handshake. Encoding, hierarchical-symbol support
+    /// and workspace roots were negotiated in [`Backend::new`]; this only builds the capabilities
+    /// (identical set to the pre-migration server).
+    pub fn initialize_result(&self) -> InitializeResult {
+        let encoding = self.encoding();
+        InitializeResult {
             capabilities: ServerCapabilities {
                 position_encoding: Some(encoding.to_kind()),
                 // FULL sync: the client resends the whole document on every change.
@@ -1114,10 +1321,12 @@ impl LanguageServer for Backend {
                 name: "otui-lsp".to_owned(),
                 version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             }),
-        })
+        }
     }
 
-    async fn initialized(&self, _: InitializedParams) {
+    /// Post-handshake work (run once, after `initialize_finish`): register the two dynamic
+    /// capabilities and kick off the background workspace scan.
+    fn run_initialized(&self) {
         // Type hierarchy (the `Name < Base` graph): this lsp-types (0.94.1) has no static
         // `type_hierarchy_provider` field in `ServerCapabilities`, so the only way to advertise it is
         // dynamic registration. We register **unconditionally** rather than gating on the client's
@@ -1125,91 +1334,67 @@ impl LanguageServer for Backend {
         // flag by default, yet both process an incoming `client/registerCapability` for type
         // hierarchy, so gating on it would make the feature undiscoverable in exactly the clients that
         // matter. A client that genuinely cannot handle the registration replies with an error, which
-        // we log and otherwise ignore (the rest of the server is unaffected). A future lsp-types bump
-        // would let us advertise this statically instead.
-        let registration = Registration {
-            id: "otui-type-hierarchy".to_owned(),
-            method: "textDocument/prepareTypeHierarchy".to_owned(),
-            register_options: None,
-        };
-        if let Err(err) = self.client.register_capability(vec![registration]).await {
-            self.client
-                .log_message(
-                    MessageType::WARNING,
-                    format!("failed to register type hierarchy capability: {err}"),
-                )
-                .await;
-        }
+        // arrives as a `Message::Response` the loop ignores (we do not track the ack). A future
+        // lsp-types bump would let us advertise this statically instead.
+        self.register_capability(
+            "otui-type-hierarchy",
+            Registration {
+                id: "otui-type-hierarchy".to_owned(),
+                method: "textDocument/prepareTypeHierarchy".to_owned(),
+                register_options: None,
+            },
+        );
 
         // Watch every `.otui` in the workspace so the index tracks files edited/created/deleted on
         // disk outside the editor (or in files the user never opens). Registered dynamically for the
         // same reason as type hierarchy above: it is the portable way to request
-        // `workspace/didChangeWatchedFiles`, and a client that cannot honor it simply errors (logged,
-        // otherwise ignored).
-        let watch_registration = Registration {
-            id: "otui-watched-files".to_owned(),
-            method: "workspace/didChangeWatchedFiles".to_owned(),
-            register_options: serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
-                watchers: vec![FileSystemWatcher {
-                    glob_pattern: GlobPattern::String("**/*.otui".to_owned()),
-                    kind: None, // default: create | change | delete
-                }],
-            })
-            .ok(),
-        };
-        if let Err(err) = self
-            .client
-            .register_capability(vec![watch_registration])
-            .await
-        {
-            self.client
-                .log_message(
-                    MessageType::WARNING,
-                    format!("failed to register file-watching capability: {err}"),
-                )
-                .await;
-        }
+        // `workspace/didChangeWatchedFiles`, and (like above) it is fire-and-forget — the client's
+        // ack is a `Message::Response` the loop ignores.
+        self.register_capability(
+            "otui-watched-files",
+            Registration {
+                id: "otui-watched-files".to_owned(),
+                method: "workspace/didChangeWatchedFiles".to_owned(),
+                register_options: serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                    watchers: vec![FileSystemWatcher {
+                        glob_pattern: GlobPattern::String("**/*.otui".to_owned()),
+                        kind: None, // default: create | change | delete
+                    }],
+                })
+                .ok(),
+            },
+        );
 
         // Initial workspace scan: index every `.otui` on disk so cross-file features
-        // (references/rename/definition/…) see closed files, not only open buffers. Spawned as a
-        // background task so `initialized` returns promptly; it walks the roots off the async worker
-        // threads (`spawn_blocking`) and writes into the index incrementally. With no workspace root
-        // (client opened a loose file, not a folder) there is nothing to scan, and the server falls
-        // back to today's open-docs-only indexing.
+        // (references/rename/definition/…) see closed files, not only open buffers. Spawned on a
+        // dedicated `std::thread` so `run_initialized` returns promptly; it walks the roots and
+        // writes into the index incrementally, holding each write lock only per file. With no
+        // workspace root (client opened a loose file, not a folder) there is nothing to scan, and the
+        // server falls back to open-docs-only indexing.
         let roots = self.roots.lock().expect("roots mutex poisoned").clone();
         if roots.is_empty() {
-            self.client
-                .log_message(
-                    MessageType::INFO,
-                    "otui-lsp: no workspace root; indexing open documents only",
-                )
-                .await;
+            self.log(
+                MessageType::INFO,
+                "otui-lsp: no workspace root; indexing open documents only",
+            );
         } else {
             let style_index = Arc::clone(&self.style_index);
             let disk_texts = Arc::clone(&self.disk_texts);
             let documents = Arc::clone(&self.documents);
-            let client = self.client.clone();
-            tokio::spawn(async move {
-                let entries =
-                    match tokio::task::spawn_blocking(move || scan_workspace(&roots)).await {
-                        Ok(entries) => entries,
-                        Err(err) => {
-                            client
-                                .log_message(
-                                    MessageType::WARNING,
-                                    format!("otui-lsp: workspace scan failed: {err}"),
-                                )
-                                .await;
-                            return;
-                        }
-                    };
+            let sender = self.sender.clone();
+            std::thread::spawn(move || {
+                let entries = scan_workspace(&roots);
                 // The scan is stateless, so a fresh service suffices for extraction.
                 let service = OtuiService::new();
                 let mut indexed = 0usize;
                 for (uri, text) in entries {
                     // An open buffer is authoritative: if the file was opened while the scan ran, do
                     // not overwrite its buffer-derived index entry with disk text.
-                    if documents.read().await.contains_key(&uri) {
+                    if documents
+                        .read()
+                        .expect("documents lock poisoned")
+                        .contains_key(&uri)
+                    {
                         continue;
                     }
                     let defs = service.style_defs(&text);
@@ -1217,105 +1402,100 @@ impl LanguageServer for Backend {
                     // scan never blocks request handlers for long.
                     style_index
                         .write()
-                        .await
+                        .expect("style_index lock poisoned")
                         .set_document(DocId::from(uri.to_string()), defs);
-                    disk_texts.write().await.insert(uri, text);
+                    disk_texts
+                        .write()
+                        .expect("disk_texts lock poisoned")
+                        .insert(uri, text);
                     indexed += 1;
                 }
-                client
-                    .log_message(
-                        MessageType::INFO,
-                        format!("otui-lsp: indexed {indexed} workspace .otui file(s)"),
-                    )
-                    .await;
+                let _ = sender.send(Message::Notification(Notification::new(
+                    "window/logMessage".to_owned(),
+                    LogMessageParams {
+                        typ: MessageType::INFO,
+                        message: format!("otui-lsp: indexed {indexed} workspace .otui file(s)"),
+                    },
+                )));
             });
         }
 
-        self.client
-            .log_message(MessageType::INFO, "otui-lsp server ready")
-            .await;
+        self.log(MessageType::INFO, "otui-lsp server ready");
     }
 
-    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+    /// Send a fire-and-forget `client/registerCapability` request for `registration`. The client's
+    /// ack arrives as a `Message::Response` the main loop ignores; we do not track it.
+    fn register_capability(&self, request_id: &str, registration: Registration) {
+        let params = RegistrationParams {
+            registrations: vec![registration],
+        };
+        let request = Request::new(
+            RequestId::from(request_id.to_owned()),
+            "client/registerCapability".to_owned(),
+            params,
+        );
+        let _ = self.sender.send(Message::Request(request));
+    }
+
+    fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         for change in params.changes {
             let uri = change.uri;
             // Open buffer wins: a document open in the editor is authoritative over its on-disk copy,
             // so a disk event for it must never clobber the buffer-derived index entry. did_close
             // re-syncs it from disk once the buffer goes away.
-            if self.documents.read().await.contains_key(&uri) {
+            if self.is_open(&uri) {
                 continue;
             }
             if change.typ == FileChangeType::DELETED {
-                self.deindex(&uri).await;
+                self.deindex(&uri);
             } else if change.typ == FileChangeType::CREATED || change.typ == FileChangeType::CHANGED
             {
-                // Re-read from disk (off the runtime — see `read_otui_off_runtime`) and re-index; skip
-                // (with a log) an unreadable/oversized/binary file.
-                let disk = self.read_otui_off_runtime(&uri).await;
-                // Post-await race guard: the read yields the executor, so the file may have been
-                // opened DURING the await (the pre-await open-check above cannot see that). If it is
-                // open now, its buffer is authoritative and `did_open`/`did_change` already indexed
-                // it — skip the disk-index write so we do not clobber the fresh buffer entry.
-                if self.is_open(&uri).await {
-                    // Opened mid-await: leave the buffer-derived index entry untouched.
-                } else if let Some(text) = disk {
-                    self.index_from_disk(&uri, text).await;
+                // Re-read from disk (synchronously — the single-threaded loop makes an inline read
+                // fine) and re-index; skip (with a log) an unreadable/oversized/binary file.
+                //
+                // The old post-await open-state re-check is gone: with a single-threaded loop this
+                // handler runs to completion before the next message is read, so no concurrent
+                // `did_open` can slip in between the read and the index write. The race is impossible.
+                if let Some(text) = read_otui_from_disk(&uri) {
+                    self.index_from_disk(&uri, text);
                 } else {
-                    self.client
-                        .log_message(
-                            MessageType::INFO,
-                            format!("otui-lsp: skipped unreadable watched file {uri}"),
-                        )
-                        .await;
+                    self.log(
+                        MessageType::INFO,
+                        format!("otui-lsp: skipped unreadable watched file {uri}"),
+                    );
                 }
             }
         }
     }
 
-    async fn shutdown(&self) -> RpcResult<()> {
-        Ok(())
-    }
-
-    async fn semantic_tokens_full(
-        &self,
-        params: SemanticTokensParams,
-    ) -> RpcResult<Option<SemanticTokensResult>> {
+    fn semantic_tokens_full(&self, params: SemanticTokensParams) -> Option<SemanticTokensResult> {
         let uri = params.text_document.uri;
         // Serve from the stored document text; nothing to highlight for an unknown document.
-        let Some(text) = self
+        let text = self
             .documents
             .read()
-            .await
+            .expect("documents lock poisoned")
             .get(&uri)
-            .map(|doc| doc.text.clone())
-        else {
-            return Ok(None);
-        };
+            .map(|doc| doc.text.clone())?;
 
         let core_tokens = self.service.semantic_tokens(&text);
         let data = semantic::encode(&text, &core_tokens, self.encoding());
 
-        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+        Some(SemanticTokensResult::Tokens(SemanticTokens {
             result_id: None,
             data,
-        })))
+        }))
     }
 
-    async fn document_symbol(
-        &self,
-        params: DocumentSymbolParams,
-    ) -> RpcResult<Option<DocumentSymbolResponse>> {
+    fn document_symbol(&self, params: DocumentSymbolParams) -> Option<DocumentSymbolResponse> {
         let uri = params.text_document.uri;
         // Serve from the stored document text; an unknown document has no outline.
-        let Some(text) = self
+        let text = self
             .documents
             .read()
-            .await
+            .expect("documents lock poisoned")
             .get(&uri)
-            .map(|doc| doc.text.clone())
-        else {
-            return Ok(None);
-        };
+            .map(|doc| doc.text.clone())?;
 
         let core_syms = self.service.document_symbols(&text);
         // Honor the client's negotiated shape: hierarchical clients get the nested outline;
@@ -1334,34 +1514,28 @@ impl LanguageServer for Backend {
                 self.encoding(),
             ))
         };
-        Ok(Some(response))
+        Some(response)
     }
 
-    async fn document_color(
-        &self,
-        params: DocumentColorParams,
-    ) -> RpcResult<Vec<ColorInformation>> {
+    fn document_color(&self, params: DocumentColorParams) -> Vec<ColorInformation> {
         let uri = params.text_document.uri;
-        // Serve from the stored document text; an unknown document has no colors. The trait returns
-        // a plain `Vec` (not `Option`), so an unknown document is the empty vec.
+        // Serve from the stored document text; an unknown document has no colors. The request
+        // returns a plain `Vec` (not `Option`), so an unknown document is the empty vec.
         let Some(text) = self
             .documents
             .read()
-            .await
+            .expect("documents lock poisoned")
             .get(&uri)
             .map(|doc| doc.text.clone())
         else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
 
         let core_colors = self.service.document_colors(&text);
-        Ok(convert::colors_to_lsp(&text, &core_colors, self.encoding()))
+        convert::colors_to_lsp(&text, &core_colors, self.encoding())
     }
 
-    async fn color_presentation(
-        &self,
-        params: ColorPresentationParams,
-    ) -> RpcResult<Vec<ColorPresentation>> {
+    fn color_presentation(&self, params: ColorPresentationParams) -> Vec<ColorPresentation> {
         // The picked color, as engine `Rgba`. `range` is where the new text is inserted (the token
         // being replaced) — so each presentation carries a `TextEdit` over that range.
         let color = params.color;
@@ -1371,7 +1545,7 @@ impl LanguageServer for Backend {
             b: color.blue,
             a: color.alpha,
         };
-        let presentations = otui_core::schema::color_presentations(rgba)
+        otui_core::schema::color_presentations(rgba)
             .into_iter()
             .map(|label| ColorPresentation {
                 text_edit: Some(TextEdit {
@@ -1381,210 +1555,160 @@ impl LanguageServer for Backend {
                 label,
                 additional_text_edits: None,
             })
-            .collect();
-        Ok(presentations)
+            .collect()
     }
 
-    async fn folding_range(
-        &self,
-        params: FoldingRangeParams,
-    ) -> RpcResult<Option<Vec<FoldingRange>>> {
+    fn folding_range(&self, params: FoldingRangeParams) -> Option<Vec<FoldingRange>> {
         let uri = params.text_document.uri;
         // Serve from the stored document text; an unknown document has nothing to fold.
-        let Some(text) = self
+        let text = self
             .documents
             .read()
-            .await
+            .expect("documents lock poisoned")
             .get(&uri)
-            .map(|doc| doc.text.clone())
-        else {
-            return Ok(None);
-        };
+            .map(|doc| doc.text.clone())?;
 
         let folds = self.service.folding_ranges(&text);
-        Ok(Some(convert::folds_to_lsp(&folds)))
+        Some(convert::folds_to_lsp(&folds))
     }
 
-    async fn goto_definition(
-        &self,
-        params: GotoDefinitionParams,
-    ) -> RpcResult<Option<GotoDefinitionResponse>> {
+    fn goto_definition(&self, params: GotoDefinitionParams) -> Option<GotoDefinitionResponse> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let encoding = self.encoding();
 
         // Read the request document's text (unknown document → nothing to resolve). Cloned so the
         // documents lock is released before we take the index lock, keeping the two locks unnested.
-        let Some(text) = self
+        let text = self
             .documents
             .read()
-            .await
+            .expect("documents lock poisoned")
             .get(&uri)
-            .map(|doc| doc.text.clone())
-        else {
-            return Ok(None);
-        };
+            .map(|doc| doc.text.clone())?;
 
         // Map the cursor Position to a byte offset, then classify the token under it.
         let offset = LineIndex::new(&text).offset_at(position, encoding);
-        let Some(base_ref) = self.service.base_reference_at(&text, offset) else {
-            return Ok(None);
-        };
+        let base_ref = self.service.base_reference_at(&text, offset)?;
 
         // Resolve against the workspace index, building each target range from its own document.
-        let documents = self.merged_documents().await;
-        let index = self.style_index.read().await;
-        Ok(resolve_base_definition(
-            &index,
-            &documents,
-            &base_ref.name,
-            encoding,
-        ))
+        let documents = self.merged_documents();
+        let index = self.style_index.read().expect("style_index lock poisoned");
+        resolve_base_definition(&index, &documents, &base_ref.name, encoding)
     }
 
-    async fn goto_type_definition(
+    fn goto_type_definition(
         &self,
         params: GotoTypeDefinitionParams,
-    ) -> RpcResult<Option<GotoTypeDefinitionResponse>> {
+    ) -> Option<GotoTypeDefinitionResponse> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let encoding = self.encoding();
 
         // Read the request document's text (unknown document → nothing to resolve). Cloned so the
         // documents lock is released before we take it again for aggregation.
-        let Some(text) = self
+        let text = self
             .documents
             .read()
-            .await
+            .expect("documents lock poisoned")
             .get(&uri)
-            .map(|doc| doc.text.clone())
-        else {
-            return Ok(None);
-        };
+            .map(|doc| doc.text.clone())?;
 
         // Classify the symbol under the cursor into the style name it is an instance of / declares.
         let offset = LineIndex::new(&text).offset_at(position, encoding);
-        let Some(type_ref) = self.service.style_type_at(&text, offset) else {
-            return Ok(None);
-        };
+        let type_ref = self.service.style_type_at(&text, offset)?;
 
         // Resolve its declaration(s) from the cached workspace index (the namespace is global). A
         // native `UI*` type has no user declaration and so resolves to nothing.
-        let documents = self.merged_documents().await;
-        let index = self.style_index.read().await;
-        Ok(resolve_type_definition(
-            &index,
-            &documents,
-            &type_ref.name,
-            encoding,
-        ))
+        let documents = self.merged_documents();
+        let index = self.style_index.read().expect("style_index lock poisoned");
+        resolve_type_definition(&index, &documents, &type_ref.name, encoding)
     }
 
-    async fn goto_implementation(
+    fn goto_implementation(
         &self,
         params: GotoImplementationParams,
-    ) -> RpcResult<Option<GotoImplementationResponse>> {
+    ) -> Option<GotoImplementationResponse> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let encoding = self.encoding();
 
         // Read the request document's text (unknown document → nothing to resolve). Cloned so the
         // documents lock is released before we take it again for aggregation.
-        let Some(text) = self
+        let text = self
             .documents
             .read()
-            .await
+            .expect("documents lock poisoned")
             .get(&uri)
-            .map(|doc| doc.text.clone())
-        else {
-            return Ok(None);
-        };
+            .map(|doc| doc.text.clone())?;
 
         // Classify the style name under the cursor (a header name/base, or a widget instance treated
         // as its type); implementation lists who derives from that name.
         let offset = LineIndex::new(&text).offset_at(position, encoding);
-        let Some(type_ref) = self.service.style_type_at(&text, offset) else {
-            return Ok(None);
-        };
+        let type_ref = self.service.style_type_at(&text, offset)?;
 
         // Aggregate the derivations from the cached workspace index (the namespace is global). No
         // user derivations → `None` (mirroring go-to-definition's empty-is-None convention).
-        let documents = self.merged_documents().await;
-        let index = self.style_index.read().await;
+        let documents = self.merged_documents();
+        let index = self.style_index.read().expect("style_index lock poisoned");
         let locations = collect_implementations(&index, &documents, &type_ref.name, encoding);
         if locations.is_empty() {
-            return Ok(None);
+            return None;
         }
-        Ok(Some(GotoImplementationResponse::Array(locations)))
+        Some(GotoImplementationResponse::Array(locations))
     }
 
-    async fn prepare_type_hierarchy(
+    fn prepare_type_hierarchy(
         &self,
         params: TypeHierarchyPrepareParams,
-    ) -> RpcResult<Option<Vec<TypeHierarchyItem>>> {
+    ) -> Option<Vec<TypeHierarchyItem>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let encoding = self.encoding();
 
         // Read the request document's text (unknown document → nothing to root on). Cloned so the
         // documents lock is released before we take it again for aggregation.
-        let Some(text) = self
+        let text = self
             .documents
             .read()
-            .await
+            .expect("documents lock poisoned")
             .get(&uri)
-            .map(|doc| doc.text.clone())
-        else {
-            return Ok(None);
-        };
+            .map(|doc| doc.text.clone())?;
 
         // Classify the symbol under the cursor into the style name it is an instance of / declares.
         let offset = LineIndex::new(&text).offset_at(position, encoding);
-        let Some(type_ref) = self.service.style_type_at(&text, offset) else {
-            return Ok(None);
-        };
+        let type_ref = self.service.style_type_at(&text, offset)?;
 
         // Root the hierarchy on that style's declaration in the cached workspace index. A native
         // `UI*` name (or any name with no user declaration) has nothing to root on → `None`.
-        let documents = self.merged_documents().await;
-        let index = self.style_index.read().await;
-        Ok(
-            prepare_type_hierarchy_item(&index, &documents, &type_ref.name, encoding)
-                .map(|item| vec![item]),
-        )
+        let documents = self.merged_documents();
+        let index = self.style_index.read().expect("style_index lock poisoned");
+        prepare_type_hierarchy_item(&index, &documents, &type_ref.name, encoding)
+            .map(|item| vec![item])
     }
 
-    async fn supertypes(
-        &self,
-        params: TypeHierarchySupertypesParams,
-    ) -> RpcResult<Option<Vec<TypeHierarchyItem>>> {
+    fn supertypes(&self, params: TypeHierarchySupertypesParams) -> Option<Vec<TypeHierarchyItem>> {
         let encoding = self.encoding();
         // The style name travels in the item's `data` (falling back to its `name`); the direct
         // supertype is its base, resolved fresh from the cached index (the namespace is global).
         let name = item_style_name(&params.item);
-        let documents = self.merged_documents().await;
-        let index = self.style_index.read().await;
+        let documents = self.merged_documents();
+        let index = self.style_index.read().expect("style_index lock poisoned");
         // An empty list is the LSP "no supertypes" answer (a native/absent base ends the chain).
-        Ok(Some(resolve_supertypes(
-            &index, &documents, &name, encoding,
-        )))
+        Some(resolve_supertypes(&index, &documents, &name, encoding))
     }
 
-    async fn subtypes(
-        &self,
-        params: TypeHierarchySubtypesParams,
-    ) -> RpcResult<Option<Vec<TypeHierarchyItem>>> {
+    fn subtypes(&self, params: TypeHierarchySubtypesParams) -> Option<Vec<TypeHierarchyItem>> {
         let encoding = self.encoding();
         // The style name travels in the item's `data` (falling back to its `name`); the direct
         // subtypes are the styles deriving from it, read from the cached workspace index.
         let name = item_style_name(&params.item);
-        let documents = self.merged_documents().await;
-        let index = self.style_index.read().await;
+        let documents = self.merged_documents();
+        let index = self.style_index.read().expect("style_index lock poisoned");
         // An empty list is a valid answer (nothing derives from this style).
-        Ok(Some(resolve_subtypes(&index, &documents, &name, encoding)))
+        Some(resolve_subtypes(&index, &documents, &name, encoding))
     }
 
-    async fn references(&self, params: ReferenceParams) -> RpcResult<Option<Vec<Location>>> {
+    fn references(&self, params: ReferenceParams) -> Option<Vec<Location>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let include_declaration = params.context.include_declaration;
@@ -1592,26 +1716,21 @@ impl LanguageServer for Backend {
 
         // Read the request document's text (unknown document → nothing to resolve). Cloned so the
         // documents lock is released before we take the index lock, keeping the two locks unnested.
-        let Some(text) = self
+        let text = self
             .documents
             .read()
-            .await
+            .expect("documents lock poisoned")
             .get(&uri)
-            .map(|doc| doc.text.clone())
-        else {
-            return Ok(None);
-        };
+            .map(|doc| doc.text.clone())?;
 
         // Map the cursor Position to a byte offset, then classify what it is on. A cursor on neither
         // a style name nor an id has no references.
         let offset = LineIndex::new(&text).offset_at(position, encoding);
-        let Some(target) = classify_reference_target(&self.service, &text, offset) else {
-            return Ok(None);
-        };
+        let target = classify_reference_target(&self.service, &text, offset)?;
 
         // Aggregate: style names fan out across the workspace; ids stay in the current document.
-        let documents = self.merged_documents().await;
-        let index = self.style_index.read().await;
+        let documents = self.merged_documents();
+        let index = self.style_index.read().expect("style_index lock poisoned");
         let locations = collect_references(
             &target,
             &uri,
@@ -1621,52 +1740,44 @@ impl LanguageServer for Backend {
             include_declaration,
             encoding,
         );
-        Ok(Some(locations))
+        Some(locations)
     }
 
-    async fn prepare_rename(
-        &self,
-        params: TextDocumentPositionParams,
-    ) -> RpcResult<Option<PrepareRenameResponse>> {
+    fn prepare_rename(&self, params: TextDocumentPositionParams) -> Option<PrepareRenameResponse> {
         let uri = params.text_document.uri;
         let position = params.position;
         let encoding = self.encoding();
 
         // Read the request document's text (unknown document → not renameable). Cloned so the
         // documents lock is released before we take the index lock, keeping the two locks unnested.
-        let Some(text) = self
+        let text = self
             .documents
             .read()
-            .await
+            .expect("documents lock poisoned")
             .get(&uri)
-            .map(|doc| doc.text.clone())
-        else {
-            return Ok(None);
-        };
+            .map(|doc| doc.text.clone())?;
 
         // Map the cursor Position to a byte offset, then classify the token under it. A cursor on
         // neither a style name nor an id is not renameable here → `None`.
         let line_index = LineIndex::new(&text);
         let offset = line_index.offset_at(position, encoding);
-        let Some((target, span)) = classify_rename_target(&self.service, &text, offset) else {
-            return Ok(None);
-        };
+        let (target, span) = classify_rename_target(&self.service, &text, offset)?;
 
         // A native `UI*` base has no user declaration to rename → not user-renameable, so report it
         // as unrenameable (`None`) rather than pre-selecting a token that a rename would refuse.
         if let ReferenceTarget::StyleName(name) = &target {
-            let index = self.style_index.read().await;
+            let index = self.style_index.read().expect("style_index lock poisoned");
             if is_native_base(name) && index.lookup(name).is_empty() {
-                return Ok(None);
+                return None;
             }
         }
 
         // Echo the exact name/id token range so the client pre-selects it for editing.
         let range = line_index.range(span.start, span.end, encoding);
-        Ok(Some(PrepareRenameResponse::Range(range)))
+        Some(PrepareRenameResponse::Range(range))
     }
 
-    async fn rename(&self, params: RenameParams) -> RpcResult<Option<WorkspaceEdit>> {
+    fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>, String> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let new_name = params.new_name;
@@ -1677,7 +1788,7 @@ impl LanguageServer for Backend {
         let Some(text) = self
             .documents
             .read()
-            .await
+            .expect("documents lock poisoned")
             .get(&uri)
             .map(|doc| doc.text.clone())
         else {
@@ -1692,9 +1803,10 @@ impl LanguageServer for Backend {
         };
 
         // Build the edits: style names fan out across the workspace; ids stay document-local. An
-        // invalid `new_name` surfaces as a JSON-RPC error (never a broken edit).
-        let documents = self.merged_documents().await;
-        let index = self.style_index.read().await;
+        // invalid `new_name` surfaces as an `Err(message)` the dispatch arm maps to a JSON-RPC error
+        // (never a broken edit).
+        let documents = self.merged_documents();
+        let index = self.style_index.read().expect("style_index lock poisoned");
         build_rename_edits(
             &target,
             &uri,
@@ -1706,86 +1818,72 @@ impl LanguageServer for Backend {
         )
     }
 
-    async fn symbol(
-        &self,
-        params: WorkspaceSymbolParams,
-    ) -> RpcResult<Option<Vec<SymbolInformation>>> {
+    fn symbol(&self, params: WorkspaceSymbolParams) -> Option<Vec<SymbolInformation>> {
         let encoding = self.encoding();
         // Take both read locks (mirroring `goto_definition`'s discipline: never nest a write lock).
-        let documents = self.merged_documents().await;
-        let index = self.style_index.read().await;
+        let documents = self.merged_documents();
+        let index = self.style_index.read().expect("style_index lock poisoned");
         let symbols = collect_workspace_symbols(&index, &documents, &params.query, encoding);
         // Always return a list (empty is fine and conventional); never `None` for "no matches".
-        Ok(Some(symbols))
+        Some(symbols)
     }
 
-    async fn hover(&self, params: HoverParams) -> RpcResult<Option<Hover>> {
+    fn hover(&self, params: HoverParams) -> Option<Hover> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let encoding = self.encoding();
 
         // Read the request document's text (unknown document → nothing to hover). Cloned so the
         // documents lock is released before we take the index lock, keeping the two locks unnested.
-        let Some(text) = self
+        let text = self
             .documents
             .read()
-            .await
+            .expect("documents lock poisoned")
             .get(&uri)
-            .map(|doc| doc.text.clone())
-        else {
-            return Ok(None);
-        };
+            .map(|doc| doc.text.clone())?;
 
         // Map the cursor Position to a byte offset, then let the engine describe the token under it,
         // resolving against the workspace index. Only the current doc's LineIndex is needed to map
         // the description's span back to a range.
         let line_index = LineIndex::new(&text);
         let offset = line_index.offset_at(position, encoding);
-        let index = self.style_index.read().await;
-        let Some(desc) = self.service.style_hover_at(&text, offset, &index) else {
-            return Ok(None);
-        };
-        Ok(Some(render_hover(&desc, &line_index, encoding)))
+        let index = self.style_index.read().expect("style_index lock poisoned");
+        let desc = self.service.style_hover_at(&text, offset, &index)?;
+        Some(render_hover(&desc, &line_index, encoding))
     }
 
-    async fn completion(&self, params: CompletionParams) -> RpcResult<Option<CompletionResponse>> {
+    fn completion(&self, params: CompletionParams) -> Option<CompletionResponse> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let encoding = self.encoding();
 
         // Serve from the stored document text; an unknown document has nothing to complete.
-        let Some(text) = self
+        let text = self
             .documents
             .read()
-            .await
+            .expect("documents lock poisoned")
             .get(&uri)
-            .map(|doc| doc.text.clone())
-        else {
-            return Ok(None);
-        };
+            .map(|doc| doc.text.clone())?;
 
         // Map the cursor Position to a byte offset, then ask the engine for the closed set that
         // applies. An empty list is a valid answer (no closed-set context here); return it as such
         // rather than `None`, which some clients treat as "retry".
         let offset = LineIndex::new(&text).offset_at(position, encoding);
         let items = convert::completions_to_lsp(&self.service.complete_at(&text, offset));
-        Ok(Some(CompletionResponse::Array(items)))
+        Some(CompletionResponse::Array(items))
     }
 
-    async fn code_action(&self, params: CodeActionParams) -> RpcResult<Option<CodeActionResponse>> {
+    fn code_action(&self, params: CodeActionParams) -> Option<CodeActionResponse> {
         let uri = params.text_document.uri;
         let encoding = self.encoding();
 
         // Serve from the stored document text; an unknown document has nothing to fix.
-        let Some(text) = self
+        let text = self
             .documents
             .read()
-            .await
+            .expect("documents lock poisoned")
             .get(&uri)
-            .map(|doc| doc.text.clone())
-        else {
-            return Ok(None);
-        };
+            .map(|doc| doc.text.clone())?;
 
         // Map the requested LSP range to a byte span, then let the engine compute the fixes that
         // overlap it. An empty list is a valid answer (nothing fixable here); return it as such.
@@ -1802,44 +1900,36 @@ impl LanguageServer for Backend {
             &params.context.diagnostics,
             encoding,
         );
-        Ok(Some(actions))
+        Some(actions)
     }
 
-    async fn formatting(
-        &self,
-        params: DocumentFormattingParams,
-    ) -> RpcResult<Option<Vec<TextEdit>>> {
+    fn formatting(&self, params: DocumentFormattingParams) -> Option<Vec<TextEdit>> {
         let uri = params.text_document.uri;
         let encoding = self.encoding();
 
         // Serve from the stored document text; an unknown document has nothing to format.
-        let Some(text) = self
+        let text = self
             .documents
             .read()
-            .await
+            .expect("documents lock poisoned")
             .get(&uri)
-            .map(|doc| doc.text.clone())
-        else {
-            return Ok(None);
-        };
+            .map(|doc| doc.text.clone())?;
 
         // Ask the engine to format. `None` means the document does not parse cleanly (parse error /
         // `ERROR`/`MISSING` node); per the safety gate we then return no edits. Otherwise reply with
         // a single whole-document replace of the formatted text.
-        let Some(formatted) = self.service.format(&text) else {
-            return Ok(None);
-        };
-        Ok(Some(vec![convert::full_document_edit(
+        let formatted = self.service.format(&text)?;
+        Some(vec![convert::full_document_edit(
             &text, formatted, encoding,
-        )]))
+        )])
     }
 
-    async fn did_open(&self, params: DidOpenTextDocumentParams) {
+    fn did_open(&self, params: DidOpenTextDocumentParams) {
         let doc = params.text_document;
         let uri = doc.uri;
         let version = doc.version;
         {
-            let mut docs = self.documents.write().await;
+            let mut docs = self.documents.write().expect("documents lock poisoned");
             docs.insert(
                 uri.clone(),
                 Document {
@@ -1848,11 +1938,11 @@ impl LanguageServer for Backend {
                 },
             );
         }
-        self.reindex_styles(&uri, &doc.text).await;
-        self.publish(uri, &doc.text, version).await;
+        self.reindex_styles(&uri, &doc.text);
+        self.publish(uri, &doc.text, version);
     }
 
-    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+    fn did_change(&self, params: DidChangeTextDocumentParams) {
         // FULL sync: the last content change carries the entire new document text.
         let Some(change) = params.content_changes.into_iter().last() else {
             return;
@@ -1861,7 +1951,7 @@ impl LanguageServer for Backend {
         let version = params.text_document.version;
         let text = change.text;
         {
-            let mut docs = self.documents.write().await;
+            let mut docs = self.documents.write().expect("documents lock poisoned");
             docs.insert(
                 uri.clone(),
                 Document {
@@ -1870,44 +1960,39 @@ impl LanguageServer for Backend {
                 },
             );
         }
-        self.reindex_styles(&uri, &text).await;
-        self.publish(uri, &text, version).await;
+        self.reindex_styles(&uri, &text);
+        self.publish(uri, &text, version);
     }
 
-    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+    fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
         {
-            let mut docs = self.documents.write().await;
+            let mut docs = self.documents.write().expect("documents lock poisoned");
             docs.remove(&uri);
         }
         // Semantics change (workspace index): closing a file no longer drops it from the index.
         // Under open-only indexing that was correct; now a closed `.otui` still lives on disk and
-        // must stay indexed as a closed file. Re-read it from disk and re-index from that text (the
-        // buffer's unsaved edits, if any, are discarded on close — disk is now authoritative). If the
-        // disk read fails (the file was deleted while open), drop it from the index + cache instead.
-        // The read runs off the async runtime (see `read_otui_off_runtime`) so a slow/large read
-        // never stalls the tokio worker shared by all LSP requests.
-        let disk = self.read_otui_off_runtime(&uri).await;
-        // Post-await race guard: `read_otui_off_runtime` yields the executor, so a concurrent
-        // `did_open` for this URI can reinsert its buffer AND index it from that (authoritative)
-        // buffer while we were awaiting. If the file is open again now, do nothing — the open buffer
-        // wins and is already correctly indexed; writing stale disk text (or removing the entry a
-        // `did_open` just created) would clobber it.
-        if !self.is_open(&uri).await {
-            match disk {
-                Some(text) => self.index_from_disk(&uri, text).await,
-                None => self.deindex(&uri).await,
-            }
+        // must stay indexed as a closed file. Re-read it from disk (inline — the single-threaded loop
+        // makes a sync read fine) and re-index from that text (the buffer's unsaved edits, if any,
+        // are discarded on close — disk is now authoritative). If the disk read fails (the file was
+        // deleted while open), drop it from the index + cache instead.
+        //
+        // The old post-await open-state re-check is gone: with a single-threaded loop this handler
+        // runs to completion before the next message is read, so no concurrent `did_open` can slip in
+        // between the read and the index write. The race is impossible.
+        match read_otui_from_disk(&uri) {
+            Some(text) => self.index_from_disk(&uri, text),
+            None => self.deindex(&uri),
         }
         // Clear diagnostics for the closed document.
-        self.client.publish_diagnostics(uri, Vec::new(), None).await;
+        self.send_diagnostics(uri, Vec::new(), None);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tower_lsp::lsp_types::{
+    use lsp_types::{
         ClientCapabilities, DocumentSymbolClientCapabilities, GeneralClientCapabilities, Position,
         Range, TextDocumentClientCapabilities,
     };
@@ -2320,7 +2405,7 @@ mod tests {
 
     #[test]
     fn workspace_roots_prefers_folders_then_falls_back_to_root_uri() {
-        use tower_lsp::lsp_types::WorkspaceFolder;
+        use lsp_types::WorkspaceFolder;
         // workspace_folders present → its URIs win over root_uri.
         let params = InitializeParams {
             workspace_folders: Some(vec![WorkspaceFolder {
@@ -2997,7 +3082,8 @@ mod tests {
         let svc = OtuiService::new();
         let uri = Url::parse("file:///a.otui").expect("uri");
         let target = ReferenceTarget::StyleName("MyPanel".to_owned());
-        // A name containing a space is not a valid identifier → a JSON-RPC error, never an edit.
+        // A name containing a space is not a valid identifier → an `Err(message)` (which the
+        // dispatch arm turns into a JSON-RPC `InvalidParams` error), never an edit.
         let err = build_rename_edits(
             &target,
             &uri,
@@ -3008,7 +3094,10 @@ mod tests {
             PositionEncoding::Utf16,
         )
         .expect_err("an invalid new name is rejected");
-        assert_eq!(err.code, tower_lsp::jsonrpc::ErrorCode::InvalidParams);
+        assert!(
+            err.contains("not a valid OTML name"),
+            "unexpected message: {err}"
+        );
     }
 
     #[test]
