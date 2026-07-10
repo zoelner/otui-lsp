@@ -207,6 +207,23 @@ impl OtuiService {
         format::format(source)
     }
 
+    /// Format `source` as a whole, then return only the [`LineEdit`](format::LineEdit)s for the
+    /// lines in `[start_line, end_line]` (inclusive, 0-based) that actually changed — the primitive
+    /// behind `textDocument/rangeFormatting`. Returns [`None`] on the same safety gate as
+    /// [`format`](Self::format) (a document that does not parse cleanly is left untouched). See
+    /// [`format::format_line_edits`] for how the whole-document format is scoped to the range.
+    ///
+    /// Inherent (not on the [`LanguageService`] trait), mirroring [`format`](Self::format).
+    #[must_use]
+    pub fn format_line_edits(
+        &self,
+        source: &str,
+        start_line: u32,
+        end_line: u32,
+    ) -> Option<Vec<format::LineEdit>> {
+        format::format_line_edits(source, start_line, end_line)
+    }
+
     /// Compute the folding ranges for `source` (spec §2): one collapsible region per multi-line
     /// widget block (`container` / `style_header`) and per multi-line block-scalar body, plus one
     /// per run of consecutive full-line comments. Line numbers are 0-based; a single-line construct
