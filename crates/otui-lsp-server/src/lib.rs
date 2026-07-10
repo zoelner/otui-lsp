@@ -218,6 +218,13 @@ impl Backend {
         }
     }
 
+    /// Whether `uri` is currently an open buffer. Takes the `documents` read lock briefly and
+    /// releases it before returning, so callers can re-check open-state after an `.await` without
+    /// holding a lock across the subsequent `style_index`/`disk_texts` write.
+    async fn is_open(&self, uri: &Url) -> bool {
+        self.documents.read().await.contains_key(uri)
+    }
+
     /// Drop `uri` from both the style index and the disk-text cache (a deleted / vanished file).
     async fn deindex(&self, uri: &Url) {
         self.style_index
@@ -1238,7 +1245,14 @@ impl LanguageServer for Backend {
             {
                 // Re-read from disk (off the runtime — see `read_otui_off_runtime`) and re-index; skip
                 // (with a log) an unreadable/oversized/binary file.
-                if let Some(text) = self.read_otui_off_runtime(&uri).await {
+                let disk = self.read_otui_off_runtime(&uri).await;
+                // Post-await race guard: the read yields the executor, so the file may have been
+                // opened DURING the await (the pre-await open-check above cannot see that). If it is
+                // open now, its buffer is authoritative and `did_open`/`did_change` already indexed
+                // it — skip the disk-index write so we do not clobber the fresh buffer entry.
+                if self.is_open(&uri).await {
+                    // Opened mid-await: leave the buffer-derived index entry untouched.
+                } else if let Some(text) = disk {
                     self.index_from_disk(&uri, text).await;
                 } else {
                     self.client
@@ -1819,9 +1833,17 @@ impl LanguageServer for Backend {
         // disk read fails (the file was deleted while open), drop it from the index + cache instead.
         // The read runs off the async runtime (see `read_otui_off_runtime`) so a slow/large read
         // never stalls the tokio worker shared by all LSP requests.
-        match self.read_otui_off_runtime(&uri).await {
-            Some(text) => self.index_from_disk(&uri, text).await,
-            None => self.deindex(&uri).await,
+        let disk = self.read_otui_off_runtime(&uri).await;
+        // Post-await race guard: `read_otui_off_runtime` yields the executor, so a concurrent
+        // `did_open` for this URI can reinsert its buffer AND index it from that (authoritative)
+        // buffer while we were awaiting. If the file is open again now, do nothing — the open buffer
+        // wins and is already correctly indexed; writing stale disk text (or removing the entry a
+        // `did_open` just created) would clobber it.
+        if !self.is_open(&uri).await {
+            match disk {
+                Some(text) => self.index_from_disk(&uri, text).await,
+                None => self.deindex(&uri).await,
+            }
         }
         // Clear diagnostics for the closed document.
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
