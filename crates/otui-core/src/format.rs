@@ -134,6 +134,71 @@ pub fn format(source: &str) -> Option<String> {
     Some(format!("{trimmed}\n"))
 }
 
+/// A single line-scoped replacement produced by [`format_line_edits`]: replace the whole content of
+/// original line [`line`](LineEdit::line) (0-based) with [`new_text`](LineEdit::new_text) (the
+/// canonical form of that line, WITHOUT any terminating newline). The server maps each one onto an
+/// `lsp_types::TextEdit` whose range covers that line from column 0 to its end. Pure — byte-free line
+/// numbers, no `lsp-types`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineEdit {
+    /// 0-based index of the ORIGINAL line this edit rewrites.
+    pub line: u32,
+    /// The line's canonical content (no trailing newline).
+    pub new_text: String,
+}
+
+/// Format `source` as a whole, then return only the [`LineEdit`]s for the lines in
+/// `[start_line, end_line]` (inclusive, 0-based) that actually changed — the primitive behind
+/// `textDocument/rangeFormatting`.
+///
+/// The formatter needs the full document to compute each line's structural depth (from the CST), so
+/// there is no way to format a fragment in isolation; instead we [`format`] the whole document and
+/// then scope the edits. Both the original and formatted text are split into lines and, for each
+/// line index in the requested range, an edit is emitted only when the original and formatted line
+/// **contents differ**. Lines outside the range are never emitted, even if the whole-document format
+/// would change them — line-granular formatting is the standard, correct granularity for an
+/// indentation-structured language (a range that only partially covers a line still reformats that
+/// whole line).
+///
+/// Returns [`None`] exactly when [`format`] does — a document that does not parse cleanly is left
+/// untouched, the same safety gate as whole-document formatting.
+///
+/// **Line correspondence.** The whole-document pass rewrites lines 1:1 for the entire common prefix:
+/// it only re-indents / re-spaces / trims each structural line in place and never inserts or removes
+/// an interior line (interior blank lines are preserved). The two views can diverge only at the
+/// **tail**, where the whole-document pass may collapse trailing blank lines into the single final
+/// newline (or, for an empty document, produce no lines at all). Adding the final newline never
+/// changes any line's *content* (a trailing `\n` yields no extra line here), so it is invisible to a
+/// content comparison. To stay robust against the tail divergence we compare only line indices that
+/// exist in **both** views; the tail-only collapse is the whole-document formatter's job and is
+/// deliberately out of scope for line-granular range formatting.
+#[must_use]
+pub fn format_line_edits(source: &str, start_line: u32, end_line: u32) -> Option<Vec<LineEdit>> {
+    let formatted = format(source)?;
+    let orig = split_lines(source);
+    let fmt = split_lines(&formatted);
+
+    // The last line index present in BOTH views (exclusive upper bound). Beyond this the two
+    // diverge only at the tail (trailing-blank collapse / final-newline), which range formatting
+    // intentionally leaves to the whole-document pass.
+    let common = orig.len().min(fmt.len());
+    let start = start_line as usize;
+    // `end_line` is inclusive; clamp the exclusive bound to the common length (this also clamps an
+    // out-of-range `end_line` to the document's bounds).
+    let end = (end_line as usize).saturating_add(1).min(common);
+
+    let mut edits = Vec::new();
+    for i in start..end {
+        if orig[i].text != fmt[i].text {
+            edits.push(LineEdit {
+                line: i as u32,
+                new_text: fmt[i].text.to_owned(),
+            });
+        }
+    }
+    Some(edits)
+}
+
 /// Metadata for a source line that begins a structural node or a comment.
 struct LineMeta {
     /// The node's nesting depth (number of statement-node ancestors) — the line's leading
@@ -553,5 +618,104 @@ Panel
             let twice = format(&once).expect("re-formats");
             assert_eq!(once, twice, "not idempotent for {src:?}");
         }
+    }
+
+    #[test]
+    fn line_edits_only_touch_changed_lines_in_range() {
+        // All three properties are uniformly over-indented (6 spaces) and would each change to the
+        // canonical 2 spaces under a whole-document format. (Uniform indent avoids a mixed-indent
+        // sibling parsing as a shallower statement.) Requesting only lines 1..=2 yields edits for
+        // lines 1 and 2 only — line 3 (changed but out of range) is not touched.
+        let src = "Panel\n      id: main\n      width: 10\n      height: 20\n";
+        let edits = format_line_edits(src, 1, 2).expect("formats");
+        assert_eq!(
+            edits,
+            vec![
+                LineEdit {
+                    line: 1,
+                    new_text: "  id: main".to_owned(),
+                },
+                LineEdit {
+                    line: 2,
+                    new_text: "  width: 10".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn line_edits_cover_each_changed_line_in_range_with_correct_text() {
+        // A range spanning two changed lines yields one edit each, with the right line numbers and
+        // canonical text (indentation fixed on line 1, indentation AND `key:value` spacing on line
+        // 2). Both properties share a uniform 4-space indent so they parse as siblings of `Panel`.
+        let src = "Panel\n    id: main\n    width:10\n";
+        let edits = format_line_edits(src, 0, 2).expect("formats");
+        assert_eq!(
+            edits,
+            vec![
+                LineEdit {
+                    line: 1,
+                    new_text: "  id: main".to_owned(),
+                },
+                LineEdit {
+                    line: 2,
+                    new_text: "  width: 10".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn line_edits_exclude_changed_lines_outside_the_range() {
+        // Both properties are over-indented and would change; requesting only line 2 must yield an
+        // edit for line 2 alone — line 1, though it would also change, is out of range and excluded.
+        let src = "Panel\n    id: main\n    width: 10\n";
+        let edits = format_line_edits(src, 2, 2).expect("formats");
+        assert_eq!(
+            edits,
+            vec![LineEdit {
+                line: 2,
+                new_text: "  width: 10".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn line_edits_for_an_already_canonical_range_are_empty() {
+        let src = "Panel\n  id: main\n  width: 10\n";
+        let edits = format_line_edits(src, 0, 2).expect("formats");
+        assert!(edits.is_empty(), "{edits:?}");
+    }
+
+    #[test]
+    fn line_edits_leave_block_scalar_body_lines_untouched() {
+        // The `|` body lines (2 and 3) are emitted verbatim by the formatter, so a range covering
+        // them yields no edits — even though the marker line 1 is over-indented and would change if
+        // it were in range. Requesting only the body lines returns nothing.
+        let src = "Panel\n    @onClick: |\n        body()\n        more()\n";
+        let edits = format_line_edits(src, 2, 3).expect("formats");
+        assert!(edits.is_empty(), "{edits:?}");
+    }
+
+    #[test]
+    fn line_edits_return_none_for_a_parse_error_document() {
+        // Same safety gate as whole-document formatting: an ERROR node → None, so the caller edits
+        // nothing.
+        assert!(format_line_edits("x: [a, b\n", 0, 0).is_none());
+    }
+
+    #[test]
+    fn line_edits_clamp_an_out_of_range_end_to_the_document_bounds() {
+        // `end_line` far past EOF is clamped to the last real line; only the in-bounds changed line
+        // (1) is edited, with no panic on the out-of-range indices.
+        let src = "Panel\n    id: main\n";
+        let edits = format_line_edits(src, 0, 999).expect("formats");
+        assert_eq!(
+            edits,
+            vec![LineEdit {
+                line: 1,
+                new_text: "  id: main".to_owned(),
+            }]
+        );
     }
 }

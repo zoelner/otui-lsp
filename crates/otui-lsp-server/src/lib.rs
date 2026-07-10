@@ -42,20 +42,20 @@ use lsp_types::{
     DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentColorParams,
     DocumentFormattingParams, DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
-    DocumentLink, DocumentLinkOptions, DocumentLinkParams, DocumentSymbolParams,
-    DocumentSymbolResponse, FileChangeType, FileSystemWatcher, FoldingRange, FoldingRangeParams,
-    FoldingRangeProviderCapability, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse,
-    Hover, HoverContents, HoverParams, HoverProviderCapability, ImplementationProviderCapability,
-    InitializeParams, InitializeResult, Location, LogMessageParams, MarkupContent, MarkupKind,
-    MessageType, NumberOrString, OneOf, PositionEncodingKind, PrepareRenameResponse,
-    PublishDiagnosticsParams, ReferenceParams, Registration, RegistrationParams, RenameOptions,
-    RenameParams, SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions,
-    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, ServerInfo, SymbolInformation, SymbolKind, TextDocumentPositionParams,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, TypeDefinitionProviderCapability,
-    TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
-    TypeHierarchySupertypesParams, Uri, WorkDoneProgressOptions, WorkspaceEdit,
-    WorkspaceSymbolParams,
+    DocumentLink, DocumentLinkOptions, DocumentLinkParams, DocumentRangeFormattingParams,
+    DocumentSymbolParams, DocumentSymbolResponse, FileChangeType, FileSystemWatcher, FoldingRange,
+    FoldingRangeParams, FoldingRangeProviderCapability, GlobPattern, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
+    ImplementationProviderCapability, InitializeParams, InitializeResult, Location,
+    LogMessageParams, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf,
+    PositionEncodingKind, PrepareRenameResponse, PublishDiagnosticsParams, ReferenceParams,
+    Registration, RegistrationParams, RenameOptions, RenameParams, SemanticTokens,
+    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SymbolInformation,
+    SymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextEdit, TypeDefinitionProviderCapability, TypeHierarchyItem, TypeHierarchyPrepareParams,
+    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri, WorkDoneProgressOptions,
+    WorkspaceEdit, WorkspaceSymbolParams,
 };
 use otui_core::fixes::Fix;
 use otui_core::hover::{Inheritance, StyleHover, StyleHoverKind};
@@ -1280,6 +1280,12 @@ impl Backend {
                 DocumentFormattingParams,
                 |p| self.formatting(p)
             ),
+            "textDocument/rangeFormatting" => reply!(
+                req,
+                "textDocument/rangeFormatting",
+                DocumentRangeFormattingParams,
+                |p| self.range_formatting(p)
+            ),
             "textDocument/foldingRange" => {
                 reply!(req, "textDocument/foldingRange", FoldingRangeParams, |p| {
                     self.folding_range(p)
@@ -1459,6 +1465,9 @@ impl Backend {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 // Formatting: whole-document, conservative whitespace normalization (spec §8).
                 document_formatting_provider: Some(OneOf::Left(true)),
+                // Range formatting: reuse the whole-document formatter but scope the resulting edits
+                // to the lines the user selected (spec §8).
+                document_range_formatting_provider: Some(OneOf::Left(true)),
                 // Completion: the OTML closed sets (spec §6). `$` / `@` / `.` / `!` re-trigger
                 // completion as those characters open a `$state` selector, an `@event` key, an
                 // `anchors.<edge>` / `<target>.<edge>` dotted position, or a `!`-negated state in a
@@ -2181,6 +2190,52 @@ impl Backend {
         Some(vec![convert::full_document_edit(
             &text, formatted, encoding,
         )])
+    }
+
+    fn range_formatting(&self, params: DocumentRangeFormattingParams) -> Option<Vec<TextEdit>> {
+        let uri = params.text_document.uri;
+        let encoding = self.encoding();
+
+        // Serve from the stored document text; an unknown document has nothing to format.
+        let text = self
+            .documents
+            .read()
+            .expect("documents lock poisoned")
+            .get(&uri)
+            .map(|doc| doc.text.clone())?;
+
+        // Format the whole document (the formatter needs the full CST for structural depth) and keep
+        // only the edits for lines that intersect the requested range and actually changed. `None`
+        // means the document does not parse cleanly (parse error / `ERROR`/`MISSING` node); per the
+        // same safety gate as whole-document formatting we then return no edits. A range that only
+        // partially covers a line still reformats that whole line — line granularity is the correct
+        // unit for an indentation-structured language.
+        let line_edits = self.service.format_line_edits(
+            &text,
+            params.range.start.line,
+            params.range.end.line,
+        )?;
+
+        // Map each line edit onto a `TextEdit` whose range covers that whole original line, from
+        // column 0 to the line's end (a huge column clamps to the line end, before any `\r\n`, via
+        // `LineIndex::offset_at`). Replacing only the content leaves the line's terminator intact.
+        let line_index = LineIndex::new(&text);
+        let edits = line_edits
+            .into_iter()
+            .map(|edit| {
+                let start = lsp_types::Position::new(edit.line, 0);
+                let end_offset =
+                    line_index.offset_at(lsp_types::Position::new(edit.line, u32::MAX), encoding);
+                TextEdit {
+                    range: lsp_types::Range {
+                        start,
+                        end: line_index.position(end_offset, encoding),
+                    },
+                    new_text: edit.new_text,
+                }
+            })
+            .collect();
+        Some(edits)
     }
 
     fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -4038,5 +4093,79 @@ mod tests {
         let uri = Uri::from_str("untitled:Untitled-1").expect("uri");
         let backend = backend_with_doc(&uri, "Panel\n  image-source: images/x.png\n", Vec::new());
         assert!(backend.document_link(link_params(&uri)).is_none());
+    }
+
+    fn range_formatting_params(
+        uri: &Uri,
+        range: lsp_types::Range,
+    ) -> DocumentRangeFormattingParams {
+        use lsp_types::{FormattingOptions, TextDocumentIdentifier, WorkDoneProgressParams};
+        DocumentRangeFormattingParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range,
+            options: FormattingOptions::default(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        }
+    }
+
+    #[test]
+    fn range_formatting_returns_edits_only_for_changed_lines_in_range() {
+        use lsp_types::{Position, Range};
+        // Both properties are uniformly over-indented (4 spaces) and would change under a
+        // whole-document format; selecting only line 1 must edit line 1 alone — line 2, though it
+        // would also change, is out of range and excluded.
+        let uri = Uri::from_str("file:///x.otui").expect("uri");
+        let text = "Panel\n    id: main\n    width: 10\n";
+        let backend = backend_with_doc(&uri, text, Vec::new());
+
+        // A range whose start/end land mid-line still reformats the whole line.
+        let range = Range {
+            start: Position::new(1, 3),
+            end: Position::new(1, 7),
+        };
+        let edits = backend
+            .range_formatting(range_formatting_params(&uri, range))
+            .expect("known, parseable document");
+
+        assert_eq!(edits.len(), 1, "got {edits:?}");
+        let edit = &edits[0];
+        // The whole of original line 1 (col 0 to its end) is replaced with the canonical text.
+        assert_eq!(edit.range.start, Position::new(1, 0));
+        assert_eq!(
+            edit.range.end,
+            Position::new(1, "    id: main".len() as u32)
+        );
+        assert_eq!(edit.new_text, "  id: main");
+    }
+
+    #[test]
+    fn range_formatting_on_unparsable_document_is_none() {
+        use lsp_types::{Position, Range};
+        // Same safety gate as whole-document formatting: an unterminated inline array is an ERROR
+        // node, so the engine returns None and the server makes no edit.
+        let uri = Uri::from_str("file:///bad.otui").expect("uri");
+        let backend = backend_with_doc(&uri, "x: [a, b\n", Vec::new());
+        let range = Range {
+            start: Position::new(0, 0),
+            end: Position::new(0, 8),
+        };
+        assert!(backend
+            .range_formatting(range_formatting_params(&uri, range))
+            .is_none());
+    }
+
+    #[test]
+    fn range_formatting_on_unknown_document_is_none() {
+        use lsp_types::{Position, Range};
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let backend = Backend::new(tx, &InitializeParams::default());
+        let uri = Uri::from_str("file:///nope.otui").expect("uri");
+        let range = Range {
+            start: Position::new(0, 0),
+            end: Position::new(0, 0),
+        };
+        assert!(backend
+            .range_formatting(range_formatting_params(&uri, range))
+            .is_none());
     }
 }
