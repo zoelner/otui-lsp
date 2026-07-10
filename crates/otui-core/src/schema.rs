@@ -184,6 +184,31 @@ pub enum ColorForm {
     Functional,
 }
 
+/// A resolved color as four channels, each a normalized `f32` in `[0, 1]` — the shape the LSP
+/// `documentColor` feature wants (LSP `Color`). Computed by [`color_value`] from any of the OTML
+/// color forms (hex / functional / named), faithful to the engine's `Color::operator>>`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rgba {
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+}
+
+impl Rgba {
+    /// Build an [`Rgba`] from integer `0..=255` channels (the engine's native `uint8_t` channels),
+    /// normalizing each to `[0, 1]`.
+    #[must_use]
+    pub(crate) fn from_u8(r: u8, g: u8, b: u8, a: u8) -> Self {
+        Self {
+            r: f32::from(r) / 255.0,
+            g: f32::from(g) / 255.0,
+            b: f32::from(b) / 255.0,
+            a: f32::from(a) / 255.0,
+        }
+    }
+}
+
 /// True if `name` is one of the 14 known `$state` selectors. Case-insensitive, matching the
 /// engine's `tolower`+`trim` before comparison in `Fw::translateState`.
 #[must_use]
@@ -294,13 +319,35 @@ pub fn is_known_event(name: &str) -> bool {
     EVENTS.contains(&name)
 }
 
-/// True if `name` is a named color in the generated catalog ([`crate::catalog::NAMED_COLORS`]).
-/// Case-insensitive, matching the engine's `css_lookup`, which lowercases the token before
-/// comparing. The table is machine-extracted from the engine's color source, so a `false` here now
-/// genuinely means the name is not an engine-recognized color.
+/// True if `name` is a named color the engine recognizes: a CSS-table color
+/// ([`crate::catalog::NAMED_COLORS`]) or a legacy engine color name / the `transparent` alias
+/// ([`crate::catalog::LEGACY_COLOR_NAMES`]). Case-insensitive, matching the engine's `css_lookup`,
+/// which lowercases the token before comparing. Both tables are machine-extracted from the engine's
+/// color source, so a `false` here genuinely means the name is not an engine-recognized color.
 #[must_use]
 pub fn is_named_color(name: &str) -> bool {
-    contains_ascii_ci(crate::catalog::NAMED_COLORS, name)
+    let needle = name.trim();
+    crate::catalog::NAMED_COLORS
+        .iter()
+        .any(|(n, _)| n.eq_ignore_ascii_case(needle))
+        || contains_ascii_ci(crate::catalog::LEGACY_COLOR_NAMES, needle)
+}
+
+/// The packed `0xRRGGBB` value of a CSS named color ([`crate::catalog::NAMED_COLORS`]), or `None`
+/// when `name` is not a valued CSS color. Case-insensitive, matching the engine's `css_lookup`.
+///
+/// Legacy engine names with no CSS-table entry ([`crate::catalog::LEGACY_COLOR_NAMES`] — `alpha`,
+/// `darkPink`, `darkTeal`, `darkYellow`, `transparent`) return `None`: their RGB lives only in the
+/// engine's static `Color` constants, which the catalog does not extract, so they are recognized as
+/// names ([`is_named_color`]) but yield no swatch value. `transparent` is handled separately by
+/// [`color_value`] (it is fully transparent, not an RGB).
+#[must_use]
+pub fn named_color_value(name: &str) -> Option<u32> {
+    let needle = name.trim();
+    crate::catalog::NAMED_COLORS
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(needle))
+        .map(|(_, value)| *value)
 }
 
 /// True if `name` is a known OTML property tag in the generated catalog
@@ -338,6 +385,63 @@ pub fn parse_color(value: &str) -> Option<ColorForm> {
 #[must_use]
 pub fn is_valid_color(value: &str) -> bool {
     parse_color(value).is_some()
+}
+
+/// Resolve a color value string to its actual [`Rgba`] channels, faithful to the engine's
+/// `Color::operator>>` (`src/framework/util/color.cpp`). Returns `None` for anything that is not a
+/// valid color.
+///
+/// Handles every OTML color form (spec §2.9):
+/// * **hex** `#rgb` / `#rgba` / `#rrggbb` / `#rrggbbaa` — 3/4-digit bodies are nibble-doubled,
+///   alpha defaults to opaque.
+/// * **functional** `rgb()` / `rgba()` (byte-or-percent channels) and `hsl()` / `hsla()`
+///   (converted via the engine's `hsl_to_rgb`), reusing the same validation as
+///   [`is_valid_color`].
+/// * **named** — the `transparent` alias is fully transparent; any other name resolves through the
+///   CSS table ([`named_color_value`]). Legacy engine names with no CSS value yield `None` (no
+///   swatch); see [`named_color_value`].
+#[must_use]
+pub fn color_value(value: &str) -> Option<Rgba> {
+    let v = value.trim();
+
+    if let Some(body) = v.strip_prefix('#') {
+        return hex_value(body);
+    }
+    if is_valid_color(v) {
+        // A valid non-hex color is functional (hex is handled above).
+        return functional_value(v);
+    }
+    // Named colors. `transparent` is fully transparent (alpha 0), distinct from any RGB entry.
+    if v.eq_ignore_ascii_case("transparent") {
+        return Some(Rgba::from_u8(0, 0, 0, 0));
+    }
+    named_color_value(v).map(|rgb| {
+        let [r, g, b] = unpack_rgb(rgb);
+        Rgba::from_u8(r, g, b, 255)
+    })
+}
+
+/// The textual color forms to offer for `colorPresentation` (spec §2.9), given a picked color: the
+/// canonical hex (`#rrggbb`, or `#rrggbbaa` when the color is not fully opaque) first, then the
+/// functional `rgb(r, g, b)` / `rgba(r, g, b, a)` spelling. Every string is a form the engine's
+/// parser accepts, so applying it round-trips. Channels are rounded to `0..=255`.
+#[must_use]
+pub fn color_presentations(color: Rgba) -> Vec<String> {
+    let r = to_u8(color.r);
+    let g = to_u8(color.g);
+    let b = to_u8(color.b);
+    let a = to_u8(color.a);
+    if a == 255 {
+        vec![
+            format!("#{r:02x}{g:02x}{b:02x}"),
+            format!("rgb({r}, {g}, {b})"),
+        ]
+    } else {
+        vec![
+            format!("#{r:02x}{g:02x}{b:02x}{a:02x}"),
+            format!("rgba({r}, {g}, {b}, {a})"),
+        ]
+    }
 }
 
 /// True if `name` is a syntactically valid OTML identifier — the shape the grammar's `IDENT` rule
@@ -424,6 +528,200 @@ fn is_numeric_component(part: &str) -> bool {
         return false;
     }
     num.parse::<f64>().is_ok_and(f64::is_finite)
+}
+
+/// Unpack a packed `0xRRGGBB` into `[r, g, b]` bytes.
+fn unpack_rgb(rgb: u32) -> [u8; 3] {
+    [
+        ((rgb >> 16) & 0xFF) as u8,
+        ((rgb >> 8) & 0xFF) as u8,
+        (rgb & 0xFF) as u8,
+    ]
+}
+
+/// Round a normalized `[0, 1]` channel to a `0..=255` byte, clamping out-of-range inputs.
+fn to_u8(channel: f32) -> u8 {
+    (channel.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// Compute the [`Rgba`] of a hex color body (the text after `#`), faithful to the engine: a length-3
+/// or -4 body is nibble-doubled to 6/8; a length-6 or -8 body is used as-is; every char must be a
+/// hex digit; a 6-digit body is opaque. Any other length or a non-hex char yields `None`.
+fn hex_value(body: &str) -> Option<Rgba> {
+    if !is_valid_hex_body(body) {
+        return None;
+    }
+    let expanded: String = if matches!(body.len(), 3 | 4) {
+        body.chars().flat_map(|c| [c, c]).collect()
+    } else {
+        body.to_owned()
+    };
+    let byte = |i: usize| u8::from_str_radix(&expanded[i..i + 2], 16).ok();
+    let r = byte(0)?;
+    let g = byte(2)?;
+    let b = byte(4)?;
+    let a = if expanded.len() == 8 { byte(6)? } else { 255 };
+    Some(Rgba::from_u8(r, g, b, a))
+}
+
+/// Compute the [`Rgba`] of a functional `rgb()/rgba()/hsl()/hsla()` color, faithful to the engine's
+/// `operator>>` (whitespace stripped, comma-split, `parse_byte_or_percent` for `rgb` channels,
+/// `hsl_to_rgb` for `hsl`, `parse_alpha_any` for the alpha channel). Returns `None` if the value is
+/// not a well-formed functional color (mirrors [`is_valid_functional`]).
+fn functional_value(value: &str) -> Option<Rgba> {
+    let stripped: String = value.chars().filter(|c| !c.is_whitespace()).collect();
+    let (prefix, is_hsl, has_alpha) = ["rgba", "hsla", "rgb", "hsl"]
+        .into_iter()
+        .find(|name| stripped.starts_with(&format!("{name}(")))
+        .map(|name| (name, name.starts_with("hsl"), name.ends_with('a')))?;
+
+    let inner = stripped
+        .strip_prefix(prefix)
+        .and_then(|s| s.strip_prefix('('))
+        .and_then(|s| s.strip_suffix(')'))
+        .filter(|s| !s.is_empty())?;
+
+    let parts: Vec<&str> = inner.split(',').collect();
+    if parts.len() != if has_alpha { 4 } else { 3 } {
+        return None;
+    }
+    if !parts.iter().all(|p| is_numeric_component(p)) {
+        return None;
+    }
+
+    let alpha = if has_alpha {
+        parse_alpha_any(parts[3])
+    } else {
+        255
+    };
+    let (r, g, b) = if is_hsl {
+        let h = strtod(parts[0]);
+        let s = hsl_percent(parts[1]);
+        let l = hsl_percent(parts[2]);
+        hsl_to_rgb(h, s, l)
+    } else {
+        (
+            parse_byte_or_percent(parts[0]),
+            parse_byte_or_percent(parts[1]),
+            parse_byte_or_percent(parts[2]),
+        )
+    };
+    Some(Rgba::from_u8(r, g, b, alpha))
+}
+
+/// Clamp an `i32` to a `0..=255` byte (the engine's `clamp255`).
+fn clamp255(v: i32) -> u8 {
+    v.clamp(0, 255) as u8
+}
+
+/// Parse the leading decimal of a functional-color token as `strtod` does (reads the numeric prefix,
+/// tolerating a trailing `%` or other suffix). The token is already validated numeric, so a bare
+/// numeric prefix always parses; anything unparsable yields `0.0`.
+fn strtod(s: &str) -> f64 {
+    let end = s
+        .char_indices()
+        .find(|(i, c)| !(c.is_ascii_digit() || matches!(c, '+' | '-' | '.' | 'e' | 'E') || *i == 0))
+        .map_or(s.len(), |(i, _)| i);
+    s[..end].parse::<f64>().unwrap_or(0.0)
+}
+
+/// Parse the leading integer of a token as `std::stoi` does (leading sign + digits, stopping at the
+/// first non-digit — so `stoi("1.5") == 1`). Yields `0` when there is no leading integer.
+fn stoi(s: &str) -> i32 {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    if matches!(bytes.first(), Some(b'+' | b'-')) {
+        i = 1;
+    }
+    let digits_end = bytes[i..]
+        .iter()
+        .position(|b| !b.is_ascii_digit())
+        .map_or(bytes.len(), |p| i + p);
+    if digits_end == i {
+        return 0;
+    }
+    s[..digits_end].parse::<i32>().unwrap_or(0)
+}
+
+/// An `rgb()` channel: a trailing `%` scales `p% -> p*255/100`; otherwise an integer byte. Both are
+/// clamped to `0..=255`. Mirrors the engine's `parse_byte_or_percent`.
+fn parse_byte_or_percent(s: &str) -> u8 {
+    if s.ends_with('%') {
+        clamp255((strtod(s) * 255.0 / 100.0).round() as i32)
+    } else {
+        clamp255(stoi(s))
+    }
+}
+
+/// An alpha channel: a trailing `%` is a percentage; a value carrying `.`, `e` or `E` is a `[0, 1]`
+/// float scaled to a byte; otherwise an integer byte. Mirrors the engine's `parse_alpha_any`.
+fn parse_alpha_any(s: &str) -> u8 {
+    if s.ends_with('%') {
+        return clamp255((strtod(s) * 255.0 / 100.0).round() as i32);
+    }
+    if s.contains(['.', 'e', 'E']) {
+        let f = strtod(s).clamp(0.0, 1.0);
+        return clamp255((f * 255.0).round() as i32);
+    }
+    clamp255(stoi(s))
+}
+
+/// An `hsl()` saturation/lightness component: a trailing `%` scales to `[0, 1]`; otherwise the raw
+/// number is clamped to `[0, 1]`. Mirrors the engine's `pct` lambda in `operator>>`.
+fn hsl_percent(s: &str) -> f64 {
+    let v = strtod(s);
+    if s.ends_with('%') {
+        (v / 100.0).clamp(0.0, 1.0)
+    } else {
+        v.clamp(0.0, 1.0)
+    }
+}
+
+/// Convert HSL (`h` in degrees, `s`/`l` in `[0, 1]`) to `0..=255` RGB, faithful to the engine's
+/// `hsl_to_rgb`.
+fn hsl_to_rgb(mut h: f64, s: f64, l: f64) -> (u8, u8, u8) {
+    h = h.rem_euclid(360.0);
+    let s = s.clamp(0.0, 1.0);
+    let l = l.clamp(0.0, 1.0);
+    let hue2rgb = |p: f64, q: f64, mut t: f64| {
+        if t < 0.0 {
+            t += 1.0;
+        }
+        if t > 1.0 {
+            t -= 1.0;
+        }
+        if t < 1.0 / 6.0 {
+            return p + (q - p) * 6.0 * t;
+        }
+        if t < 1.0 / 2.0 {
+            return q;
+        }
+        if t < 2.0 / 3.0 {
+            return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
+        }
+        p
+    };
+    let (rf, gf, bf) = if s == 0.0 {
+        (l, l, l)
+    } else {
+        let q = if l < 0.5 {
+            l * (1.0 + s)
+        } else {
+            l + s - l * s
+        };
+        let p = 2.0 * l - q;
+        let hk = h / 360.0;
+        (
+            hue2rgb(p, q, hk + 1.0 / 3.0),
+            hue2rgb(p, q, hk),
+            hue2rgb(p, q, hk - 1.0 / 3.0),
+        )
+    };
+    (
+        clamp255((rf * 255.0).round() as i32),
+        clamp255((gf * 255.0).round() as i32),
+        clamp255((bf * 255.0).round() as i32),
+    )
 }
 
 #[cfg(test)]
@@ -596,6 +894,129 @@ mod tests {
         assert!(!is_named_color("chartreuse-ish"));
         assert!(!is_named_color("notacolor"));
         assert!(!is_named_color(""));
+    }
+
+    /// Assert two [`Rgba`] are equal within a small epsilon (rounding tolerance).
+    fn assert_rgba(actual: Rgba, r: u8, g: u8, b: u8, a: u8) {
+        let expected = Rgba::from_u8(r, g, b, a);
+        let close = |x: f32, y: f32| (x - y).abs() < 1e-4;
+        assert!(
+            close(actual.r, expected.r)
+                && close(actual.g, expected.g)
+                && close(actual.b, expected.b)
+                && close(actual.a, expected.a),
+            "{actual:?} != rgba({r},{g},{b},{a})"
+        );
+    }
+
+    #[test]
+    fn hex_color_values_of_each_length() {
+        // 3-digit body is nibble-doubled (#abc -> #aabbcc); alpha defaults opaque.
+        assert_rgba(color_value("#abc").unwrap(), 0xaa, 0xbb, 0xcc, 255);
+        // 4-digit -> #aabbccdd (with alpha).
+        assert_rgba(color_value("#abcd").unwrap(), 0xaa, 0xbb, 0xcc, 0xdd);
+        // 6-digit used as-is, opaque.
+        assert_rgba(color_value("#ff0000").unwrap(), 255, 0, 0, 255);
+        // 8-digit carries alpha.
+        assert_rgba(color_value("#11223344").unwrap(), 0x11, 0x22, 0x33, 0x44);
+        // Uppercase hex digits are fine.
+        assert_rgba(color_value("#FF00FF").unwrap(), 255, 0, 255, 255);
+    }
+
+    #[test]
+    fn functional_rgb_values_including_percent() {
+        assert_rgba(color_value("rgb(255, 0, 0)").unwrap(), 255, 0, 0, 255);
+        // rgba alpha as a 0-255 byte.
+        assert_rgba(color_value("rgba(255, 0, 0, 128)").unwrap(), 255, 0, 0, 128);
+        // rgba alpha as a [0,1] float scales to a byte.
+        assert_rgba(color_value("rgba(0, 0, 0, 0.5)").unwrap(), 0, 0, 0, 128);
+        // Percent channels are valid for rgb too (engine fidelity): 50% -> 128.
+        assert_rgba(
+            color_value("rgb(50%, 50%, 50%)").unwrap(),
+            128,
+            128,
+            128,
+            255,
+        );
+        // Whitespace is stripped before parsing.
+        assert_rgba(color_value("rgb( 10 , 20 , 30 )").unwrap(), 10, 20, 30, 255);
+    }
+
+    #[test]
+    fn functional_hsl_values_convert_to_rgb() {
+        // hsl(120, 100%, 50%) is pure green.
+        assert_rgba(color_value("hsl(120, 100%, 50%)").unwrap(), 0, 255, 0, 255);
+        // hsl(0, 0%, 0%) is black; saturation 0 => gray of the lightness.
+        assert_rgba(color_value("hsl(0, 0%, 100%)").unwrap(), 255, 255, 255, 255);
+        // hsla carries alpha.
+        assert_rgba(
+            color_value("hsla(240, 100%, 50%, 0.5)").unwrap(),
+            0,
+            0,
+            255,
+            128,
+        );
+    }
+
+    #[test]
+    fn named_color_values_from_catalog_case_insensitive() {
+        // A CSS-table color resolves to its packed RGB, case-insensitively.
+        assert_rgba(color_value("red").unwrap(), 255, 0, 0, 255);
+        assert_rgba(color_value("RED").unwrap(), 255, 0, 0, 255);
+        assert_rgba(color_value("aliceblue").unwrap(), 0xF0, 0xF8, 0xFF, 255);
+        // `transparent` is fully transparent.
+        assert_rgba(color_value("transparent").unwrap(), 0, 0, 0, 0);
+        // A legacy-only name with no CSS value gets no swatch (recognized as a name, but valueless).
+        assert!(is_named_color("darkPink"));
+        assert!(color_value("darkPink").is_none());
+        assert!(color_value("alpha").is_none());
+    }
+
+    #[test]
+    fn named_color_value_lookup() {
+        assert_eq!(named_color_value("red"), Some(0xFF0000));
+        assert_eq!(named_color_value("AliceBlue"), Some(0xF0F8FF));
+        assert_eq!(named_color_value("darkPink"), None);
+        assert_eq!(named_color_value("notacolor"), None);
+    }
+
+    #[test]
+    fn non_color_values_yield_no_rgba() {
+        assert!(color_value("").is_none());
+        assert!(color_value("Hello World").is_none());
+        assert!(color_value("10").is_none());
+        assert!(color_value("#ab").is_none()); // bad hex length
+        assert!(color_value("rgb(1, 2)").is_none()); // too few args
+        assert!(color_value("notacolor").is_none());
+    }
+
+    #[test]
+    fn color_presentations_offer_hex_and_functional() {
+        // Opaque -> #rrggbb + rgb(...).
+        let opaque = Rgba::from_u8(255, 128, 0, 255);
+        assert_eq!(
+            color_presentations(opaque),
+            vec!["#ff8000".to_owned(), "rgb(255, 128, 0)".to_owned()]
+        );
+        // Translucent -> #rrggbbaa + rgba(...).
+        let translucent = Rgba::from_u8(255, 128, 0, 128);
+        assert_eq!(
+            color_presentations(translucent),
+            vec![
+                "#ff8000".to_owned() + "80",
+                "rgba(255, 128, 0, 128)".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn color_presentation_strings_round_trip_through_color_value() {
+        // Every offered form must parse back to (approximately) the same color.
+        let c = Rgba::from_u8(12, 200, 250, 128);
+        for form in color_presentations(c) {
+            let back = color_value(&form).unwrap_or_else(|| panic!("`{form}` should parse"));
+            assert_rgba(back, 12, 200, 250, 128);
+        }
     }
 
     #[test]

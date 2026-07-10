@@ -51,7 +51,13 @@ const OUTPUT_REL: &str = "crates/otui-core/src/catalog.rs";
 /// The extracted, sorted, de-duped catalog ready to be rendered to Rust source.
 struct Catalog {
     properties: Vec<String>,
-    named_colors: Vec<String>,
+    /// The CSS named-color table: `(lowercased name, packed 0xRRGGBB)`, sorted by name. The value is
+    /// captured from the `rgb_to_abgr(0xRRGGBB)` literal in the engine's `kCss` table.
+    named_colors: Vec<(String, u32)>,
+    /// Legacy engine color names (the `tmp == "..."` / `key == "..."` statics, e.g. `alpha`,
+    /// `darkPink`, `transparent`) that are **not** in the CSS table, so carry no extractable RGB
+    /// value — kept names-only for `is_named_color` membership. Lowercased, sorted.
+    legacy_color_names: Vec<String>,
 }
 
 fn main() -> ExitCode {
@@ -117,9 +123,10 @@ fn gen_catalog(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         .map_err(|e| format!("failed to write '{}': {e}", out_path.display()))?;
 
     println!(
-        "gen-catalog: wrote {} properties and {} named colors to {}",
+        "gen-catalog: wrote {} properties, {} named colors and {} legacy color names to {}",
         catalog.properties.len(),
         catalog.named_colors.len(),
+        catalog.legacy_color_names.len(),
         OUTPUT_REL
     );
     Ok(())
@@ -161,33 +168,57 @@ fn extract(src: &Path) -> Result<Catalog, String> {
         );
     }
 
-    // Named colors: the CSS table entries `{"name", rgb_to_abgr(0x...)}` plus the legacy engine
-    // color names and the `transparent` alias compared as `tmp == "..."` / `key == "..."`. Names are
-    // lowercased to match the engine's case-insensitive `css_lookup`.
+    // Named colors: the CSS table entries `{"name", rgb_to_abgr(0xRRGGBB)}` (name + value) plus the
+    // legacy engine color names and the `transparent` alias compared as `tmp == "..."` /
+    // `key == "..."` (names only — the legacy statics carry an AABBGGRR literal we do not extract).
+    // Names are lowercased to match the engine's case-insensitive `css_lookup`.
     let color_path = src.join(COLOR_FILE);
     let color_text = std::fs::read_to_string(&color_path)
         .map_err(|e| format!("failed to read '{}': {e}", color_path.display()))?;
     let color_text = strip_comments(&color_text);
 
-    let table_re =
-        Regex::new(r#"\{\s*"([A-Za-z]+)"\s*,\s*rgb_to_abgr"#).expect("valid table regex");
-    let name_re = Regex::new(r#"\b(?:tmp|key)\s*==\s*"([^"]+)""#).expect("valid color-name regex");
+    let named_colors = extract_css_colors(&color_text)?;
 
-    let mut named_colors: Vec<String> = Vec::new();
-    for caps in table_re.captures_iter(&color_text) {
-        named_colors.push(caps[1].to_ascii_lowercase());
-    }
+    // Legacy `tmp == "..."` / `key == "..."` names, minus any already carried (with a value) by the
+    // CSS table — those extras have no CSS-table RGB, so they are membership-only.
+    let name_re = Regex::new(r#"\b(?:tmp|key)\s*==\s*"([^"]+)""#).expect("valid color-name regex");
+    let css_names: std::collections::HashSet<&str> =
+        named_colors.iter().map(|(n, _)| n.as_str()).collect();
+    let mut legacy_color_names: Vec<String> = Vec::new();
     for caps in name_re.captures_iter(&color_text) {
-        named_colors.push(caps[1].to_ascii_lowercase());
-    }
-    if named_colors.is_empty() {
-        return Err("extracted zero named colors — is the color table layout as expected?".into());
+        let lower = caps[1].to_ascii_lowercase();
+        if !css_names.contains(lower.as_str()) {
+            legacy_color_names.push(lower);
+        }
     }
 
     Ok(Catalog {
         properties: sorted_dedup(properties),
-        named_colors: sorted_dedup(named_colors),
+        named_colors,
+        legacy_color_names: sorted_dedup(legacy_color_names),
     })
+}
+
+/// Extract the CSS named-color table (`{"name", rgb_to_abgr(0xRRGGBB)}`) as `(lowercased name,
+/// 0xRRGGBB)` pairs, sorted by name and de-duped (first value wins on a duplicate name). Kept as its
+/// own function so the value parsing can be unit-tested.
+fn extract_css_colors(color_text: &str) -> Result<Vec<(String, u32)>, String> {
+    let table_re = Regex::new(r#"\{\s*"([A-Za-z]+)"\s*,\s*rgb_to_abgr\(\s*0x([0-9A-Fa-f]+)\s*\)"#)
+        .expect("valid table regex");
+
+    let mut named_colors: Vec<(String, u32)> = Vec::new();
+    for caps in table_re.captures_iter(color_text) {
+        let name = caps[1].to_ascii_lowercase();
+        let value = u32::from_str_radix(&caps[2], 16)
+            .map_err(|e| format!("bad rgb literal for color '{name}': {e}"))?;
+        named_colors.push((name, value));
+    }
+    if named_colors.is_empty() {
+        return Err("extracted zero named colors — is the color table layout as expected?".into());
+    }
+    named_colors.sort_by(|a, b| a.0.cmp(&b.0));
+    named_colors.dedup_by(|a, b| a.0 == b.0);
+    Ok(named_colors)
 }
 
 /// Sort + de-duplicate for deterministic, idempotent output.
@@ -266,8 +297,10 @@ fn render(catalog: &Catalog) -> String {
          //! * [`PROPERTIES`] — the OTML property tag names dispatched by the widget style parsers\n\
          //!   (`parseBaseStyle` / `parseImageStyle` / `parseTextStyle`). Lowercase/kebab, matching\n\
          //!   the engine's exact tag compare.\n\
-         //! * [`NAMED_COLORS`] — the CSS named-color table plus the legacy engine color names and\n\
-         //!   the `transparent` alias, lowercased to match the engine's case-insensitive lookup.\n\
+         //! * [`NAMED_COLORS`] — the CSS named-color table as `(name, 0xRRGGBB)` pairs, lowercased\n\
+         //!   to match the engine's case-insensitive lookup. The packed value is the color's RGB.\n\
+         //! * [`LEGACY_COLOR_NAMES`] — the legacy engine color names and the `transparent` alias\n\
+         //!   that are not in the CSS table, so carry no extractable RGB value (membership only).\n\
          //!\n\
          //! A future per-fork variant would add sibling tables here; the single catalog is the\n\
          //! current scope.\n\n",
@@ -276,8 +309,20 @@ fn render(catalog: &Catalog) -> String {
     s.push_str("/// OTML property tag names recognized by the engine's widget style parsers.\n");
     s.push_str(&render_slice("PROPERTIES", &catalog.properties));
     s.push('\n');
-    s.push_str("/// Named colors recognized by the engine's color parser (lowercased).\n");
-    s.push_str(&render_slice("NAMED_COLORS", &catalog.named_colors));
+    s.push_str(
+        "/// CSS named colors recognized by the engine's color parser: `(lowercased name, packed \
+         0xRRGGBB)`.\n",
+    );
+    s.push_str(&render_pairs("NAMED_COLORS", &catalog.named_colors));
+    s.push('\n');
+    s.push_str(
+        "/// Legacy engine color names (and the `transparent` alias) with no CSS-table RGB value \
+         (lowercased).\n",
+    );
+    s.push_str(&render_slice(
+        "LEGACY_COLOR_NAMES",
+        &catalog.legacy_color_names,
+    ));
 
     s
 }
@@ -288,6 +333,15 @@ fn render_slice(name: &str, values: &[String]) -> String {
         s.push_str("    \"");
         s.push_str(v);
         s.push_str("\",\n");
+    }
+    s.push_str("];\n");
+    s
+}
+
+fn render_pairs(name: &str, values: &[(String, u32)]) -> String {
+    let mut s = format!("pub static {name}: &[(&str, u32)] = &[\n");
+    for (n, v) in values {
+        s.push_str(&format!("    (\"{n}\", 0x{v:06X}),\n"));
     }
     s.push_str("];\n");
     s
@@ -305,7 +359,33 @@ fn workspace_root() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_comments;
+    use super::{extract_css_colors, strip_comments};
+
+    #[test]
+    fn extracts_css_color_values_sorted_with_rgb() {
+        // A miniature `kCss`-shaped table: names + `rgb_to_abgr(0xRRGGBB)` literals. The packed
+        // value is the RGB argument verbatim, names are lowercased, and the result is sorted by name.
+        let src = r#"
+            static constexpr CssPair kCss[] = {
+                {"Red",rgb_to_abgr(0xFF0000)}, {"aliceblue",rgb_to_abgr(0xF0F8FF)},
+                {"black",rgb_to_abgr(0x000000)},
+            };
+        "#;
+        let colors = extract_css_colors(src).expect("parses");
+        assert_eq!(
+            colors,
+            vec![
+                ("aliceblue".to_owned(), 0x00F0_F8FF),
+                ("black".to_owned(), 0x0000_0000),
+                ("red".to_owned(), 0x00FF_0000),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_color_table_is_an_error() {
+        assert!(extract_css_colors("no table here").is_err());
+    }
 
     #[test]
     fn strips_line_and_block_comments_but_keeps_code() {

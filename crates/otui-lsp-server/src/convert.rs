@@ -9,11 +9,12 @@ use lang_api::{
     SymbolKind as CoreSymbolKind,
 };
 use otui_core::folding::{FoldKind as CoreFoldKind, FoldRange as CoreFoldRange};
+use otui_core::schema::Rgba;
 use tower_lsp::lsp_types::{
-    CompletionItem as LspCompletionItem, CompletionItemKind as LspCompletionItemKind,
-    Diagnostic as LspDiagnostic, DiagnosticSeverity, DocumentSymbol as LspSymbol, FoldingRange,
-    FoldingRangeKind, Location, NumberOrString, Position, Range, SymbolInformation,
-    SymbolKind as LspSymbolKind, TextEdit, Url,
+    Color, ColorInformation, CompletionItem as LspCompletionItem,
+    CompletionItemKind as LspCompletionItemKind, Diagnostic as LspDiagnostic, DiagnosticSeverity,
+    DocumentSymbol as LspSymbol, FoldingRange, FoldingRangeKind, Location, NumberOrString,
+    Position, Range, SymbolInformation, SymbolKind as LspSymbolKind, TextEdit, Url,
 };
 
 use crate::position::{LineIndex, PositionEncoding};
@@ -241,6 +242,47 @@ pub fn full_document_edit(text: &str, new_text: String, encoding: PositionEncodi
         },
         new_text,
     }
+}
+
+/// Map an engine [`Rgba`] (channels in `[0, 1]`) onto an LSP [`Color`] (also `[0, 1]` f32 channels)
+/// — a straight field copy, since both use the same normalized representation.
+pub fn color_to_lsp(rgba: Rgba) -> Color {
+    Color {
+        red: rgba.r,
+        green: rgba.g,
+        blue: rgba.b,
+        alpha: rgba.a,
+    }
+}
+
+/// Convert one engine color occurrence — a `(byte span, [`Rgba`])` pair from
+/// [`document_colors`](otui_core::OtuiService::document_colors) — into an LSP [`ColorInformation`],
+/// resolving the span against `index` under `encoding`. This is the byte-offset → protocol seam for
+/// `textDocument/documentColor`.
+pub fn color_information_of(
+    span: ByteSpan,
+    rgba: Rgba,
+    index: &LineIndex<'_>,
+    encoding: PositionEncoding,
+) -> ColorInformation {
+    ColorInformation {
+        range: index.range(span.start, span.end, encoding),
+        color: color_to_lsp(rgba),
+    }
+}
+
+/// Convert every engine color occurrence for `text` into an LSP [`ColorInformation`], building one
+/// shared [`LineIndex`] for the batch.
+pub fn colors_to_lsp(
+    text: &str,
+    colors: &[(ByteSpan, Rgba)],
+    encoding: PositionEncoding,
+) -> Vec<ColorInformation> {
+    let index = LineIndex::new(text);
+    colors
+        .iter()
+        .map(|(span, rgba)| color_information_of(*span, *rgba, &index, encoding))
+        .collect()
 }
 
 /// Map a protocol-agnostic [`CoreFoldKind`] onto its LSP `FoldingRangeKind`. A widget block or
@@ -474,6 +516,55 @@ mod tests {
         // unterminated inline array → `ERROR` node) yields `None` from the engine, so the server
         // returns no edits rather than a spurious whole-document replace.
         assert!(OtuiService::new().format("x: [a, b\n").is_none());
+    }
+
+    #[test]
+    fn maps_rgba_to_lsp_color_channelwise() {
+        let rgba = Rgba {
+            r: 1.0,
+            g: 0.5,
+            b: 0.0,
+            a: 0.25,
+        };
+        let color = color_to_lsp(rgba);
+        assert!((color.red - 1.0).abs() < f32::EPSILON);
+        assert!((color.green - 0.5).abs() < f32::EPSILON);
+        assert!((color.blue - 0.0).abs() < f32::EPSILON);
+        assert!((color.alpha - 0.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn maps_a_color_occurrence_span_to_a_range() {
+        // `#ff0000` sits on line 1, bytes 9..16 of "Panel\n  color: #ff0000".
+        let text = "Panel\n  color: #ff0000\n";
+        let start = text.find('#').unwrap();
+        let span = ByteSpan::new(start, start + "#ff0000".len());
+        let rgba = Rgba {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        };
+        let index = LineIndex::new(text);
+        let info = color_information_of(span, rgba, &index, PositionEncoding::Utf16);
+        assert_eq!(info.range.start, Position::new(1, 9));
+        assert_eq!(info.range.end, Position::new(1, 16));
+        assert!((info.color.red - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn document_color_end_to_end_over_a_small_doc() {
+        // Position → engine document_colors → LSP ColorInformation, the path the handler drives.
+        let text = "Panel\n  color: #00ff00\n  background-color: red\n";
+        let core = OtuiService::new().document_colors(text);
+        let lsp = colors_to_lsp(text, &core, PositionEncoding::Utf16);
+        assert_eq!(lsp.len(), 2);
+        // The hex green on line 1.
+        assert_eq!(lsp[0].range.start, Position::new(1, 9));
+        assert!((lsp[0].color.green - 1.0).abs() < f32::EPSILON);
+        // The named red on line 2 (its span covers the `red` token).
+        assert!((lsp[1].color.red - 1.0).abs() < f32::EPSILON);
+        assert!((lsp[1].color.green - 0.0).abs() < f32::EPSILON);
     }
 
     #[test]
