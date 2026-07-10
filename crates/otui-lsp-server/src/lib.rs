@@ -19,7 +19,7 @@ use std::sync::Mutex;
 use lang_api::{ByteSpan, LanguageService};
 use otui_core::fixes::Fix;
 use otui_core::hover::{Inheritance, StyleHover, StyleHoverKind};
-use otui_core::style_index::{is_native_base, DocId, StyleIndex};
+use otui_core::style_index::{is_native_base, DocId, StyleDef, StyleIndex};
 use otui_core::OtuiService;
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result as RpcResult;
@@ -37,12 +37,13 @@ use tower_lsp::lsp_types::{
     HoverContents, HoverParams, HoverProviderCapability, ImplementationProviderCapability,
     InitializeParams, InitializeResult, InitializedParams, Location, MarkupContent, MarkupKind,
     MessageType, NumberOrString, OneOf, PositionEncodingKind, PrepareRenameResponse,
-    ReferenceParams, RenameOptions, RenameParams, SemanticTokens, SemanticTokensFullOptions,
-    SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+    ReferenceParams, Registration, RenameOptions, RenameParams, SemanticTokens,
+    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
     SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SymbolInformation,
     SymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextEdit, TypeDefinitionProviderCapability, Url, WorkDoneProgressOptions, WorkspaceEdit,
-    WorkspaceSymbolParams,
+    TextEdit, TypeDefinitionProviderCapability, TypeHierarchyItem, TypeHierarchyPrepareParams,
+    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Url, WorkDoneProgressOptions,
+    WorkspaceEdit, WorkspaceSymbolParams,
 };
 use tower_lsp::{Client, LanguageServer};
 
@@ -250,6 +251,141 @@ fn collect_implementations(
     for (doc_id, def) in index.subtypes(name) {
         if let Some(loc) = resolve_location(doc_id, def.name_span, documents, encoding) {
             out.push(loc);
+        }
+    }
+    out
+}
+
+/// Build a [`TypeHierarchyItem`] for the style `def` declared in `doc_id` (spec: type hierarchy).
+///
+/// A style is modelled as a [`SymbolKind::CLASS`] whose `range` is the whole `header_span` (the
+/// declaration and any indented body) and whose `selection_range` is the `name_span` (the declared
+/// name identifier) — both byte spans into **that** document's own text, so the ranges are mapped
+/// against it. `detail` carries the style's base (like the hover's "inherits from"), and `data`
+/// round-trips the style **name** as a JSON string so a later `supertypes`/`subtypes` request can
+/// recover the exact style the item stands for (see [`item_style_name`]).
+///
+/// Returns `None` — and the caller skips the entry — when `doc_id` is not a parseable URL or its
+/// document is not currently open (its spans cannot be mapped to ranges; the index only holds open
+/// documents today). Mirrors [`resolve_location`]'s span→range mapping, and is kept `Client`-free so
+/// it is unit-testable without a live server.
+fn build_type_hierarchy_item(
+    doc_id: &DocId,
+    def: &StyleDef,
+    documents: &HashMap<Url, Document>,
+    encoding: PositionEncoding,
+) -> Option<TypeHierarchyItem> {
+    let uri = Url::parse(doc_id.as_str()).ok()?;
+    let doc = documents.get(&uri)?;
+    let line_index = LineIndex::new(&doc.text);
+    Some(TypeHierarchyItem {
+        name: def.name.clone(),
+        kind: SymbolKind::CLASS,
+        tags: None,
+        detail: def.base.clone(),
+        uri,
+        range: line_index.range(def.header_span.start, def.header_span.end, encoding),
+        selection_range: line_index.range(def.name_span.start, def.name_span.end, encoding),
+        data: Some(serde_json::Value::String(def.name.clone())),
+    })
+}
+
+/// The style name a [`TypeHierarchyItem`] stands for, read back from what
+/// [`build_type_hierarchy_item`] stored.
+///
+/// Prefers the `data` field (a JSON string carrying the style name, preserved across the
+/// prepare→supertypes/subtypes round-trip), falling back to the item's `name` when `data` is absent
+/// or not a string. This is what the `supertypes`/`subtypes` graph queries key off, so an item the
+/// server built always resolves back to the right style.
+fn item_style_name(item: &TypeHierarchyItem) -> String {
+    item.data
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| item.name.clone(), str::to_owned)
+}
+
+/// Root a type hierarchy on the style named `name` (spec: `textDocument/prepareTypeHierarchy`).
+///
+/// Looks `name` up in the cached workspace index and builds a [`TypeHierarchyItem`] from its
+/// declaration. Returns `None` when `name` has no user declaration — a native `UI*` name or any name
+/// absent from the index — since there is nothing to root a hierarchy on (mirroring
+/// [`resolve_type_definition`]'s native-is-nothing rule). When a name is declared more than once
+/// (legal in the engine), the hierarchy is rooted on the **first** declaration the index yields that
+/// maps to an open document (the backing map is unordered, so "first" is stable only per index
+/// state); the client can still walk supertypes/subtypes from it.
+///
+/// Kept `Client`-free so it is unit-testable without a live server (mirroring
+/// [`resolve_base_definition`]).
+fn prepare_type_hierarchy_item(
+    index: &StyleIndex,
+    documents: &HashMap<Url, Document>,
+    name: &str,
+    encoding: PositionEncoding,
+) -> Option<TypeHierarchyItem> {
+    index
+        .lookup(name)
+        .into_iter()
+        .find_map(|(doc_id, def)| build_type_hierarchy_item(doc_id, def, documents, encoding))
+}
+
+/// The direct supertype(s) of the style `name` (spec: `typeHierarchy/supertypes`) — its base.
+///
+/// One level only: the client walks further up by calling supertypes again on the returned item. The
+/// direct supertype of `name` is its **base** (from `name`'s declaration in the index). A base that
+/// is a **user style** present in the index yields a [`TypeHierarchyItem`] built from the base's own
+/// declaration; a **native `UI*`** base, an absent base, or a base with no declaration in the index
+/// yields nothing — native classes are built-in leaves with no navigable declaration, so the chain
+/// ends there (an empty list is the LSP "no supertypes" answer). Each distinct base is emitted once.
+///
+/// Kept `Client`-free so it is unit-testable without a live server.
+fn resolve_supertypes(
+    index: &StyleIndex,
+    documents: &HashMap<Url, Document>,
+    name: &str,
+    encoding: PositionEncoding,
+) -> Vec<TypeHierarchyItem> {
+    // Gather the distinct base names of every declaration of `name` (duplicates may differ in base).
+    let mut bases: Vec<&str> = Vec::new();
+    for (_doc_id, def) in index.lookup(name) {
+        if let Some(base) = def.base.as_deref() {
+            // A native `UI*` base is a built-in leaf: the chain ends, so it is not a navigable
+            // supertype.
+            if !is_native_base(base) && !bases.contains(&base) {
+                bases.push(base);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for base in bases {
+        for (doc_id, def) in index.lookup(base) {
+            if let Some(item) = build_type_hierarchy_item(doc_id, def, documents, encoding) {
+                out.push(item);
+            }
+        }
+    }
+    out
+}
+
+/// The direct subtypes of the style `name` (spec: `typeHierarchy/subtypes`) — the styles deriving
+/// from it.
+///
+/// One level only: the client walks further down by calling subtypes again on each returned item.
+/// Reads the styles whose base is `name` from the cached index ([`StyleIndex::subtypes`], every
+/// top-level `X < name` across the whole workspace — the namespace is global) and builds a
+/// [`TypeHierarchyItem`] from each. An empty list means nothing derives from `name`.
+///
+/// Kept `Client`-free so it is unit-testable without a live server.
+fn resolve_subtypes(
+    index: &StyleIndex,
+    documents: &HashMap<Url, Document>,
+    name: &str,
+    encoding: PositionEncoding,
+) -> Vec<TypeHierarchyItem> {
+    let mut out = Vec::new();
+    for (doc_id, def) in index.subtypes(name) {
+        if let Some(item) = build_type_hierarchy_item(doc_id, def, documents, encoding) {
+            out.push(item);
         }
     }
     out
@@ -772,6 +908,29 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
+        // Type hierarchy (the `Name < Base` graph): this lsp-types (0.94.1) has no static
+        // `type_hierarchy_provider` field in `ServerCapabilities`, so the only way to advertise it is
+        // dynamic registration. We register **unconditionally** rather than gating on the client's
+        // `textDocument.typeHierarchy.dynamicRegistration` flag — neither VS Code nor Neovim sets that
+        // flag by default, yet both process an incoming `client/registerCapability` for type
+        // hierarchy, so gating on it would make the feature undiscoverable in exactly the clients that
+        // matter. A client that genuinely cannot handle the registration replies with an error, which
+        // we log and otherwise ignore (the rest of the server is unaffected). A future lsp-types bump
+        // would let us advertise this statically instead.
+        let registration = Registration {
+            id: "otui-type-hierarchy".to_owned(),
+            method: "textDocument/prepareTypeHierarchy".to_owned(),
+            register_options: None,
+        };
+        if let Err(err) = self.client.register_capability(vec![registration]).await {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("failed to register type hierarchy capability: {err}"),
+                )
+                .await;
+        }
+
         self.client
             .log_message(MessageType::INFO, "otui-lsp server ready")
             .await;
@@ -973,6 +1132,72 @@ impl LanguageServer for Backend {
             return Ok(None);
         }
         Ok(Some(GotoImplementationResponse::Array(locations)))
+    }
+
+    async fn prepare_type_hierarchy(
+        &self,
+        params: TypeHierarchyPrepareParams,
+    ) -> RpcResult<Option<Vec<TypeHierarchyItem>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let encoding = self.encoding();
+
+        // Read the request document's text (unknown document → nothing to root on). Cloned so the
+        // documents lock is released before we take it again for aggregation.
+        let Some(text) = self
+            .documents
+            .read()
+            .await
+            .get(&uri)
+            .map(|doc| doc.text.clone())
+        else {
+            return Ok(None);
+        };
+
+        // Classify the symbol under the cursor into the style name it is an instance of / declares.
+        let offset = LineIndex::new(&text).offset_at(position, encoding);
+        let Some(type_ref) = self.service.style_type_at(&text, offset) else {
+            return Ok(None);
+        };
+
+        // Root the hierarchy on that style's declaration in the cached workspace index. A native
+        // `UI*` name (or any name with no user declaration) has nothing to root on → `None`.
+        let index = self.style_index.read().await;
+        let documents = self.documents.read().await;
+        Ok(
+            prepare_type_hierarchy_item(&index, &documents, &type_ref.name, encoding)
+                .map(|item| vec![item]),
+        )
+    }
+
+    async fn supertypes(
+        &self,
+        params: TypeHierarchySupertypesParams,
+    ) -> RpcResult<Option<Vec<TypeHierarchyItem>>> {
+        let encoding = self.encoding();
+        // The style name travels in the item's `data` (falling back to its `name`); the direct
+        // supertype is its base, resolved fresh from the cached index (the namespace is global).
+        let name = item_style_name(&params.item);
+        let index = self.style_index.read().await;
+        let documents = self.documents.read().await;
+        // An empty list is the LSP "no supertypes" answer (a native/absent base ends the chain).
+        Ok(Some(resolve_supertypes(
+            &index, &documents, &name, encoding,
+        )))
+    }
+
+    async fn subtypes(
+        &self,
+        params: TypeHierarchySubtypesParams,
+    ) -> RpcResult<Option<Vec<TypeHierarchyItem>>> {
+        let encoding = self.encoding();
+        // The style name travels in the item's `data` (falling back to its `name`); the direct
+        // subtypes are the styles deriving from it, read from the cached workspace index.
+        let name = item_style_name(&params.item);
+        let index = self.style_index.read().await;
+        let documents = self.documents.read().await;
+        // An empty list is a valid answer (nothing derives from this style).
+        Ok(Some(resolve_subtypes(&index, &documents, &name, encoding)))
     }
 
     async fn references(&self, params: ReferenceParams) -> RpcResult<Option<Vec<Location>>> {
@@ -1286,7 +1511,7 @@ mod tests {
     use super::*;
     use tower_lsp::lsp_types::{
         ClientCapabilities, DocumentSymbolClientCapabilities, GeneralClientCapabilities, Position,
-        TextDocumentClientCapabilities,
+        Range, TextDocumentClientCapabilities,
     };
 
     #[test]
@@ -1594,6 +1819,189 @@ mod tests {
         // Nothing derives from `Leaf` → an empty list (the handler maps this to `None`).
         let (index, docs) = workspace(&[("file:///a.otui", "Leaf < UIWidget\n")]);
         assert!(collect_implementations(&index, &docs, "Leaf", PositionEncoding::Utf16).is_empty());
+    }
+
+    // --- Type hierarchy (prepareTypeHierarchy / supertypes / subtypes) ---
+
+    #[test]
+    fn prepare_roots_the_hierarchy_on_the_style_under_the_cursor() {
+        // `Panel` is declared in one file and used as an instance in another; prepare roots on the
+        // declaration, carrying its name, uri, header/name ranges, base detail, and name data.
+        let (index, docs) = workspace(&[
+            ("file:///defs.otui", "Panel < UIWidget\n  id: p\n"),
+            (
+                "file:///use.otui",
+                "MainWindow < UIWindow\n  Panel\n    id: p\n",
+            ),
+        ]);
+        let item = prepare_type_hierarchy_item(&index, &docs, "Panel", PositionEncoding::Utf16)
+            .expect("roots on the declaration");
+        assert_eq!(item.name, "Panel");
+        assert_eq!(item.kind, SymbolKind::CLASS);
+        assert_eq!(item.uri.as_str(), "file:///defs.otui");
+        // detail carries the base, like the hover's "inherits from".
+        assert_eq!(item.detail.as_deref(), Some("UIWidget"));
+        // selection_range is the name token; range covers the whole header (declaration + body).
+        assert_eq!(item.selection_range.start, Position::new(0, 0));
+        assert_eq!(item.selection_range.end, Position::new(0, 5));
+        assert_eq!(item.range.start, Position::new(0, 0));
+        // The header range extends over the indented body, past the declaration line.
+        assert!(item.range.end.line >= 1);
+        // data round-trips the style name.
+        assert_eq!(item_style_name(&item), "Panel");
+    }
+
+    #[test]
+    fn prepare_is_none_for_a_native_or_unknown_name() {
+        let (index, docs) = workspace(&[("file:///a.otui", "Panel < UIWidget\n")]);
+        // A native `UI*` name has no user declaration to root on.
+        assert!(
+            prepare_type_hierarchy_item(&index, &docs, "UIWidget", PositionEncoding::Utf16)
+                .is_none()
+        );
+        // A name declared nowhere in the workspace.
+        assert!(
+            prepare_type_hierarchy_item(&index, &docs, "Missing", PositionEncoding::Utf16)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn prepare_roots_on_the_first_declaration_when_duplicated() {
+        // The same style declared in two files is legal; prepare roots on a single (the first)
+        // declaration rather than returning several roots.
+        let (index, docs) = workspace(&[
+            ("file:///a.otui", "Dup < UIWidget\n"),
+            ("file:///b.otui", "Dup < UIWindow\n"),
+        ]);
+        let item = prepare_type_hierarchy_item(&index, &docs, "Dup", PositionEncoding::Utf16)
+            .expect("roots on one declaration");
+        assert_eq!(item.name, "Dup");
+        // It is one of the two declarations (order across docs is unspecified).
+        assert!(["file:///a.otui", "file:///b.otui"].contains(&item.uri.as_str()));
+    }
+
+    #[test]
+    fn supertypes_returns_the_user_base_item() {
+        // `Child < Base`, `Base < UIWidget`: the direct supertype of `Child` is the user style `Base`.
+        let (index, docs) = workspace(&[
+            ("file:///defs.otui", "Base < UIWidget\n"),
+            ("file:///use.otui", "Child < Base\n"),
+        ]);
+        let supers = resolve_supertypes(&index, &docs, "Child", PositionEncoding::Utf16);
+        assert_eq!(supers.len(), 1);
+        assert_eq!(supers[0].name, "Base");
+        assert_eq!(supers[0].uri.as_str(), "file:///defs.otui");
+        assert_eq!(supers[0].detail.as_deref(), Some("UIWidget"));
+        assert_eq!(item_style_name(&supers[0]), "Base");
+    }
+
+    #[test]
+    fn supertypes_of_a_native_base_is_empty_chain_end() {
+        // `Panel < UIWidget`: its base is native `UIWidget`, a built-in leaf — the chain ends here.
+        let (index, docs) = workspace(&[("file:///a.otui", "Panel < UIWidget\n")]);
+        assert!(resolve_supertypes(&index, &docs, "Panel", PositionEncoding::Utf16).is_empty());
+    }
+
+    #[test]
+    fn supertypes_of_a_dangling_base_is_empty() {
+        // `Child < Missing` where `Missing` is declared nowhere: no navigable supertype.
+        let (index, docs) = workspace(&[("file:///a.otui", "Child < Missing\n")]);
+        assert!(resolve_supertypes(&index, &docs, "Child", PositionEncoding::Utf16).is_empty());
+    }
+
+    #[test]
+    fn subtypes_returns_an_item_per_deriving_style_across_docs() {
+        // `Base` is derived from in two separate files; subtypes lists both.
+        let (index, docs) = workspace(&[
+            ("file:///base.otui", "Base < UIWidget\n"),
+            ("file:///a.otui", "ChildA < Base\n"),
+            ("file:///b.otui", "ChildB < Base\n"),
+        ]);
+        let mut subs = resolve_subtypes(&index, &docs, "Base", PositionEncoding::Utf16);
+        subs.sort_by(|x, y| x.name.cmp(&y.name));
+        assert_eq!(subs.len(), 2);
+        assert_eq!(subs[0].name, "ChildA");
+        assert_eq!(subs[0].detail.as_deref(), Some("Base"));
+        assert_eq!(subs[1].name, "ChildB");
+        assert_eq!(item_style_name(&subs[0]), "ChildA");
+    }
+
+    #[test]
+    fn subtypes_is_empty_when_nothing_derives() {
+        let (index, docs) = workspace(&[("file:///a.otui", "Leaf < UIWidget\n")]);
+        assert!(resolve_subtypes(&index, &docs, "Leaf", PositionEncoding::Utf16).is_empty());
+    }
+
+    #[test]
+    fn item_data_round_trips_the_name_through_supertypes_and_subtypes() {
+        // Build the root item exactly as prepare does, then drive supertypes/subtypes off *that*
+        // item's carried name — the client always passes the item back, never a bare name.
+        let (index, docs) = workspace(&[
+            ("file:///defs.otui", "Base < UIWidget\n"),
+            ("file:///mid.otui", "Mid < Base\n"),
+            ("file:///leaf.otui", "Leaf < Mid\n"),
+        ]);
+        let mid = prepare_type_hierarchy_item(&index, &docs, "Mid", PositionEncoding::Utf16)
+            .expect("Mid is declared");
+        // supertypes(Mid) via the item → Base.
+        let supers = resolve_supertypes(
+            &index,
+            &docs,
+            &item_style_name(&mid),
+            PositionEncoding::Utf16,
+        );
+        assert_eq!(supers.len(), 1);
+        assert_eq!(supers[0].name, "Base");
+        // subtypes(Mid) via the item → Leaf.
+        let subs = resolve_subtypes(
+            &index,
+            &docs,
+            &item_style_name(&mid),
+            PositionEncoding::Utf16,
+        );
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].name, "Leaf");
+    }
+
+    #[test]
+    fn item_style_name_falls_back_to_name_when_data_is_absent() {
+        // A client that echoes an item without `data` still resolves via the item's `name`.
+        let item = TypeHierarchyItem {
+            name: "Fallback".to_owned(),
+            kind: SymbolKind::CLASS,
+            tags: None,
+            detail: None,
+            uri: Url::parse("file:///a.otui").expect("uri"),
+            range: Range::default(),
+            selection_range: Range::default(),
+            data: None,
+        };
+        assert_eq!(item_style_name(&item), "Fallback");
+    }
+
+    #[test]
+    fn full_flow_from_cursor_to_type_hierarchy_root() {
+        // Position → offset → style_type_at → prepare, the path the handler drives.
+        let (index, docs) = workspace(&[
+            ("file:///defs.otui", "Panel < UIWidget\n"),
+            (
+                "file:///use.otui",
+                "MainWindow < UIWindow\n  Panel\n    id: p\n",
+            ),
+        ]);
+        let request_text = "MainWindow < UIWindow\n  Panel\n    id: p\n";
+        // Cursor on the `Panel` widget instance (line 1, column 2).
+        let position = Position::new(1, 2);
+        let offset = LineIndex::new(request_text).offset_at(position, PositionEncoding::Utf16);
+        let type_ref = OtuiService::new()
+            .style_type_at(request_text, offset)
+            .expect("cursor is on the instance tag");
+        assert_eq!(type_ref.name, "Panel");
+        let item =
+            prepare_type_hierarchy_item(&index, &docs, &type_ref.name, PositionEncoding::Utf16)
+                .expect("roots on Panel's declaration");
+        assert_eq!(item.uri.as_str(), "file:///defs.otui");
     }
 
     /// The `(uri, range)` of each location, sorted, for order-independent assertions (the document
