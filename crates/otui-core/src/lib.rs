@@ -29,6 +29,7 @@ pub mod semantic;
 pub mod style_index;
 pub mod symbols;
 pub mod syntax;
+pub mod widget_resolve;
 
 use fixes::Fix;
 use hierarchy::StyleRef;
