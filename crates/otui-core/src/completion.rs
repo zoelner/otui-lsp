@@ -9,15 +9,21 @@
 //!   values reachable in the current document, and target-side edges, and
 //! * `@event` handler names ([`schema::EVENTS`]),
 //!
-//! plus one open-ish set from the generated catalog:
+//! plus the **indented statement slot** — a position that is grammatically ambiguous between a
+//! property key and a nested child widget, so (following consolidated LSPs) it offers the *union*,
+//! ranked and tagged for the client to filter:
 //!
-//! * property **key** names ([`catalog::PROPERTIES`]) — offered while the cursor is building an
-//!   ordinary `key:` on an indented line (spec §6, §2.10).
+//! * property **key** names — the global [`catalog::PROPERTIES`] plus the enclosing widget's
+//!   Lua-added properties (resolved cross-file via [`widget_resolve`]), and
+//! * child **widget** names — workspace `.otui` styles, Lua widget classes, and native `UI*` bases.
 //!
 //! **Deliberately out of scope** (returns an empty vec): property **values** — color names/forms and
 //! per-property value enums. Color completion needs per-property color-type metadata the catalog does
 //! not carry, so it is deferred until that metadata exists; likewise value enums. When no set applies,
 //! this returns nothing — never a guess.
+//!
+//! No I/O and no `lsp-types`: byte offsets in, [`CompletionItem`]s out. The workspace-aware slot reads
+//! the in-memory style + Lua indexes ([`complete_at_with_widgets`]); [`complete_at`] passes empty ones.
 //!
 //! ## How the context is classified
 //!
@@ -63,9 +69,10 @@ enum Context {
     AnchorTarget,
     /// On an `@event` key: offer the known event handler names.
     Events,
-    /// On an ordinary property **key** being typed (indented, no `:` yet): offer the catalog
-    /// property names.
-    PropertyKey,
+    /// On an indented statement slot being typed (no `:` yet): the position is grammatically
+    /// ambiguous between a **property key** and a nested **child widget**, so offer the union —
+    /// catalog + the widget's Lua properties + child-widget names — ranked, and let the client filter.
+    IndentedSlot,
 }
 
 /// Compute the completion candidates for the cursor at byte `offset` in `source` (spec §6).
@@ -114,42 +121,87 @@ pub fn complete_at_with_widgets(
         // flags `odd-indentation` / `invalid-indentation-depth`), so no key may be offered there.
         // This needs the whole document (the preceding lines' depth), so it is gated here rather
         // than in the line-prefix classifier. The closed-set contexts keep their own guards.
-        Some(Context::PropertyKey) if !diagnostics::line_indentation_is_valid(source, offset) => {
+        Some(Context::IndentedSlot) if !diagnostics::line_indentation_is_valid(source, offset) => {
             Vec::new()
         }
-        Some(Context::PropertyKey) => property_key_items(source, offset, styles, lua),
+        Some(Context::IndentedSlot) => indented_slot_items(source, offset, styles, lua),
         Some(context) => items_for(context, source, offset),
         None => Vec::new(),
     }
 }
 
-/// Build the property-key candidates: the global C++ catalog plus the Lua-added custom properties of
-/// the widget enclosing the cursor (resolved cross-file through its `.otui` + Lua ancestry). The
-/// catalog comes first (const order); the widget's Lua properties are appended, de-duplicated against
-/// the catalog, and tagged so the client can tell them apart. When the enclosing widget cannot be
-/// located (a parse too broken to find it) or has no Lua properties, this is just the catalog.
-fn property_key_items(
+/// Build the union offered in an indented statement slot — the grammatically-ambiguous position that
+/// admits either a property key or a nested child widget (see [`Context::IndentedSlot`]). Following
+/// consolidated LSPs, we return **all** valid candidates tagged by [`CompletionKind`] and ranked via
+/// `sort_text`, and let the client's filter + icons disambiguate as the user types:
+///
+/// 1. the enclosing widget's **Lua-added properties** (most specific → ranked first), then
+/// 2. the global C++ **property catalog**, then
+/// 3. **child-widget names** — workspace `.otui` styles, Lua widget classes, and the native `UI*`
+///    bases in use.
+///
+/// De-duplicated by label. The `sort_text` prefixes (`0_`/`1_`/`2_`) impose the group order; within a
+/// group the client sorts by the appended label. The natural case convention still does the work for
+/// free: catalog/Lua properties are lowercase, widget names are capitalized, so typing one letter
+/// filters to the intended family.
+fn indented_slot_items(
     source: &str,
     offset: usize,
     styles: &StyleIndex,
     lua: &LuaWidgetIndex,
 ) -> Vec<CompletionItem> {
-    let mut items = set_items(catalog::PROPERTIES, CompletionKind::Keyword, "property");
-    let Some(widget) = enclosing_widget_type(source, offset) else {
-        return items;
-    };
-    let ancestry = widget_resolve::resolve_ancestry(&widget, styles, lua);
-    for prop in ancestry.custom_properties(lua) {
-        if items.iter().any(|item| item.label == prop) {
-            continue; // a Lua property that shadows a catalog name collapses into one entry
+    let mut items: Vec<CompletionItem> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut push = |label: String, kind: CompletionKind, detail: &str, group: char| {
+        if seen.insert(label.clone()) {
+            let sort_text = Some(format!("{group}_{label}"));
+            items.push(CompletionItem {
+                label,
+                kind,
+                detail: Some(detail.to_owned()),
+                sort_text,
+            });
         }
-        items.push(CompletionItem {
-            label: prop,
-            kind: CompletionKind::Keyword,
-            detail: Some("lua property".to_owned()),
-        });
+    };
+
+    // 1. The enclosing widget's Lua-added properties (ranked first — most specific to this widget).
+    if let Some(widget) = enclosing_widget_type(source, offset) {
+        let ancestry = widget_resolve::resolve_ancestry(&widget, styles, lua);
+        for prop in ancestry.custom_properties(lua) {
+            push(prop, CompletionKind::Keyword, "lua property", '0');
+        }
+    }
+    // 2. The global C++ property catalog.
+    for &prop in catalog::PROPERTIES {
+        push(prop.to_owned(), CompletionKind::Keyword, "property", '1');
+    }
+    // 3. Child-widget names in scope across the workspace.
+    for (name, detail) in widget_names(styles, lua) {
+        push(name, CompletionKind::Class, detail, '2');
     }
     items
+}
+
+/// The widget/style type names usable as a nested child tag, each with a short origin `detail`:
+/// workspace `.otui` styles and the native `UI*` bases they reference ([`StyleIndex`]), plus the Lua
+/// widget classes ([`LuaWidgetIndex`]). Returned sorted by name for determinism; the caller
+/// de-duplicates across the sources (a native referenced as a base and defined in Lua collapses).
+fn widget_names(styles: &StyleIndex, lua: &LuaWidgetIndex) -> Vec<(String, &'static str)> {
+    use crate::style_index::is_native_base;
+    let mut named: std::collections::BTreeMap<String, &'static str> =
+        std::collections::BTreeMap::new();
+    for (_, def) in styles.iter() {
+        named.entry(def.name.clone()).or_insert("style");
+        if let Some(base) = def.base.as_deref() {
+            if is_native_base(base) {
+                named.entry(base.to_owned()).or_insert("native widget");
+            }
+        }
+    }
+    for def in lua.iter() {
+        named.entry(def.name.clone()).or_insert("lua widget");
+    }
+    named.into_iter().collect()
 }
 
 /// The type name of the widget enclosing the cursor: the `tag` of the nearest ancestor `container`
@@ -241,55 +293,48 @@ fn classify(prefix: &str) -> Option<Context> {
         };
     }
 
-    // An ordinary `key:` property — offer the catalog property names while the KEY is being typed.
-    classify_property_key(indent, trimmed)
+    // An indented statement slot — a property key or a nested child widget being typed.
+    classify_indented_slot(indent, trimmed)
 }
 
-/// Classify the ordinary property **key** slot from the line's `indent` and its `trimmed` content.
+/// Classify the **indented statement slot** from the line's `indent` and its `trimmed` content — the
+/// position that admits either a property key or a nested child widget (see [`Context::IndentedSlot`]).
 ///
-/// Fires [`Context::PropertyKey`] only when the cursor is actively building a bare property-key
-/// token, mirroring the `property_key` grammar shape (`token(IDENT)`, then letters/digits/`_`/`-`).
-/// Precision over recall — anything ambiguous yields `None`:
+/// Fires [`Context::IndentedSlot`] when the cursor is on an indented line either empty or building a
+/// bare identifier token (letters/digits/`_`/`-`, any leading case). The union — and the client's
+/// filter — sort out property-vs-widget, so unlike the earlier precision-first design this no longer
+/// stays silent on an empty slot or an uppercase word. Still `None` for:
 ///
-/// * unindented (`indent` empty) → a top-level word is a widget tag / style header, never a property;
-/// * empty word (just indentation, `  `) → ambiguous with a nested widget tag about to be typed;
-/// * an **uppercase-initial** word → a child-widget tag / style header (`Button`, `UIWidget`), not a
-///   property: OTML property names are all lowercase/kebab, so a leading uppercase letter marks a
-///   widget position (widget-name completion is a separate future node);
-/// * a `:` in the prefix → we are past the key, in **value** position (property-value/color
-///   completion is deferred — see the module docs), so nothing;
+/// * unindented (`indent` empty) → a top-level word is a style-header declaration, a separate concern;
+/// * a `:` in the token → past the key, in **value** position (value completion is deferred);
 /// * a `.` → a dotted key (`foo.bar`) is neither a property nor an `anchors.` object;
-/// * whitespace, `<`, or any non-IDENT char → a completed word + trailing space, a `Name < Base`
-///   header, or otherwise not a bare key.
+/// * a leading digit / `&` / `!` / `-` / other non-letter → an alias/expr/list form, not this slot;
+/// * `<`, whitespace, or any other char in the token → a `Name < Base` header or a completed word.
 ///
-/// The `$` / `@` / `anchors.` / `&` / `!` / `-` forms are already handled or excluded upstream (or by
-/// the leading-char test), so they never reach here as a property key. Indentation-depth validity is
+/// The `$` / `@` / `anchors.` forms are already handled upstream. Indentation-depth validity is
 /// enforced separately by the caller (it needs the whole document).
-fn classify_property_key(indent: &str, trimmed: &str) -> Option<Context> {
-    // Properties are nested under a widget, so they always carry leading indentation. A top-level
-    // (unindented) bare word is a widget/style header, not a property → offer nothing.
+fn classify_indented_slot(indent: &str, trimmed: &str) -> Option<Context> {
+    // Statements are nested under a widget, so they always carry leading indentation. A top-level
+    // (unindented) bare word is a style-header declaration, out of scope here.
     if indent.is_empty() {
         return None;
     }
-    // Require a non-empty word actively being built: an empty indented slot (`  `) is ambiguous with
-    // a nested container tag about to be typed, so we stay silent (precision over recall).
     let mut chars = trimmed.chars();
-    let first = chars.next()?;
-    // A property key starts with a LOWERCASE ASCII letter. OTML property names are all lowercase/kebab
-    // (`width`, `image-source`, `text-align`), whereas a child-widget tag / style header at the same
-    // indentation is CamelCase / uppercase-initial (`Button`, `Panel`, `UIWidget`) — the case
-    // convention is what tells the two apart (every `catalog::PROPERTIES` entry is lowercase-initial).
-    // A leading uppercase letter, digit, `_`, `&`, `!`, `-`, `.` or anything else is not a key here.
-    if !first.is_ascii_lowercase() {
-        return None;
+    match chars.next() {
+        // An empty indented slot: offer the whole union (property keys + child widgets).
+        None => return Some(Context::IndentedSlot),
+        // A word being typed must start with a letter (either case). A leading digit / `&` / `!` /
+        // `-` / `.` marks an alias/expr/list/dotted form, not this slot.
+        Some(first) if first.is_ascii_alphabetic() => {}
+        Some(_) => return None,
     }
     // The rest must stay within the IDENT charset. A `:` (value position — deferred), `.` (dotted
     // key), `<` (style header), whitespace (completed word / multi-word tag), or any other char
-    // means this is not a bare key still being typed.
+    // means this is not a bare token still being typed.
     if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
         return None;
     }
-    Some(Context::PropertyKey)
+    Some(Context::IndentedSlot)
 }
 
 /// Classify the anchor **value** slot — the text after `anchors.<edge>:` up to the cursor.
@@ -338,10 +383,11 @@ fn items_for(context: Context, source: &str, offset: usize) -> Vec<CompletionIte
         ),
         Context::AnchorTarget => anchor_target_items(source, offset),
         Context::Events => set_items(schema::EVENTS, CompletionKind::Event, "event handler"),
-        // Property KEY names from the generated catalog, in its (sorted) order. Property VALUES —
-        // color names/forms and value enums — are deferred (no per-property type metadata yet), so
-        // the value position deliberately falls through to an empty result upstream.
-        Context::PropertyKey => set_items(catalog::PROPERTIES, CompletionKind::Keyword, "property"),
+        // The indented statement slot is workspace-aware (catalog + Lua props + widget names), so it
+        // is built by `indented_slot_items` and routed before this function is reached.
+        Context::IndentedSlot => {
+            unreachable!("IndentedSlot is handled in complete_at_with_widgets")
+        }
     }
 }
 
@@ -365,6 +411,7 @@ fn anchor_target_items(source: &str, offset: usize) -> Vec<CompletionItem> {
             label: id,
             kind: CompletionKind::Value,
             detail: Some("widget id".to_owned()),
+            sort_text: None,
         });
     }
     items
@@ -457,6 +504,7 @@ fn set_items(set: &[&str], kind: CompletionKind, detail: &str) -> Vec<Completion
             label: label.to_owned(),
             kind,
             detail: Some(detail.to_owned()),
+            sort_text: None,
         })
         .collect()
 }
@@ -760,10 +808,11 @@ Panel
     }
 
     #[test]
-    fn empty_indented_position_offers_nothing() {
-        // DECISION (pinned): an empty indented slot (`  ` with no word yet) is ambiguous with a
-        // nested container tag about to be typed, so we require a non-empty word — precision over
-        // recall. Nothing is offered here.
+    fn wholly_blank_indented_line_offers_nothing() {
+        // A line that is *entirely* whitespace is treated as blank by the indentation validity gate
+        // (it carries no structural depth), so completion stays silent there. The union opens up as
+        // soon as the line has content — a typed word, or an empty slot before an existing word
+        // (see `empty_slot_before_existing_content_offers_the_union`).
         let src = "Button\n  \n";
         let offset = at(src, "  \n") + 2; // just past the two indent spaces
         assert!(complete_at(src, offset).is_empty());
@@ -795,18 +844,30 @@ Panel
     }
 
     #[test]
-    fn indented_uppercase_word_is_a_child_widget_not_a_property() {
-        // An indented CamelCase word is a nested widget/tag position, not a property key. Property
-        // names are all lowercase/kebab, so a leading uppercase letter marks a widget → offer
-        // nothing (widget-name completion is a separate future node).
+    fn indented_uppercase_word_offers_widget_names_in_the_union() {
+        // An indented CamelCase word is a child-widget position. The slot now offers the union, so
+        // widget names are present (the client filters them in as the user types `Button`); a
+        // catalog property is present too but the client's case-based filter drops it for `Button`.
+        let styles = styles(&[("lib.otui", "Button < UIButton\nPanel < UIWidget\n")]);
+        let lua = lua(&[]);
         let src = "Panel\n  Button\n";
-        assert!(complete_at(src, at(src, "Button") + "Button".len()).is_empty());
-        // ...but a lowercase-initial word at the very same indentation still offers the catalog.
+        let items =
+            complete_at_with_widgets(src, at(src, "  Button") + "  Button".len(), &styles, &lua);
+        let button = items
+            .iter()
+            .find(|i| i.label == "Button")
+            .expect("Button offered");
+        assert_eq!(button.kind, CompletionKind::Class);
+        assert_eq!(button.detail.as_deref(), Some("style"));
+        // A lowercase-initial word at the same indentation still surfaces the catalog properties.
         let src = "Panel\n  wid\n";
-        assert_eq!(
-            labels(&complete_at(src, at(src, "wid") + "wid".len())),
-            catalog::PROPERTIES
-        );
+        let got = labels(&complete_at_with_widgets(
+            src,
+            at(src, "wid") + "wid".len(),
+            &styles,
+            &lua,
+        ));
+        assert!(got.contains(&"width".to_owned()));
     }
 
     #[test]
@@ -934,30 +995,34 @@ end
 ";
 
     #[test]
-    fn property_key_offers_lua_props_of_the_enclosing_widget() {
-        // Under a `< UITable` header, the property key context offers the catalog PLUS UITable's
-        // Lua-added properties, deterministically (catalog first, then the Lua props sorted).
+    fn slot_offers_lua_props_ranked_above_the_catalog() {
+        // Under a `< UITable` header, the slot offers UITable's Lua-added properties alongside the
+        // catalog, tagged and ranked above it (sort_text group `0_` < `1_`).
         let styles = styles(&[]);
         let lua = lua(&[("uitable.lua", UITABLE_LUA)]);
         let src = "Table < UITable\n  col\n";
         let items = complete_at_with_widgets(src, at(src, "col") + "col".len(), &styles, &lua);
-        let got = labels(&items);
 
-        let mut expected: Vec<String> = catalog::PROPERTIES
+        let col = items
             .iter()
-            .map(|s| (*s).to_owned())
-            .collect();
-        expected.push("column-style".to_owned());
-        expected.push("row-style".to_owned());
-        assert_eq!(got, expected);
-        // The Lua props are tagged so the client can distinguish them from catalog properties.
-        let col = items.iter().find(|i| i.label == "column-style").unwrap();
+            .find(|i| i.label == "column-style")
+            .expect("lua prop offered");
         assert_eq!(col.detail.as_deref(), Some("lua property"));
         assert_eq!(col.kind, CompletionKind::Keyword);
+        assert_eq!(col.sort_text.as_deref(), Some("0_column-style"));
+        assert!(items.iter().any(|i| i.label == "row-style"));
+
+        // A catalog property is present and ranked below the Lua props.
+        let width = items
+            .iter()
+            .find(|i| i.label == "width")
+            .expect("catalog prop offered");
+        assert_eq!(width.sort_text.as_deref(), Some("1_width"));
+        assert!(col.sort_text < width.sort_text);
     }
 
     #[test]
-    fn property_key_lua_props_resolve_cross_file_on_a_widget_instance() {
+    fn slot_lua_props_resolve_cross_file_on_a_widget_instance() {
         // The cursor is under a nested `Table` container whose type resolves cross-file
         // (`Table < UITable`) to the native UITable that declares the Lua props.
         let styles = styles(&[("lib.otui", "Table < UITable\n")]);
@@ -967,30 +1032,73 @@ Window < UIWindow
   Table
     col
 ";
-        let items = complete_at_with_widgets(src, at(src, "col") + "col".len(), &styles, &lua);
-        let got = labels(&items);
-        assert!(got.contains(&"column-style".to_owned()));
-        assert!(got.contains(&"row-style".to_owned()));
-    }
-
-    #[test]
-    fn property_key_omits_lua_props_on_an_unrelated_widget() {
-        // A Button does not descend from UITable, so its property completion is the catalog only.
-        let styles = styles(&[]);
-        let lua = lua(&[("uitable.lua", UITABLE_LUA)]);
-        let src = "Button < UIButton\n  col\n";
         let got = labels(&complete_at_with_widgets(
             src,
             at(src, "col") + "col".len(),
             &styles,
             &lua,
         ));
-        assert_eq!(got, catalog::PROPERTIES);
+        assert!(got.contains(&"column-style".to_owned()));
+        assert!(got.contains(&"row-style".to_owned()));
+    }
+
+    #[test]
+    fn slot_omits_lua_props_of_an_unrelated_widget() {
+        // A Button does not descend from UITable, so UITable's Lua props are not offered on it (the
+        // catalog still is; UITable may appear only as a child-widget *name*, never as a property).
+        let styles = styles(&[]);
+        let lua = lua(&[("uitable.lua", UITABLE_LUA)]);
+        let src = "Button < UIButton\n  col\n";
+        let items = complete_at_with_widgets(src, at(src, "col") + "col".len(), &styles, &lua);
+        assert!(!items
+            .iter()
+            .any(|i| i.label == "column-style" && i.detail.as_deref() == Some("lua property")));
+        assert!(items.iter().any(|i| i.label == "width"));
+    }
+
+    #[test]
+    fn slot_offers_widget_names_from_every_source() {
+        // Child-widget names come from workspace `.otui` styles, native bases in use, and Lua widget
+        // classes — each tagged with its origin and kind `Class`.
+        let styles = styles(&[("lib.otui", "Panel < UIWidget\n")]);
+        let lua = lua(&[("uitable.lua", UITABLE_LUA)]);
+        let src = "Panel\n  Pa\n";
+        let items = complete_at_with_widgets(src, at(src, "Pa\n") + "Pa".len(), &styles, &lua);
+
+        let named = |label: &str| items.iter().find(|i| i.label == label).cloned();
+        let panel = named("Panel").expect("user style offered");
+        assert_eq!(panel.kind, CompletionKind::Class);
+        assert_eq!(panel.detail.as_deref(), Some("style"));
+        assert_eq!(panel.sort_text.as_deref(), Some("2_Panel"));
+
+        assert_eq!(
+            named("UIWidget").and_then(|i| i.detail),
+            Some("native widget".to_owned())
+        );
+        assert_eq!(
+            named("UITable").and_then(|i| i.detail),
+            Some("lua widget".to_owned())
+        );
+    }
+
+    #[test]
+    fn empty_slot_before_existing_content_offers_the_union() {
+        // The cursor sits at the start of an indented line that already has a word after it — an
+        // empty slot the classifier now opens (the line is not wholly blank, so the indentation gate
+        // passes). The union (catalog + widget names) is offered.
+        let styles = styles(&[("lib.otui", "Button < UIButton\n")]);
+        let lua = lua(&[]);
+        let src = "Panel\n  Button\n";
+        let items = complete_at_with_widgets(src, at(src, "Button"), &styles, &lua);
+        let got = labels(&items);
+        assert!(got.contains(&"width".to_owned()), "catalog present");
+        assert!(got.contains(&"Button".to_owned()), "widget names present");
     }
 
     #[test]
     fn empty_indexes_degrade_to_the_catalog_only() {
-        // The workspace-unaware `complete_at` (empty indexes) offers exactly the catalog.
+        // The workspace-unaware `complete_at` (empty indexes) offers exactly the catalog on a key —
+        // no Lua props and no widget names, so the labels are the catalog in const order.
         let src = "Table < UITable\n  col\n";
         assert_eq!(
             labels(&complete_at(src, at(src, "col") + "col".len())),
