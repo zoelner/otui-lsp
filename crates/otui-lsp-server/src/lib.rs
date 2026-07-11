@@ -23,6 +23,7 @@ pub mod semantic;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crossbeam_channel::Sender;
@@ -139,6 +140,11 @@ pub struct Backend {
     /// unnested; the guard is always the outermost lock, so no opposing nesting can deadlock.
     /// [`Arc`] so the scan thread holds a clone.
     reindex_guard: Arc<Mutex<()>>,
+    /// Set once the LSP lifecycle ends ([`signal_shutdown`](Self::signal_shutdown)) to tell the
+    /// background scan thread to stop as soon as possible. The scan checks it between files and, if
+    /// set, skips the remaining work and its completion refresh — so dropping the backend and joining
+    /// the I/O threads never waits for a full scan. [`Arc`] so the scan thread holds a clone.
+    shutdown: Arc<AtomicBool>,
 }
 
 /// Largest `.otui` file the workspace scan / watcher will read into the index. A style file is a few
@@ -161,7 +167,15 @@ impl Backend {
             disk_texts: Arc::new(RwLock::new(HashMap::new())),
             roots: Mutex::new(workspace_roots(params)),
             reindex_guard: Arc::new(Mutex::new(())),
+            shutdown: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Signal the background workspace scan to stop as soon as possible (it checks between files),
+    /// so shutdown does not wait for a full scan. Called once the LSP lifecycle ends — before the
+    /// backend (and its `Sender`) is dropped and the I/O threads are joined.
+    pub fn signal_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
     }
 
     fn encoding(&self) -> PositionEncoding {
@@ -210,28 +224,23 @@ impl Backend {
     /// older `version` than the one currently stored for `uri`.
     fn publish(&self, uri: Uri, text: &str, version: i32) {
         // Widget-aware diagnostics: the unknown-property check consults the workspace style + Lua
-        // indexes so a Lua-added property is not wrongly hinted. Both read locks are taken and
-        // released here around the (owned) result, and no document lock is held meanwhile, preserving
-        // the unnested-lock discipline. With the indexes still empty (scan not yet complete) this is
-        // identical to the catalog-only pass.
-        let core_diags = {
-            let styles = self.style_index.read().expect("style_index lock poisoned");
-            let lua = self.lua_index.read().expect("lua_index lock poisoned");
-            self.service.diagnostics_with_widgets(text, &styles, &lua)
-        };
-        let lsp_diags = convert::all_to_lsp(text, &core_diags, self.encoding());
-
-        let latest = self
-            .documents
-            .read()
-            .expect("documents lock poisoned")
-            .get(&uri)
-            .map(|doc| doc.version);
-        if !is_current_version(latest, version) {
-            return;
-        }
-
-        self.send_diagnostics(uri, lsp_diags, Some(version));
+        // indexes so a Lua-added property is not wrongly hinted. With the indexes still empty (scan
+        // not yet complete) this is identical to the catalog-only pass. The actual compute+send is
+        // shared with the background scan's completion refresh (see `compute_and_send_diagnostics`).
+        let encoding = self.encoding();
+        let styles = self.style_index.read().expect("style_index lock poisoned");
+        let lua = self.lua_index.read().expect("lua_index lock poisoned");
+        compute_and_send_diagnostics(
+            &self.sender,
+            &self.service,
+            &styles,
+            &lua,
+            &self.documents,
+            encoding,
+            uri,
+            text,
+            version,
+        );
     }
 
     /// Recompute and republish diagnostics for every currently open document.
@@ -358,6 +367,48 @@ impl Backend {
             .expect("lua_index lock poisoned")
             .remove_document(&DocId::from(uri.to_string()));
     }
+}
+
+/// Compute widget-aware diagnostics for one document and publish them, unless a newer version has
+/// superseded `version`. Shared by the request-driven [`Backend::publish`] and the background scan's
+/// completion refresh (which runs without a `&Backend`), so every dependency is passed explicitly.
+///
+/// The style + Lua index read locks are held by the caller across this call (the analysis borrows
+/// them); the documents lock is then taken only to read the current version. This ordering cannot
+/// deadlock: no path holds the documents *write* lock while waiting on an index lock — the index
+/// writers ([`Backend::set_open_document`], the scan) take the documents lock, if at all, in a
+/// separate released scope first.
+#[allow(clippy::too_many_arguments)]
+fn compute_and_send_diagnostics(
+    sender: &Sender<Message>,
+    service: &OtuiService,
+    styles: &StyleIndex,
+    lua: &LuaWidgetIndex,
+    documents: &RwLock<HashMap<Uri, Document>>,
+    encoding: PositionEncoding,
+    uri: Uri,
+    text: &str,
+    version: i32,
+) {
+    let core_diags = service.diagnostics_with_widgets(text, styles, lua);
+    let lsp_diags = convert::all_to_lsp(text, &core_diags, encoding);
+    let latest = documents
+        .read()
+        .expect("documents lock poisoned")
+        .get(&uri)
+        .map(|doc| doc.version);
+    if !is_current_version(latest, version) {
+        return;
+    }
+    let params = PublishDiagnosticsParams {
+        uri,
+        diagnostics: lsp_diags,
+        version: Some(version),
+    };
+    let _ = sender.send(Message::Notification(Notification::new(
+        "textDocument/publishDiagnostics".to_owned(),
+        params,
+    )));
 }
 
 /// Merge the open buffers over the on-disk cache into a single `URI → Document` view for one
@@ -1647,20 +1698,26 @@ impl Backend {
             let disk_texts = Arc::clone(&self.disk_texts);
             let documents = Arc::clone(&self.documents);
             let reindex_guard = Arc::clone(&self.reindex_guard);
-            // NOTE: the scan thread deliberately does NOT capture the LSP `Sender`. A detached,
-            // possibly-long-running thread holding a `Sender<Message>` clone would keep the stdio
-            // writer's channel open and make `IoThreads::join()` hang on shutdown until the scan
-            // finished. It reports its result to stderr instead, which never blocks shutdown.
-            // Consequence: a document opened before this scan finishes is diagnosed against the
-            // still-building indexes; its widget-aware `unknown-property` hints refine on the next
-            // edit (`did_change`) or watched-file change (`republish_open_documents`). This startup
-            // transient is the accepted cost of keeping shutdown prompt.
+            let shutdown = Arc::clone(&self.shutdown);
+            let sender = self.sender.clone();
+            let encoding = self.encoding();
+            // The scan thread holds a `Sender` clone solely to refresh open documents once the
+            // indexes are complete (see the completion refresh below) — otherwise a document opened
+            // mid-scan would keep a stale widget-aware diagnostic until its next edit. To keep
+            // shutdown prompt despite the live `Sender` (which would otherwise make
+            // `IoThreads::join()` wait for this thread), the loops below check the `shutdown` flag
+            // between files and bail; `signal_shutdown` sets it before the backend is dropped, so the
+            // thread returns within one file and its `Sender` clone drops, unblocking join. Progress
+            // is reported on stderr, never the LSP channel.
             std::thread::spawn(move || {
                 let entries = scan_workspace(&roots);
                 // The scan is stateless, so a fresh service suffices for extraction.
                 let service = OtuiService::new();
                 let mut indexed = 0usize;
                 for (uri, text) in entries {
+                    if shutdown.load(Ordering::Relaxed) {
+                        return; // shutting down: stop promptly, drop the `Sender` clone
+                    }
                     // Hold the reindex guard across the open-check AND the disk-index writes so a
                     // concurrent `did_open`/`did_change` cannot slip between them and be clobbered by
                     // stale disk text: an open buffer's index entry always wins (see `reindex_guard`).
@@ -1693,6 +1750,9 @@ impl Backend {
                 // contribute an empty result and are skipped to keep the index lean.
                 let mut lua_indexed = 0usize;
                 for (uri, text) in scan_workspace_lua(&roots) {
+                    if shutdown.load(Ordering::Relaxed) {
+                        return;
+                    }
                     let defs = service.lua_widgets(&text);
                     if defs.is_empty() {
                         continue;
@@ -1703,12 +1763,34 @@ impl Backend {
                         .set_document(DocId::from(uri.to_string()), defs);
                     lua_indexed += 1;
                 }
-                // stderr, not the LSP channel: keeps no `Sender` alive on this detached thread (see
-                // the note at the spawn site), so shutdown's `IoThreads::join()` never waits on it.
+                // Progress on stderr, never the LSP channel.
                 eprintln!(
                     "otui-lsp: indexed {indexed} workspace .otui file(s), \
                      {lua_indexed} .lua widget file(s)"
                 );
+                // Completion refresh: the indexes are now complete, so re-diagnose every open
+                // document to clear any stale widget-aware hint computed against a partial index
+                // while the scan ran. Skipped if we are already shutting down (we are quitting).
+                // Snapshot open buffers first so no document lock is held across the per-doc publish.
+                if shutdown.load(Ordering::Relaxed) {
+                    return;
+                }
+                let open: Vec<(Uri, String, i32)> = documents
+                    .read()
+                    .expect("documents lock poisoned")
+                    .iter()
+                    .map(|(uri, doc)| (uri.clone(), doc.text.clone(), doc.version))
+                    .collect();
+                if !open.is_empty() {
+                    let styles = style_index.read().expect("style_index lock poisoned");
+                    let lua = lua_index.read().expect("lua_index lock poisoned");
+                    for (uri, text, version) in open {
+                        compute_and_send_diagnostics(
+                            &sender, &service, &styles, &lua, &documents, encoding, uri, &text,
+                            version,
+                        );
+                    }
+                }
             });
         }
 
@@ -3031,6 +3113,70 @@ end
                 .iter()
                 .any(|c| c == "unknown-property"),
             "column-style must be accepted after UITable's lua is indexed"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn initial_scan_refreshes_open_documents_on_completion() {
+        use std::time::Duration;
+
+        // A workspace whose Lua declares UITable's column-style.
+        let base = std::env::temp_dir().join(format!("otui-scan-refresh-{}", std::process::id()));
+        std::fs::create_dir_all(&base).expect("mkdir");
+        std::fs::write(
+            base.join("uitable.lua"),
+            "\
+UITable = extends(UIWidget, 'UITable')
+
+function UITable:onStyleApply(styleName, styleNode)
+  for name, value in pairs(styleNode) do
+    if name == 'column-style' then
+    end
+  end
+end
+",
+        )
+        .expect("write lua");
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let backend = Backend::new(tx, &InitializeParams::default());
+        *backend.roots.lock().expect("roots") = vec![uri_from_file_path(&base).expect("root")];
+
+        // A document open *before* the scan runs, using the Lua-added property.
+        let doc_uri = Uri::from_str("file:///ws/win.otui").expect("doc uri");
+        backend.documents.write().expect("documents").insert(
+            doc_uri.clone(),
+            Document {
+                text: "Table < UITable\n  column-style: SomeColumn\n".to_owned(),
+                version: 1,
+            },
+        );
+
+        // Spawn the background scan; its completion refresh should re-diagnose the open document.
+        backend.run_initialized();
+
+        // Wait (bounded) for a publishDiagnostics addressed to the open document.
+        let mut refreshed = false;
+        while let Ok(msg) = rx.recv_timeout(Duration::from_secs(5)) {
+            if let Message::Notification(note) = msg {
+                if note.method == "textDocument/publishDiagnostics" {
+                    let params: PublishDiagnosticsParams =
+                        serde_json::from_value(note.params).expect("diagnostics params");
+                    if params.uri == doc_uri {
+                        refreshed = !params.diagnostics.iter().any(|d| {
+                            matches!(&d.code, Some(lsp_types::NumberOrString::String(s)) if s == "unknown-property")
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+        backend.signal_shutdown();
+        assert!(
+            refreshed,
+            "the initial scan's completion refresh should clear the stale column-style hint"
         );
 
         std::fs::remove_dir_all(&base).ok();
