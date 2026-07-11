@@ -874,22 +874,25 @@ end
     #[test]
     fn parent_of_is_deterministic_for_a_widget_declared_in_two_documents() {
         // The same widget with different `extends` parents in two files (e.g. a fork override) — the
-        // winner is picked by document id, stably, never by unordered map iteration.
-        let mut index = LuaWidgetIndex::new();
-        index.set_document(
-            "a.lua",
-            scan_widgets("UITable = extends(UIWidget, 'UITable')\n"),
-        );
-        index.set_document(
-            "b.lua",
-            scan_widgets("UITable = extends(UIScrollArea, 'UITable')\n"),
-        );
-        // "a.lua" sorts before "b.lua", so its parent wins — and stays the same every call.
-        for _ in 0..8 {
-            assert_eq!(index.parent_of("UITable"), Some("UIWidget"));
-        }
+        // winner is picked by document id, never by insertion or unordered-map order. Building the
+        // index in BOTH insertion orders must resolve to the same parent: `a.lua` sorts before
+        // `b.lua`, so its `UIWidget` wins regardless of which document was added first. A
+        // last-writer or insertion-order implementation would disagree between the two indexes.
+        let a = || scan_widgets("UITable = extends(UIWidget, 'UITable')\n");
+        let b = || scan_widgets("UITable = extends(UIScrollArea, 'UITable')\n");
+
+        let mut a_first = LuaWidgetIndex::new();
+        a_first.set_document("a.lua", a());
+        a_first.set_document("b.lua", b());
+
+        let mut b_first = LuaWidgetIndex::new();
+        b_first.set_document("b.lua", b());
+        b_first.set_document("a.lua", a());
+
+        assert_eq!(a_first.parent_of("UITable"), Some("UIWidget"));
+        assert_eq!(b_first.parent_of("UITable"), Some("UIWidget"));
         // Both declarations are still retained by lookup.
-        assert_eq!(index.lookup("UITable").len(), 2);
+        assert_eq!(a_first.lookup("UITable").len(), 2);
     }
 
     #[test]
