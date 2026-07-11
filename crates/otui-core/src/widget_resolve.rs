@@ -131,8 +131,24 @@ pub fn resolve_ancestry(start: &str, styles: &StyleIndex, lua: &LuaWidgetIndex) 
         }
     }
 
+    // Phase 3: `UIWidget` is the implicit root of every widget — every native `UI*` widget class
+    // derives from it in the engine, whether or not a Lua `extends` line spells that out (the C++
+    // ones never do). It matters because a module can attach style properties to `UIWidget` itself
+    // via a `connect(UIWidget, {onStyleApply = …})` hook — that is how `tooltip:` becomes valid on
+    // *any* widget — and those would otherwise resolve on nothing.
+    //
+    // Only when the chain actually reached a native class: a chain that dead-ended at an undefined
+    // base tells us nothing about what it derives from, and assuming `UIWidget` there would start
+    // accepting properties on a typo'd widget name.
+    if native.is_some() && seen.insert(UI_WIDGET.to_owned()) {
+        chain.push(UI_WIDGET.to_owned());
+    }
+
     WidgetAncestry { chain, native }
 }
+
+/// The engine's root widget class, the implicit ancestor of every widget.
+const UI_WIDGET: &str = "UIWidget";
 
 /// The deterministically-chosen definition of the style `name`, or `None` when `name` is defined
 /// nowhere (or only by malformed headers with no base). Carries both the base to keep walking and
@@ -268,8 +284,33 @@ mod tests {
 
         let a = resolve_ancestry("UIA", &styles, &lua);
         // UIA is native, so phase 2 follows UIA -> UIB, then UIB -> UIA is already seen and stops.
-        assert_eq!(a.chain, ["UIA", "UIB"]);
+        // `UIWidget` is then appended as the implicit root of every widget (phase 3).
+        assert_eq!(a.chain, ["UIA", "UIB", "UIWidget"]);
         assert_eq!(a.native.as_deref(), Some("UIA"));
+    }
+
+    #[test]
+    fn ui_widget_is_the_implicit_root_of_a_resolved_widget() {
+        // Every native widget derives from `UIWidget` in the engine, even though the C++ classes have
+        // no Lua `extends` line saying so. A module hooking style properties onto `UIWidget` (see
+        // `connect(UIWidget, {onStyleApply = …})`) must therefore reach every widget.
+        let styles = styles(&[("a.otui", "Button < UIButton\n")]);
+        let lua = lua(&[]);
+
+        let button = resolve_ancestry("Button", &styles, &lua);
+        assert_eq!(button.chain, ["Button", "UIButton", "UIWidget"]);
+    }
+
+    #[test]
+    fn a_dead_end_chain_does_not_get_the_implicit_root() {
+        // A chain that never reached a native class tells us nothing about what it derives from —
+        // assuming `UIWidget` there would start accepting properties on a typo'd widget name.
+        let styles = styles(&[("a.otui", "Thing < NoSuchBase\n")]);
+        let lua = lua(&[]);
+
+        let thing = resolve_ancestry("Thing", &styles, &lua);
+        assert!(!thing.chain.contains(&"UIWidget".to_owned()));
+        assert_eq!(thing.native, None);
     }
 
     #[test]
