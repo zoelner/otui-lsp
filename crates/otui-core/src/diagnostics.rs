@@ -21,6 +21,7 @@
 //!    a tag it does not recognize, so a misspelled/unknown property never errors, it just has no
 //!    effect).
 
+use crate::catalog;
 use crate::lua_widgets::LuaWidgetIndex;
 use crate::schema;
 use crate::style_index::StyleIndex;
@@ -52,12 +53,14 @@ pub const INVALID_ANCHOR_EDGE: &str = "invalid-anchor-edge";
 /// value-validating properties (`border`, `display`, `layout`, `anchors.*`) is a separate concern;
 /// this check is the unknown-KEY hint only.
 pub const UNKNOWN_PROPERTY: &str = "unknown-property";
-/// Diagnostic code: a malformed *value* for one of the value-validating properties `display`,
-/// `layout`, `border`, or `border-color*` (spec §2.10). Severity [`Severity::Error`]: unlike an
-/// ordinary property (whose bad value is silently ignored), these properties parse their value and
-/// the engine **throws** on malformed input, so the value is a hard error. The span is the offending
-/// value token only. (`anchors.*`, the fourth value-validating property, has its own dedicated
-/// [`INVALID_ANCHOR_EDGE`] check.)
+/// Diagnostic code: a malformed *value* for a value-validating property — `display`, `layout`,
+/// `border`, or any **color** property (`color`, `background`, `background-color`, `icon-color`,
+/// `image-color`, `ttf-stroke-color`, `border-color*` — every `node->value<Color>()` dispatch, see
+/// [`catalog::COLOR_PROPERTIES`]). Severity [`Severity::Error`]: unlike an ordinary property (whose
+/// bad value is silently ignored), these parse their value and the engine **throws** on malformed
+/// input, so the value is a hard error. The span is the offending value token only. A `$variable`
+/// reference value is exempt (it resolves at runtime — see [`leaf_value`]). (`anchors.*` has its own
+/// dedicated [`INVALID_ANCHOR_EDGE`] check.)
 pub const INVALID_PROPERTY_VALUE: &str = "invalid-property-value";
 
 /// The workspace state that makes [`analyze_with_widgets`] **widget-aware**: the `.otui` style index
@@ -160,6 +163,33 @@ fn is_comment(trimmed: &str) -> bool {
     trimmed.starts_with("//") || trimmed.starts_with('#')
 }
 
+/// Emit a tab / odd-indentation diagnostic for `line`'s leading whitespace if malformed, returning
+/// whether one was pushed. The engine checks for a tab first (`line[spaces] == '\t'`) and, only if
+/// absent, for odd indentation, so at most one finding per line. Shared by the structural and comment
+/// paths, since `getLineDepth` runs this on every non-blank line before `parseLine` classifies it.
+fn check_indent_chars(line: &Line<'_>, out: &mut Vec<Diagnostic>) -> bool {
+    let sp = leading_spaces(line.text);
+    if line.text.as_bytes().get(sp) == Some(&b'\t') {
+        out.push(Diagnostic {
+            severity: Severity::Error,
+            code: TAB_INDENTATION,
+            message: "indentation with tabs is not allowed".to_owned(),
+            span: ByteSpan::new(line.start + sp, line.start + sp + 1),
+        });
+        true
+    } else if sp % 2 != 0 {
+        out.push(Diagnostic {
+            severity: Severity::Error,
+            code: ODD_INDENTATION,
+            message: "indentation must be a multiple of 2 spaces".to_owned(),
+            span: ByteSpan::new(line.start, line.start + sp),
+        });
+        true
+    } else {
+        false
+    }
+}
+
 /// The line-based indentation validation pass (`getLineDepth` + `parseLine`).
 fn indentation_pass(source: &str) -> Vec<Diagnostic> {
     let lines = split_lines(source);
@@ -177,35 +207,15 @@ fn indentation_pass(source: &str) -> Vec<Diagnostic> {
         if trimmed.is_empty() {
             continue;
         }
-        // Comment lines are skipped by `parseLine` and do not affect structural depth.
+        // Comment lines do not affect structural depth (`parseLine` skips them), but `getLineDepth`
+        // runs on them FIRST, so a tab / odd indentation on a comment is still a hard engine error.
         if is_comment(trimmed) {
+            check_indent_chars(line, &mut out);
             continue;
         }
 
         let sp = leading_spaces(line.text);
-        let bytes = line.text.as_bytes();
-        let mut indent_flagged = false;
-
-        // The engine checks for a tab first (`line[spaces] == '\t'`) and, only if absent, for odd
-        // indentation. Preserve that precedence so a single malformed line yields one finding.
-        if bytes.get(sp) == Some(&b'\t') {
-            out.push(Diagnostic {
-                severity: Severity::Error,
-                code: TAB_INDENTATION,
-                message: "indentation with tabs is not allowed".to_owned(),
-                span: ByteSpan::new(line.start + sp, line.start + sp + 1),
-            });
-            indent_flagged = true;
-        } else if sp % 2 != 0 {
-            out.push(Diagnostic {
-                severity: Severity::Error,
-                code: ODD_INDENTATION,
-                message: "indentation must be a multiple of 2 spaces".to_owned(),
-                span: ByteSpan::new(line.start, line.start + sp),
-            });
-            indent_flagged = true;
-        }
-
+        let indent_flagged = check_indent_chars(line, &mut out);
         let depth = sp / 2;
 
         // `parseLine`: a jump of more than one level (`depth > currentDepth + 1`) is fatal. Skip
@@ -442,11 +452,11 @@ fn check_anchor_property(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>
         }
     }
 
-    // Target-side edge: in `<targetId>.<targetEdge>` the suffix after the last `.` must be an edge.
-    // A dot-less value (`parent`, `next`, `prev`, `none`, or the shorthand `anchors.fill: parent`
-    // form) carries no target edge and is intentionally left unvalidated here — we do not resolve
-    // the target id. A trailing-dot / empty suffix is also skipped (prefer a false negative to a
-    // false positive on a shape the grammar does not cleanly delimit).
+    // Target value: for a **real** edge (not the `fill`/`centerIn` shorthands) with a value other
+    // than `none`, the engine requires exactly `<id>.<edge>` — `split(value, ".")` must have two
+    // parts, else it throws `"invalid anchor description"`. So a dot-less target (`anchors.top:
+    // parent`) or a multi-dot one (`parent.top.bottom`) is a hard error; `none`, and any target on a
+    // shorthand edge (which takes a plain id), are exempt.
     let Some(value) = node.child_by_field_name("value") else {
         return;
     };
@@ -454,9 +464,28 @@ fn check_anchor_property(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>
         return;
     };
     let text = slice(source, target);
-    let Some(dot) = text.rfind('.') else {
+
+    let edge_is_shorthand = node
+        .child_by_field_name("edge")
+        .is_some_and(|e| schema::is_shorthand_anchor(slice(source, e)));
+    if text == "none" || edge_is_shorthand {
         return;
-    };
+    }
+
+    // Exactly one `.` (a two-part `id.edge`). Zero or two-plus is an "invalid anchor description".
+    if text.matches('.').count() != 1 {
+        out.push(Diagnostic {
+            severity: Severity::Error,
+            code: INVALID_ANCHOR_EDGE,
+            message: format!("`{text}` is not a valid anchor target: expected `<id>.<edge>`"),
+            span: SyntaxTree::span_of(target),
+        });
+        return;
+    }
+
+    // The suffix after the (single) dot must be an anchor edge. A trailing-dot / empty suffix is left
+    // unflagged (prefer a false negative on a shape the grammar does not cleanly delimit).
+    let dot = text.find('.').expect("exactly one dot");
     let edge = &text[dot + 1..];
     if edge.is_empty() || schema::is_anchor_edge(edge) {
         return;
@@ -597,14 +626,26 @@ fn check_property_value(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>)
                 }
             }
         }
-        "border-color"
-        | "border-color-top"
-        | "border-color-right"
-        | "border-color-bottom"
-        | "border-color-left" => {
+        // Every color-typed property (`color`, `background`, `background-color`, `icon-color`,
+        // `image-color`, `ttf-stroke-color`, and the `border-color*` family) is applied via
+        // `node->value<Color>()`, which THROWS on a value it cannot parse — so a bad color is a hard
+        // engine error, not just for `border-color`. Validate the whole set from the catalog.
+        //
+        // A `[a, b]` list is included here on purpose: OTML parses `key: [a, b]` by splitting on `,`
+        // and writing each item as a *child* node (otmlparser `writeIn`), which leaves the color
+        // node's own value empty — so `value<Color>()` casts the empty string and throws. A color
+        // property takes a single color, never a list, so `leaf_value` (which yields the whole
+        // `[...]` token) flagging it is faithful, matching how `border`/`display`/`layout` treat a
+        // list too.
+        k if catalog::COLOR_PROPERTIES.contains(&k) => {
             if let Some((text, span)) = leaf_value(node, source) {
                 if !schema::is_border_color_value(text) {
-                    push_invalid_value(out, format!("`{text}` is not a valid color"), span);
+                    let message = if text.starts_with('[') {
+                        format!("`{text}`: a color property takes a single color, not a list")
+                    } else {
+                        format!("`{text}` is not a valid color")
+                    };
+                    push_invalid_value(out, message, span);
                 }
             }
         }
@@ -654,6 +695,12 @@ fn leaf_value<'a>(node: Node<'_>, source: &'a str) -> Option<(&'a str, ByteSpan)
     let raw = slice(source, value);
     let trimmed = raw.trim();
     if trimmed.is_empty() {
+        return None;
+    }
+    // A `$variable` reference resolves to its value at runtime, so we cannot statically validate it —
+    // and must not flag it. (`$var` is the OTML variable form; a value never legitimately starts with
+    // `$` otherwise.) This keeps every value-validating property from false-flagging `key: $var`.
+    if trimmed.starts_with('$') {
         return None;
     }
     let lead = raw.len() - raw.trim_start().len();
@@ -1301,6 +1348,134 @@ Panel
             diags.iter().all(|d| d.code != INVALID_PROPERTY_VALUE),
             "mis-cased property must not be value-validated: {diags:?}"
         );
+    }
+
+    // --- F1: every color property validates its value (engine throws on a bad color) ----------
+
+    #[test]
+    fn bad_color_value_is_an_error_on_every_color_property() {
+        for key in ["color", "background", "background-color", "icon-color"] {
+            let src = format!("Panel\n  {key}: notacolor\n");
+            let diags = analyze(&src);
+            let d = only(&diags, INVALID_PROPERTY_VALUE);
+            assert_eq!(d.severity, Severity::Error);
+            assert_eq!(&src[d.span.start..d.span.end], "notacolor", "for `{key}`");
+        }
+    }
+
+    #[test]
+    fn valid_color_on_a_plain_color_property_is_silent() {
+        for src in [
+            "Panel\n  color: #ff0000\n",
+            "Panel\n  background-color: red\n",
+        ] {
+            let diags = analyze(src);
+            assert!(
+                diags.iter().all(|d| d.code != INVALID_PROPERTY_VALUE),
+                "valid color must not be flagged: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_color_list_value_is_flagged_because_the_engine_cannot_cast_it() {
+        // OTML parses `color: [red, #00ff00]` into child nodes (otmlparser `writeIn`), leaving the
+        // color node's own value empty, so `node->value<Color>()` casts "" and throws. A color
+        // property takes a single color, never a list — so the whole `[...]` token is an error.
+        for src in [
+            "Panel\n  color: [red, #00ff00]\n",
+            "Panel\n  background-color: [red, blue]\n",
+        ] {
+            let diags = analyze(src);
+            let d = only(&diags, INVALID_PROPERTY_VALUE);
+            assert_eq!(d.severity, Severity::Error);
+            let flagged = &src[d.span.start..d.span.end];
+            assert!(
+                flagged.starts_with('[') && flagged.ends_with(']'),
+                "flags the list: {flagged:?}"
+            );
+            assert!(
+                d.message.contains("single color, not a list"),
+                "message: {}",
+                d.message
+            );
+        }
+    }
+
+    #[test]
+    fn a_variable_reference_value_is_never_flagged() {
+        // `$var` resolves at runtime, so no value-validating property (color, display, layout,
+        // border) may flag it (regression guard for the false-positive the color widening exposed).
+        for src in [
+            "Panel\n  color: $textColor\n",
+            "Panel\n  background-color: $bg\n",
+            "Panel\n  display: $mode\n",
+            "Panel\n  layout: $l\n",
+            "Panel\n  border-color: $c\n",
+        ] {
+            let diags = analyze(src);
+            assert!(
+                diags.iter().all(|d| d.code != INVALID_PROPERTY_VALUE),
+                "a $var value must not be flagged: {src:?} -> {diags:?}"
+            );
+        }
+    }
+
+    // --- F2: an anchor target must be `<id>.<edge>` (one dot) on a real edge -------------------
+
+    #[test]
+    fn dotless_anchor_target_on_a_real_edge_is_an_error() {
+        let src = "Widget\n  anchors.left: parent\n";
+        let diags = analyze(src);
+        let d = only(&diags, INVALID_ANCHOR_EDGE);
+        assert_eq!(d.severity, Severity::Error);
+        assert!(&src[d.span.start..d.span.end] == "parent");
+    }
+
+    #[test]
+    fn multidot_anchor_target_is_an_error() {
+        let src = "Widget\n  anchors.top: parent.top.bottom\n";
+        let diags = analyze(src);
+        let d = only(&diags, INVALID_ANCHOR_EDGE);
+        assert_eq!(&src[d.span.start..d.span.end], "parent.top.bottom");
+    }
+
+    #[test]
+    fn valid_and_exempt_anchor_targets_are_silent() {
+        // `id.edge` targets, `none`, and the fill/centerIn shorthands (plain target) are all fine.
+        for src in [
+            "Widget\n  anchors.top: parent.top\n",
+            "Widget\n  anchors.left: sibling.right\n",
+            "Widget\n  anchors.bottom: none\n",
+            "Widget\n  anchors.fill: parent\n",
+            "Widget\n  anchors.centerIn: parent\n",
+        ] {
+            let diags = analyze(src);
+            assert!(
+                diags.iter().all(|d| d.code != INVALID_ANCHOR_EDGE),
+                "must be silent: {src:?} -> {diags:?}"
+            );
+        }
+    }
+
+    // --- F3: tab / odd indentation on a comment line is a hard error ---------------------------
+
+    #[test]
+    fn tab_indented_comment_is_flagged() {
+        let src = "Panel\n\t// note\n";
+        assert_eq!(codes(&analyze(src)), vec![TAB_INDENTATION]);
+    }
+
+    #[test]
+    fn odd_indented_comment_is_flagged() {
+        let src = "Panel\n   # note\n"; // 3 spaces
+        assert_eq!(codes(&analyze(src)), vec![ODD_INDENTATION]);
+    }
+
+    #[test]
+    fn a_validly_indented_comment_is_silent() {
+        let src = "Panel\n  // fine\n  id: main\n";
+        assert!(analyze(src).is_empty(), "{:?}", analyze(src));
     }
 
     // --- widget-aware unknown property (Lua-added style properties) ----------------------------

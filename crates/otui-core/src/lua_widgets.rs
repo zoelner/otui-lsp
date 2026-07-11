@@ -475,13 +475,24 @@ impl LuaWidgetIndex {
         self.iter().filter(|def| def.name == name).collect()
     }
 
-    /// The Lua parent recorded for the widget `name`, from the first matching def that carries one.
-    /// `None` when `name` is unknown or was only seen through an `onStyleApply` with no `extends`.
+    /// The Lua parent recorded for the widget `name`. `None` when `name` is unknown or was only seen
+    /// through an `onStyleApply` with no `extends`.
+    ///
+    /// Duplicate declarations of the same widget in different documents are legal (e.g. a fork
+    /// override), so — like [`style_index`](crate::style_index)'s `pick_base` — the winner is chosen
+    /// **deterministically** by document id, not by unordered `HashMap` iteration, so the resolved
+    /// ancestry never flickers between runs.
     #[must_use]
     pub fn parent_of(&self, name: &str) -> Option<&str> {
-        self.iter()
-            .filter(|def| def.name == name)
-            .find_map(|def| def.lua_parent.as_deref())
+        let mut candidates: Vec<(&str, &str)> = self
+            .by_doc
+            .iter()
+            .flat_map(|(doc, defs)| defs.iter().map(move |def| (doc.as_str(), def)))
+            .filter(|(_, def)| def.name == name)
+            .filter_map(|(doc, def)| def.lua_parent.as_deref().map(|p| (doc, p)))
+            .collect();
+        candidates.sort_by(|a, b| a.0.cmp(b.0));
+        candidates.first().map(|(_, parent)| *parent)
     }
 
     /// Whether the widget `name` declares the custom style property `prop` (in any matching def).
@@ -840,7 +851,7 @@ end
     }
 
     #[test]
-    fn index_aggregates_across_documents_and_merges_lookups() {
+    fn index_aggregates_across_documents() {
         let mut index = LuaWidgetIndex::new();
         index.set_document(
             "uitable.lua",
@@ -858,6 +869,30 @@ end
 
         assert_eq!(index.lookup("UITable").len(), 1);
         assert!(index.lookup("Missing").is_empty());
+    }
+
+    #[test]
+    fn parent_of_is_deterministic_for_a_widget_declared_in_two_documents() {
+        // The same widget with different `extends` parents in two files (e.g. a fork override) — the
+        // winner is picked by document id, never by insertion or unordered-map order. Building the
+        // index in BOTH insertion orders must resolve to the same parent: `a.lua` sorts before
+        // `b.lua`, so its `UIWidget` wins regardless of which document was added first. A
+        // last-writer or insertion-order implementation would disagree between the two indexes.
+        let a = || scan_widgets("UITable = extends(UIWidget, 'UITable')\n");
+        let b = || scan_widgets("UITable = extends(UIScrollArea, 'UITable')\n");
+
+        let mut a_first = LuaWidgetIndex::new();
+        a_first.set_document("a.lua", a());
+        a_first.set_document("b.lua", b());
+
+        let mut b_first = LuaWidgetIndex::new();
+        b_first.set_document("b.lua", b());
+        b_first.set_document("a.lua", a());
+
+        assert_eq!(a_first.parent_of("UITable"), Some("UIWidget"));
+        assert_eq!(b_first.parent_of("UITable"), Some("UIWidget"));
+        // Both declarations are still retained by lookup.
+        assert_eq!(a_first.lookup("UITable").len(), 2);
     }
 
     #[test]
