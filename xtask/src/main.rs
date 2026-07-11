@@ -78,6 +78,15 @@ const LAYOUT_FILES: &[&str] = &[
 /// `Button` stays unknown — as it is, the engine reads it nowhere there.
 const NATIVE_WIDGET_DIRS: &[&str] = &["src/framework/ui", "src/client"];
 
+/// The style manager, which reads the `__`-prefixed **meta keys** a style may carry — `__class` (the
+/// widget class to instantiate, see `widget_resolve`'s re-root) and `__unique`. These are read off the
+/// style node directly (`styleNode->valueAt("__class")`), never dispatched through the widget style
+/// parser, so they are absent from [`PROPERTY_FILES`] and were hinted as unknown properties.
+///
+/// Scoped to this one file on purpose: `__`-prefixed literals elsewhere in the engine are Lua
+/// metamethods (`__index`, `__gc`, …), not OTUI keys.
+const STYLE_META_FILE: &str = "src/framework/ui/uimanager.cpp";
+
 /// Relative path (under the engine-source root) of the CSS named-color table + legacy color names.
 const COLOR_FILE: &str = "src/framework/util/color.cpp";
 
@@ -102,6 +111,10 @@ struct Catalog {
     /// as `(UI class name, sorted tags)`, sorted by class. Keyed per widget — unlike
     /// [`Catalog::properties`] these are valid only on that class and its descendants.
     native_widget_properties: Vec<(String, Vec<String>)>,
+    /// The `__`-prefixed style **meta keys** the style manager reads off a style node (`__class`,
+    /// `__unique`). Sorted. Not dispatched by the widget style parser, so disjoint from
+    /// [`Catalog::properties`], but valid on any style.
+    style_meta_properties: Vec<String>,
     /// The CSS named-color table: `(lowercased name, packed 0xRRGGBB)`, sorted by name. The value is
     /// captured from the `rgb_to_abgr(0xRRGGBB)` literal in the engine's `kCss` table.
     named_colors: Vec<(String, u32)>,
@@ -298,6 +311,7 @@ fn extract(src: &Path) -> Result<Catalog, String> {
         color_properties: sorted_dedup(color_properties),
         layout_properties: sorted_dedup(layout_properties),
         native_widget_properties: extract_native_widget_properties(src)?,
+        style_meta_properties: extract_style_meta_properties(src)?,
         named_colors,
         legacy_colors,
         legacy_color_names: sorted_dedup(legacy_color_names),
@@ -386,6 +400,26 @@ fn extract_native_widget_properties(src: &Path) -> Result<Vec<(String, Vec<Strin
         );
     }
     Ok(merged)
+}
+
+/// The `__`-prefixed style meta keys the style manager reads off a style node — `__class` and
+/// `__unique` — from `(?:valueAt|writeAt|get)("__key")` in [`STYLE_META_FILE`].
+fn extract_style_meta_properties(src: &Path) -> Result<Vec<String>, String> {
+    let path = src.join(STYLE_META_FILE);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read '{}': {e}", path.display()))?;
+    let stripped = strip_comments(&text);
+
+    let re = Regex::new(r#"\b(?:valueAt|writeAt|get)\s*\(\s*"(__\w+)""#)
+        .expect("valid style-meta regex");
+    let keys: Vec<String> = re
+        .captures_iter(&stripped)
+        .map(|c| c[1].to_string())
+        .collect();
+    if keys.is_empty() {
+        return Err("extracted zero style meta keys — is the style manager as expected?".into());
+    }
+    Ok(sorted_dedup(keys))
 }
 
 /// The keys the widget style parser reads directly out of a `layout:` block — the `type` in
@@ -622,6 +656,16 @@ fn render(catalog: &Catalog) -> String {
     s.push_str(&render_native_widgets(
         "NATIVE_WIDGET_PROPERTIES",
         &catalog.native_widget_properties,
+    ));
+    s.push('\n');
+    s.push_str(
+        "/// The `__`-prefixed style meta keys the style manager reads off a style node \
+         (`__class`, which\n/// re-roots the widget class, and `__unique`). Valid on any style; not \
+         dispatched by the widget\n/// style parser, so disjoint from [`PROPERTIES`].\n",
+    );
+    s.push_str(&render_slice(
+        "STYLE_META_PROPERTIES",
+        &catalog.style_meta_properties,
     ));
     s.push('\n');
     s.push_str(

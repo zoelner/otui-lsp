@@ -391,6 +391,19 @@ pub fn named_color_value(name: &str) -> Option<u32> {
 #[must_use]
 pub fn is_known_property(name: &str) -> bool {
     crate::catalog::PROPERTIES.contains(&name)
+        || crate::catalog::STYLE_META_PROPERTIES.contains(&name)
+}
+
+/// True if `name` is one of the engine's `__`-prefixed style **meta keys**
+/// ([`crate::catalog::STYLE_META_PROPERTIES`]): `__class`, which names the widget class the engine
+/// instantiates for a style (see `widget_resolve`'s re-root), and `__unique`.
+///
+/// The style *manager* reads these straight off the style node (`styleNode->valueAt("__class")`);
+/// they never pass through the widget style parser, so they are absent from
+/// [`crate::catalog::PROPERTIES`] — which is why [`is_known_property`] folds them in.
+#[must_use]
+pub fn is_style_meta_property(name: &str) -> bool {
+    crate::catalog::STYLE_META_PROPERTIES.contains(&name)
 }
 
 /// True if `name` is a key the engine reads **inside a `layout:` block**

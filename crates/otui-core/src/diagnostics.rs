@@ -1298,6 +1298,15 @@ Panel
         assert_eq!(d.severity, Severity::Hint);
     }
 
+    #[test]
+    fn a_style_meta_key_is_not_an_unknown_property() {
+        // `__class:` re-roots the widget class and is read by the engine's style manager
+        // (`styleNode->valueAt("__class")`); `__unique` likewise. Neither goes through the widget
+        // style parser, so neither is in the base catalog — but both are perfectly valid.
+        assert!(analyze("SpinBox < TextEdit\n  __class: UISpinBox\n").is_empty());
+        assert!(analyze("Win < UIWindow\n  __unique: true\n").is_empty());
+    }
+
     // --- semantic pass: anchor vs the parent's layout ------------------------------------------
 
     #[test]

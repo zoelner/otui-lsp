@@ -20,7 +20,8 @@
 //! * [`NAMED_COLORS`] — the CSS named-color table as `(name, 0xRRGGBB)` pairs, lowercased
 //!   to match the engine's case-insensitive lookup. The packed value is the color's RGB.
 //! * [`LEGACY_COLORS`] — the legacy engine color statics as `(name, 0xRRGGBBAA)` pairs
-//!   (alpha preserved), lowercased.
+//!   (alpha preserved), in the engine's **exact** spelling: it matches them
+//!   case-sensitively before falling back to the case-insensitive CSS table.
 //! * [`LEGACY_COLOR_NAMES`] — recognized color names with no extractable RGB value (the
 //!   `transparent` alias); membership only.
 //!
@@ -303,6 +304,11 @@ pub static NATIVE_WIDGET_PROPERTIES: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// The `__`-prefixed style meta keys the style manager reads off a style node (`__class`, which
+/// re-roots the widget class, and `__unique`). Valid on any style; not dispatched by the widget
+/// style parser, so disjoint from [`PROPERTIES`].
+pub static STYLE_META_PROPERTIES: &[&str] = &["__class", "__unique"];
+
 /// CSS named colors recognized by the engine's color parser: `(lowercased name, packed 0xRRGGBB)`.
 pub static NAMED_COLORS: &[(&str, u32)] = &[
     ("aliceblue", 0xF0F8FF),
@@ -455,7 +461,9 @@ pub static NAMED_COLORS: &[(&str, u32)] = &[
     ("yellowgreen", 0x9ACD32),
 ];
 
-/// Legacy engine color statics: `(lowercased name, packed 0xRRGGBBAA)` (alpha preserved).
+/// Legacy engine color statics: `(exact engine spelling, packed 0xRRGGBBAA)` (alpha preserved).
+/// Matched **case-sensitively** — the engine compares `tmp == "darkRed"` before its case-insensitive
+/// CSS fallback, and for eight of these names the CSS table holds a different RGB.
 pub static LEGACY_COLORS: &[(&str, u32)] = &[
     ("alpha", 0x00000000),
     ("black", 0x000000FF),
