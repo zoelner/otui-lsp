@@ -46,6 +46,15 @@ pub const UNKNOWN_STATE: &str = "unknown-state";
 /// of the six anchor edges (spec §2.4). Severity [`Severity::Error`]: `anchors.*` is one of the
 /// four *value-validating* properties (spec §2.10), so the engine throws on a bad edge.
 pub const INVALID_ANCHOR_EDGE: &str = "invalid-anchor-edge";
+
+/// An `anchors.*` on a widget whose parent explicitly uses a non-anchor layout
+/// (`layout: horizontalBox` / `verticalBox` / `grid`).
+///
+/// An **error**: the engine throws `"cannot create anchor, the parent widget doesn't use anchor
+/// layout!"` while applying the style, so the file fails to load. Every widget defaults to
+/// `UIAnchorLayout`, so this only fires when the parent *switched* layout and a child under it still
+/// anchors.
+pub const ANCHOR_PARENT_NO_ANCHOR_LAYOUT: &str = "anchor-parent-no-anchor-layout";
 /// Diagnostic code: an ordinary property key that is not a known OTML property name (spec §2.10,
 /// §4). Severity [`Severity::Hint`]: the engine silently *ignores* an unrecognized tag
 /// (`node->tag()` matches nothing), so a misspelled/unknown property is never an error or warning —
@@ -458,11 +467,98 @@ fn check_state_selector(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>)
     }
 }
 
+/// An anchor is only creatable when the **containing** widget uses an anchor layout: the engine
+/// throws `"cannot create anchor, the parent widget doesn't use anchor layout!"` otherwise
+/// (`uiwidgetbasestyle.cpp`, the `anchors.` dispatch).
+///
+/// Every widget defaults to `UIAnchorLayout`, so this only bites when the parent *explicitly* switches
+/// layout — `layout: horizontalBox` (or `verticalBox` / `grid`) — and a child underneath it still
+/// anchors. That is a plausible authoring mistake and, unlike a runtime id lookup, it is fully
+/// decidable from the tree: the parent widget and its `layout:` are right there.
+///
+/// Deliberately conservative — the hint is only raised when the parent's layout type is a **literal**
+/// non-anchor type. A `$variable` type, a missing type, an absent `layout:`, or a parent we cannot
+/// resolve all mean "assume anchor layout" and stay silent, per the prefer-false-negatives rule.
+fn check_anchor_parent_layout(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+    let Some(widget) = enclosing_widget_node(node) else {
+        return;
+    };
+    let Some(parent) = enclosing_widget_node(widget) else {
+        return; // top-level widget: its runtime parent is unknown, so we cannot judge
+    };
+    let Some(layout_type) = declared_layout_type(parent, source) else {
+        return; // no explicit layout: the default is UIAnchorLayout, which anchors fine
+    };
+    // `anchor` is the anchor layout; anything else replaces it. An unrecognized type is already an
+    // INVALID_PROPERTY_VALUE error from `check_property_value`, so do not pile on here.
+    if layout_type == "anchor" || !schema::is_layout_type(&layout_type) {
+        return;
+    }
+    let span = node
+        .child_by_field_name("edge")
+        .map_or_else(|| SyntaxTree::span_of(node), SyntaxTree::span_of);
+    out.push(Diagnostic {
+        severity: Severity::Error,
+        code: ANCHOR_PARENT_NO_ANCHOR_LAYOUT,
+        message: format!(
+            "cannot anchor: the parent widget uses `{layout_type}` layout, not an anchor layout"
+        ),
+        span,
+    });
+}
+
+/// The nearest **ancestor** widget node of `node` — a `container` or a `style_header` — skipping
+/// `node` itself. `None` at the document root.
+fn enclosing_widget_node<'t>(node: Node<'t>) -> Option<Node<'t>> {
+    let mut current = node.parent()?;
+    loop {
+        if matches!(current.kind(), "container" | "style_header") {
+            return Some(current);
+        }
+        current = current.parent()?;
+    }
+}
+
+/// The layout **type** a widget node explicitly declares, as a literal: the value of a leaf
+/// `layout: <type>` or of the `type:` key inside a `layout:` block. `None` when the widget declares no
+/// `layout:`, or declares one whose type is absent or is a `$variable` (unresolvable statically).
+fn declared_layout_type(widget: Node<'_>, source: &str) -> Option<String> {
+    let mut cursor = widget.walk();
+    let layout = widget
+        .named_children(&mut cursor)
+        .filter(|c| c.kind() == "property")
+        .find(|c| {
+            c.child_by_field_name("key")
+                .is_some_and(|k| slice(source, k) == "layout")
+        })?;
+
+    // Leaf form: `layout: verticalBox`.
+    if let Some(value) = layout.child_by_field_name("value") {
+        let text = slice(source, value).trim();
+        return (!text.is_empty() && !text.starts_with('$')).then(|| text.to_owned());
+    }
+
+    // Block form: `layout:` with a nested `type:`. `_block` is hidden, so it is a direct child.
+    let mut inner = layout.walk();
+    let type_node = layout
+        .named_children(&mut inner)
+        .filter(|c| c.kind() == "property")
+        .find(|c| {
+            c.child_by_field_name("key")
+                .is_some_and(|k| slice(source, k) == "type")
+        })?;
+    let value = type_node.child_by_field_name("value")?;
+    let text = slice(source, value).trim();
+    (!text.is_empty() && !text.starts_with('$')).then(|| text.to_owned())
+}
+
 /// Validate an `anchors.<edge>: <target>` node (grammar: `anchor_property` with an `edge` field
 /// aliased to `anchor_edge` and an optional `value` field of kind `anchor_target` whose `target`
 /// field is a dotted `identifier`). Two edge tokens are checked; the target *id* is intentionally
 /// not resolved here (cross-file id existence is a later node).
 fn check_anchor_property(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+    check_anchor_parent_layout(node, source, out);
+
     // Property-side edge: must be one of the six edges OR a shorthand key (`fill`/`centerIn`, which
     // the grammar spells as the edge of `anchors.fill:` / `anchors.centerIn:`).
     if let Some(edge) = node.child_by_field_name("edge") {
@@ -1200,6 +1296,89 @@ Panel
         assert_ne!(d.severity, Severity::Error);
         assert_ne!(d.severity, Severity::Warning);
         assert_eq!(d.severity, Severity::Hint);
+    }
+
+    // --- semantic pass: anchor vs the parent's layout ------------------------------------------
+
+    #[test]
+    fn anchoring_under_a_non_anchor_layout_parent_is_an_error() {
+        // The engine throws "cannot create anchor, the parent widget doesn't use anchor layout!"
+        // while applying the style, so the file fails to load outright.
+        let src = "\
+Panel
+  layout:
+    type: horizontalBox
+
+  Button
+    anchors.left: parent.left
+";
+        let diags = analyze(src);
+        let d = only(&diags, ANCHOR_PARENT_NO_ANCHOR_LAYOUT);
+        assert_eq!(d.severity, Severity::Error);
+        assert_eq!(&src[d.span.start..d.span.end], "left");
+    }
+
+    #[test]
+    fn anchoring_under_the_leaf_layout_form_is_also_an_error() {
+        let src = "Panel\n  layout: verticalBox\n  Button\n    anchors.top: parent.top\n";
+        assert_eq!(
+            only(&analyze(src), ANCHOR_PARENT_NO_ANCHOR_LAYOUT).severity,
+            Severity::Error
+        );
+    }
+
+    #[test]
+    fn anchoring_under_a_default_layout_parent_is_silent() {
+        // Every widget defaults to UIAnchorLayout, so a parent with no `layout:` anchors fine.
+        let src = "Panel\n  Button\n    anchors.left: parent.left\n";
+        assert!(analyze(src).is_empty(), "{:?}", analyze(src));
+    }
+
+    #[test]
+    fn anchoring_under_an_explicit_anchor_layout_parent_is_silent() {
+        let src = "Panel\n  layout:\n    type: anchor\n  Button\n    anchors.left: parent.left\n";
+        assert!(analyze(src).is_empty(), "{:?}", analyze(src));
+    }
+
+    #[test]
+    fn a_top_level_widgets_anchors_are_not_judged() {
+        // Its runtime parent is unknown (it depends on where the style is instantiated), so we
+        // cannot know the parent's layout — stay silent rather than guess.
+        let src = "Panel\n  anchors.fill: parent\n";
+        assert!(analyze(src).is_empty(), "{:?}", analyze(src));
+    }
+
+    #[test]
+    fn a_variable_layout_type_does_not_trigger_the_anchor_check() {
+        // `$var` resolves at runtime; we cannot know it is non-anchor, so we must not flag.
+        let src =
+            "Panel\n  layout:\n    type: $myLayout\n  Button\n    anchors.left: parent.left\n";
+        assert!(
+            analyze(src)
+                .iter()
+                .all(|d| d.code != ANCHOR_PARENT_NO_ANCHOR_LAYOUT),
+            "{:?}",
+            analyze(src)
+        );
+    }
+
+    #[test]
+    fn the_anchoring_widgets_own_layout_does_not_matter() {
+        // The engine checks the *parent's* layout, not the anchoring widget's own.
+        let src = "\
+Panel
+  Button
+    layout:
+      type: grid
+    anchors.left: parent.left
+";
+        assert!(
+            analyze(src)
+                .iter()
+                .all(|d| d.code != ANCHOR_PARENT_NO_ANCHOR_LAYOUT),
+            "{:?}",
+            analyze(src)
+        );
     }
 
     // --- semantic pass: `layout:` block keys ---------------------------------------------------
