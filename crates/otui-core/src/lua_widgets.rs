@@ -214,11 +214,11 @@ fn starts_with_end_keyword(line: &str) -> bool {
 /// variable, and direct reads of the style-node table — `<styleNode>.<field>` and
 /// `<styleNode>['<key>']`. Both are how a widget pulls a custom attribute out of the applied style.
 fn collect_props(body: &[&str]) -> BTreeSet<String> {
-    let key_var = style_key_variable(body);
     let node_var = body.first().map_or_else(
         || "styleNode".to_owned(),
         |header| style_node_variable(header),
     );
+    let key_var = style_key_variable(body, &node_var);
     let mut props = BTreeSet::new();
     for line in body {
         if let Some(prop) = comparison_literal(line, &key_var) {
@@ -283,13 +283,16 @@ fn collect_style_node_reads(line: &str, var: &str, props: &mut BTreeSet<String>)
     }
 }
 
-/// The loop key variable iterating `styleNode`, i.e. the `k` in `for k, v in pairs(styleNode)`.
+/// The loop key variable iterating the style node, i.e. the `k` in `for k, v in pairs(<node_var>)`,
+/// where `node_var` is the style-node parameter resolved by [`style_node_variable`] (so a renamed
+/// node parameter is honored here just as it is for direct reads).
 ///
 /// Falls back to `name` (the overwhelmingly common spelling) when no such loop is found, so a body
 /// that reads the key through the conventional variable still resolves.
-fn style_key_variable(body: &[&str]) -> String {
+fn style_key_variable(body: &[&str], node_var: &str) -> String {
+    let pairs = format!("pairs({node_var})");
     for line in body {
-        if !line.contains("pairs(styleNode)") {
+        if !line.contains(&pairs) {
             continue;
         }
         if let Some(after_for) = line.trim_start().strip_prefix("for ") {
@@ -792,6 +795,23 @@ end
 ";
         let defs = scan_widgets(src);
         assert_eq!(props(&defs[0]), ["real"]);
+    }
+
+    #[test]
+    fn honors_a_renamed_style_node_param_in_the_equality_chain() {
+        // The style-node param is renamed (`sn`) AND the loop key is non-default (`k`): the loop-key
+        // detection must key off the resolved node var (`pairs(sn)`), not the literal `styleNode`,
+        // otherwise the `k == '...'` comparison is missed.
+        let src = "\
+function W:onStyleApply(sname, sn)
+  for k, v in pairs(sn) do
+    if k == 'real-prop' then
+    end
+  end
+end
+";
+        let defs = scan_widgets(src);
+        assert_eq!(props(&defs[0]), ["real-prop"]);
     }
 
     #[test]

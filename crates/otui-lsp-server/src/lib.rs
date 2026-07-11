@@ -1705,9 +1705,12 @@ impl Backend {
             // indexes are complete (see the completion refresh below) — otherwise a document opened
             // mid-scan would keep a stale widget-aware diagnostic until its next edit. To keep
             // shutdown prompt despite the live `Sender` (which would otherwise make
-            // `IoThreads::join()` wait for this thread), the loops below check the `shutdown` flag
-            // between files and bail; `signal_shutdown` sets it before the backend is dropped, so the
-            // thread returns within one file and its `Sender` clone drops, unblocking join. Progress
+            // `IoThreads::join()` wait for this thread), the indexing loops below check the
+            // `shutdown` flag between files and bail; `signal_shutdown` sets it before the backend is
+            // dropped, so the thread drops its `Sender` clone and unblocks join. The per-directory
+            // walk+read inside `scan_workspace`/`scan_workspace_lua` runs before those checks and is
+            // not itself interruptible, but it is bounded (each file capped at MAX_INDEXED_FILE_BYTES,
+            // no network), so the residual shutdown wait is a bounded latency, never a hang. Progress
             // is reported on stderr, never the LSP channel.
             std::thread::spawn(move || {
                 let entries = scan_workspace(&roots);
