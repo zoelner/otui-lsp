@@ -43,8 +43,11 @@
 
 use crate::catalog;
 use crate::diagnostics;
+use crate::lua_widgets::LuaWidgetIndex;
 use crate::schema;
+use crate::style_index::StyleIndex;
 use crate::syntax::SyntaxTree;
+use crate::widget_resolve;
 use lang_api::{CompletionItem, CompletionKind};
 use tree_sitter::Node;
 
@@ -74,6 +77,22 @@ enum Context {
 /// set so the labels are deterministic (schema/catalog const order).
 #[must_use]
 pub fn complete_at(source: &str, offset: usize) -> Vec<CompletionItem> {
+    // The pure, workspace-unaware form: no style/Lua indexes, so a property key offers only the
+    // global C++ catalog (the widget-added Lua properties come from the workspace-aware variant).
+    complete_at_with_widgets(source, offset, &StyleIndex::new(), &LuaWidgetIndex::new())
+}
+
+/// Like [`complete_at`], but **widget-aware**: on an ordinary property key it additionally offers the
+/// custom style properties the enclosing widget adds in Lua (e.g. `column-style` under a `UITable`),
+/// resolved from the workspace `styles` + `lua` indexes. Every other context is identical. With empty
+/// indexes it degrades exactly to [`complete_at`].
+#[must_use]
+pub fn complete_at_with_widgets(
+    source: &str,
+    offset: usize,
+    styles: &StyleIndex,
+    lua: &LuaWidgetIndex,
+) -> Vec<CompletionItem> {
     // Guard against an offset past the end or inside a multi-byte char: slicing the prefix below
     // would otherwise panic, and an offscreen cursor has no context anyway.
     if offset > source.len() || !source.is_char_boundary(offset) {
@@ -98,8 +117,75 @@ pub fn complete_at(source: &str, offset: usize) -> Vec<CompletionItem> {
         Some(Context::PropertyKey) if !diagnostics::line_indentation_is_valid(source, offset) => {
             Vec::new()
         }
+        Some(Context::PropertyKey) => property_key_items(source, offset, styles, lua),
         Some(context) => items_for(context, source, offset),
         None => Vec::new(),
+    }
+}
+
+/// Build the property-key candidates: the global C++ catalog plus the Lua-added custom properties of
+/// the widget enclosing the cursor (resolved cross-file through its `.otui` + Lua ancestry). The
+/// catalog comes first (const order); the widget's Lua properties are appended, de-duplicated against
+/// the catalog, and tagged so the client can tell them apart. When the enclosing widget cannot be
+/// located (a parse too broken to find it) or has no Lua properties, this is just the catalog.
+fn property_key_items(
+    source: &str,
+    offset: usize,
+    styles: &StyleIndex,
+    lua: &LuaWidgetIndex,
+) -> Vec<CompletionItem> {
+    let mut items = set_items(catalog::PROPERTIES, CompletionKind::Keyword, "property");
+    let Some(widget) = enclosing_widget_type(source, offset) else {
+        return items;
+    };
+    let ancestry = widget_resolve::resolve_ancestry(&widget, styles, lua);
+    for prop in ancestry.custom_properties(lua) {
+        if items.iter().any(|item| item.label == prop) {
+            continue; // a Lua property that shadows a catalog name collapses into one entry
+        }
+        items.push(CompletionItem {
+            label: prop,
+            kind: CompletionKind::Keyword,
+            detail: Some("lua property".to_owned()),
+        });
+    }
+    items
+}
+
+/// The type name of the widget enclosing the cursor: the `tag` of the nearest ancestor `container`
+/// or the `base` of the nearest ancestor `style_header` (the type a property on that widget resolves
+/// against, mirroring the diagnostics pass). `None` when the source cannot be parsed or the cursor
+/// has no enclosing widget. Best-effort mid-edit: the current line is often a broken `ERROR` region,
+/// but the enclosing widget itself is usually intact, so its type still resolves.
+///
+/// The half-typed key on the cursor's own line frequently parses as a bare `container` tag (a
+/// lowercase word with no `:` yet is grammatically a widget tag), which is **not** the enclosing
+/// widget — it is the property being typed. So any candidate widget that starts on the cursor's line
+/// is skipped; only a widget declared on an earlier line is a genuine encloser.
+fn enclosing_widget_type(source: &str, offset: usize) -> Option<String> {
+    let tree = SyntaxTree::parse(source)?;
+    let line_start = source[..offset].rfind('\n').map_or(0, |nl| nl + 1);
+    let lo = offset.saturating_sub(1);
+    let mut node = tree.root().descendant_for_byte_range(lo, offset)?;
+    loop {
+        // Skip a widget node sitting on the cursor's own line: it is the token being typed, not the
+        // block that encloses it. A real enclosing widget opens on an earlier line.
+        if node.start_byte() < line_start {
+            match node.kind() {
+                "container" => {
+                    return node
+                        .child_by_field_name("tag")
+                        .map(|tag| source[tag.start_byte()..tag.end_byte()].to_owned());
+                }
+                "style_header" => {
+                    return node
+                        .child_by_field_name("base")
+                        .map(|base| source[base.start_byte()..base.end_byte()].to_owned());
+                }
+                _ => {}
+            }
+        }
+        node = node.parent()?;
     }
 }
 
@@ -811,5 +897,104 @@ Panel
         // The returned labels for one context equal exactly the schema set, in const order.
         let src = "Button\n  $\n";
         assert_eq!(labels(&complete_at(src, at(src, "$") + 1)), schema::STATES);
+    }
+
+    // --- widget-aware property completion (Lua-added properties) -------------------------------
+
+    use crate::lua_widgets::scan_widgets;
+    use crate::style_index::extract_style_defs;
+
+    fn styles(docs: &[(&str, &str)]) -> StyleIndex {
+        let mut index = StyleIndex::new();
+        for (doc, src) in docs {
+            let tree = SyntaxTree::parse(src).expect("parse otui");
+            index.set_document(*doc, extract_style_defs(&tree));
+        }
+        index
+    }
+
+    fn lua(docs: &[(&str, &str)]) -> LuaWidgetIndex {
+        let mut index = LuaWidgetIndex::new();
+        for (doc, src) in docs {
+            index.set_document(*doc, scan_widgets(src));
+        }
+        index
+    }
+
+    const UITABLE_LUA: &str = "\
+UITable = extends(UIWidget, 'UITable')
+
+function UITable:onStyleApply(styleName, styleNode)
+  for name, value in pairs(styleNode) do
+    if name == 'column-style' then
+    elseif name == 'row-style' then
+    end
+  end
+end
+";
+
+    #[test]
+    fn property_key_offers_lua_props_of_the_enclosing_widget() {
+        // Under a `< UITable` header, the property key context offers the catalog PLUS UITable's
+        // Lua-added properties, deterministically (catalog first, then the Lua props sorted).
+        let styles = styles(&[]);
+        let lua = lua(&[("uitable.lua", UITABLE_LUA)]);
+        let src = "Table < UITable\n  col\n";
+        let items = complete_at_with_widgets(src, at(src, "col") + "col".len(), &styles, &lua);
+        let got = labels(&items);
+
+        let mut expected: Vec<String> = catalog::PROPERTIES
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        expected.push("column-style".to_owned());
+        expected.push("row-style".to_owned());
+        assert_eq!(got, expected);
+        // The Lua props are tagged so the client can distinguish them from catalog properties.
+        let col = items.iter().find(|i| i.label == "column-style").unwrap();
+        assert_eq!(col.detail.as_deref(), Some("lua property"));
+        assert_eq!(col.kind, CompletionKind::Keyword);
+    }
+
+    #[test]
+    fn property_key_lua_props_resolve_cross_file_on_a_widget_instance() {
+        // The cursor is under a nested `Table` container whose type resolves cross-file
+        // (`Table < UITable`) to the native UITable that declares the Lua props.
+        let styles = styles(&[("lib.otui", "Table < UITable\n")]);
+        let lua = lua(&[("uitable.lua", UITABLE_LUA)]);
+        let src = "\
+Window < UIWindow
+  Table
+    col
+";
+        let items = complete_at_with_widgets(src, at(src, "col") + "col".len(), &styles, &lua);
+        let got = labels(&items);
+        assert!(got.contains(&"column-style".to_owned()));
+        assert!(got.contains(&"row-style".to_owned()));
+    }
+
+    #[test]
+    fn property_key_omits_lua_props_on_an_unrelated_widget() {
+        // A Button does not descend from UITable, so its property completion is the catalog only.
+        let styles = styles(&[]);
+        let lua = lua(&[("uitable.lua", UITABLE_LUA)]);
+        let src = "Button < UIButton\n  col\n";
+        let got = labels(&complete_at_with_widgets(
+            src,
+            at(src, "col") + "col".len(),
+            &styles,
+            &lua,
+        ));
+        assert_eq!(got, catalog::PROPERTIES);
+    }
+
+    #[test]
+    fn empty_indexes_degrade_to_the_catalog_only() {
+        // The workspace-unaware `complete_at` (empty indexes) offers exactly the catalog.
+        let src = "Table < UITable\n  col\n";
+        assert_eq!(
+            labels(&complete_at(src, at(src, "col") + "col".len())),
+            catalog::PROPERTIES
+        );
     }
 }

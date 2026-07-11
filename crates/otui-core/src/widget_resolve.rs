@@ -42,6 +42,21 @@ impl WidgetAncestry {
     pub fn declares_custom_property(&self, lua: &LuaWidgetIndex, prop: &str) -> bool {
         self.chain.iter().any(|name| lua.declares(name, prop))
     }
+
+    /// Every Lua custom style property valid on this widget — the union of the `custom_props` of
+    /// each widget in the ancestry (per `lua`), sorted and de-duplicated. This is the enumeration
+    /// [`completion`](crate::completion) offers, the counterpart to the
+    /// [`declares_custom_property`](Self::declares_custom_property) membership test.
+    #[must_use]
+    pub fn custom_properties(&self, lua: &LuaWidgetIndex) -> std::collections::BTreeSet<String> {
+        let mut props = std::collections::BTreeSet::new();
+        for name in &self.chain {
+            for def in lua.lookup(name) {
+                props.extend(def.custom_props.iter().cloned());
+            }
+        }
+        props
+    }
 }
 
 /// Resolve the full ancestry of the widget type `start`.
@@ -255,5 +270,40 @@ end
         // The same property is unknown on an unrelated widget (no UITable in its ancestry).
         let button = resolve_ancestry("UIButton", &styles, &lua);
         assert!(!button.declares_custom_property(&lua, "column-style"));
+    }
+
+    #[test]
+    fn custom_properties_enumerates_the_whole_ancestry() {
+        // A widget with props plus a Lua parent that also declares props: the enumeration is the
+        // union across the chain (the substrate for widget-aware completion).
+        let styles = styles(&[("a.otui", "MyTable < UITable\n")]);
+        let lua = lua(&[(
+            "uitable.lua",
+            "\
+UIScrollArea = extends(UIWidget, 'UIScrollArea')
+
+function UIScrollArea:onStyleApply(styleName, styleNode)
+  for name, value in pairs(styleNode) do
+    if name == 'inverted-scroll' then
+    end
+  end
+end
+
+UITable = extends(UIScrollArea, 'UITable')
+
+function UITable:onStyleApply(styleName, styleNode)
+  for name, value in pairs(styleNode) do
+    if name == 'column-style' then
+    elseif name == 'row-style' then
+    end
+  end
+end
+",
+        )]);
+
+        let props = resolve_ancestry("MyTable", &styles, &lua).custom_properties(&lua);
+        let got: Vec<&str> = props.iter().map(String::as_str).collect();
+        // UITable's own props plus the inherited one from its Lua parent UIScrollArea.
+        assert_eq!(got, ["column-style", "inverted-scroll", "row-style"]);
     }
 }

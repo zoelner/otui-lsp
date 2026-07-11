@@ -197,15 +197,34 @@ impl OtuiService {
 
     /// Compute completion candidates for the cursor at byte `offset` (spec §6). Returns the OTML
     /// **closed set** that applies — `$state` names, `anchors.<edge>` edges, magic anchor targets,
-    /// or `@event` names — or an empty vec when the cursor is not in one of those contexts. Property
-    /// names and colors are deliberately not offered (that catalog is a later node); see
-    /// [`completion`].
+    /// `@event` names, or the global property-name catalog on an ordinary `key:` — or an empty vec
+    /// when the cursor is not in one of those contexts. Property **values** and colors are
+    /// deliberately not offered (that needs per-property type metadata); see [`completion`].
     ///
-    /// Inherent (not on the [`LanguageService`] trait) so the protocol-agnostic trait stays minimal
-    /// and mirrors [`base_reference_at`](Self::base_reference_at) / [`style_header_at`](Self::style_header_at).
+    /// This is the workspace-unaware form; [`complete_with_widgets`](Self::complete_with_widgets)
+    /// also offers a widget's Lua-added properties. Inherent (not on the [`LanguageService`] trait)
+    /// so the protocol-agnostic trait stays minimal.
     #[must_use]
     pub fn complete_at(&self, source: &str, offset: usize) -> Vec<CompletionItem> {
         completion::complete_at(source, offset)
+    }
+
+    /// Like [`complete_at`](Self::complete_at), but **widget-aware**: on an ordinary property key it
+    /// also offers the custom style properties the enclosing widget adds in Lua (e.g. `column-style`
+    /// under a `UITable`), resolved cross-file from the workspace `styles` + `lua` indexes. With empty
+    /// indexes it is identical to [`complete_at`](Self::complete_at).
+    ///
+    /// Inherent (not on the [`LanguageService`] trait) because it consumes server-owned workspace
+    /// state, mirroring [`diagnostics_with_widgets`](Self::diagnostics_with_widgets).
+    #[must_use]
+    pub fn complete_with_widgets(
+        &self,
+        source: &str,
+        offset: usize,
+        styles: &StyleIndex,
+        lua: &LuaWidgetIndex,
+    ) -> Vec<CompletionItem> {
+        completion::complete_at_with_widgets(source, offset, styles, lua)
     }
 
     /// Compute the quick-fixes offered for the byte `range` in `source` (spec §7). Recomputes the
