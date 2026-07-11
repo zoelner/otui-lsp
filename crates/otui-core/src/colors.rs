@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn unparsable_source_yields_no_colors() {
-        // An unterminated inline array parses to an ERROR node but must not panic.
-        let _ = document_colors("x: [a, b\n");
+        // An unterminated inline array parses to an ERROR node — no panic, and no colors emitted.
+        assert!(document_colors("x: [a, b\n").is_empty());
     }
 }

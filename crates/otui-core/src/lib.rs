@@ -5,11 +5,13 @@
 //! expressed in byte offsets via the [`lang-api`] contract, so the same engine can back the LSP
 //! server or be embedded directly in an editor.
 //!
-//! Behavior is a faithful mirror of the real OTClient engine, per the spec vendored at
-//! `docs/otui-language-service-spec.md`. Milestones fill in the submodules
-//! (`syntax`, `schema`, `index`, `diagnostics`, `completion`, `symbols`, `format`); this slice
-//! wires the [`LanguageService`] entry point to the parse-level [`diagnostics`] pass over the
-//! tree-sitter [`syntax`] substrate.
+//! Behavior is a faithful mirror of the real OTClient engine (opentibiabr), per the spec vendored at
+//! `docs/otui-language-service-spec.md`. The [`syntax`] tree-sitter substrate underpins every
+//! feature module: [`diagnostics`], [`completion`], [`hover`], [`property_hover`], [`symbols`],
+//! [`navigation`], [`references`], [`hierarchy`], [`format`], [`folding`], [`semantic`], [`colors`],
+//! [`links`], [`fixes`], plus the workspace-index building blocks ([`style_index`], [`lua_widgets`],
+//! [`widget_resolve`]) and the engine data ([`schema`], [`catalog`]). The [`LanguageService`] trait
+//! and the inherent [`OtuiService`] methods below are the entry points the server drives.
 
 pub mod catalog;
 pub mod colors;

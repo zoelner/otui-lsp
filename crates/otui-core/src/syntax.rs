@@ -110,10 +110,25 @@ mod tests {
     }
 
     #[test]
-    fn walk_visits_the_root() {
+    fn walk_visits_the_root_then_descends_into_children() {
         let st = SyntaxTree::parse("id: main\n").expect("parse");
-        let mut kinds = Vec::new();
-        st.walk(|kind, _span| kinds.push(kind.to_owned()));
-        assert_eq!(kinds.first().map(String::as_str), Some("document"));
+        let mut visited = Vec::new();
+        st.walk(|kind, span| visited.push((kind.to_owned(), span)));
+
+        // Pre-order: the document root is visited first.
+        assert_eq!(visited.first().map(|(k, _)| k.as_str()), Some("document"));
+        // The walk descends — it does not stop at the root — and reaches the `id_property` and the
+        // `main` value token below it, in source order.
+        let kinds: Vec<&str> = visited.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(
+            kinds.len() > 1,
+            "walk must descend past the root: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"id_property"),
+            "visits the id_property child: {kinds:?}"
+        );
+        // Every reported span is inside the source.
+        assert!(visited.iter().all(|(_, s)| s.end <= "id: main\n".len()));
     }
 }

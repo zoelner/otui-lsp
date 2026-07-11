@@ -149,13 +149,21 @@ mod tests {
     }
 
     #[test]
-    fn span_is_trimmed_to_the_path_text() {
-        // Even if the value token were to include surrounding whitespace, the reported span is the
-        // trimmed path only.
-        let source = "Panel\n  image-source: assets/bg.png\n";
+    fn span_covers_exactly_the_path_and_leaves_the_key_out() {
+        // The reported span underlines the path token only — never the `image-source:` key, the `:`,
+        // or the separating space. A path with an interior `.` and `/` is reported verbatim, so the
+        // extension and directory separators are inside the link.
+        let source = "Panel\n  image-source: assets/ui/bg.9.png\n";
         let r = &document_links(source)[0];
-        assert_eq!(&source[r.span.start..r.span.end], "assets/bg.png");
-        assert!(!source[r.span.start..r.span.end].starts_with(' '));
+        let text = &source[r.span.start..r.span.end];
+        assert_eq!(text, "assets/ui/bg.9.png");
+        assert_eq!(text, r.path, "span text and stored path agree");
+        // The span sits strictly after the `: ` separator (the key/colon are not underlined).
+        let colon = source.find(':').unwrap();
+        assert!(
+            r.span.start > colon + 1,
+            "span starts past the `: ` separator"
+        );
     }
 
     #[test]

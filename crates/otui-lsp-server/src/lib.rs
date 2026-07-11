@@ -3930,8 +3930,9 @@ end
     }
 
     #[test]
-    fn document_highlight_off_symbol_classifies_to_none() {
-        // A property value is neither a style name nor an id → the handler answers `None`.
+    fn classify_reference_target_is_none_off_a_symbol() {
+        // A property value is neither a style name nor an id → the shared classifier answers `None`,
+        // so the reference/highlight handlers that build on it have nothing to resolve.
         let svc = OtuiService::new();
         let src = "Panel\n  width: 10\n";
         let off = src.find("10").expect("present");
