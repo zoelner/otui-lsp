@@ -198,6 +198,22 @@ pub enum CompletionKind {
     Class,
 }
 
+/// How a [`CompletionItem::insert_text`] should be interpreted by the client, protocol-agnostic.
+///
+/// Mirrors LSP's `InsertTextFormat` (the server crate is the only place that maps a variant to
+/// `lsp_types::InsertTextFormat`), but this enum knows nothing about LSP. [`Plain`](Self::Plain) is
+/// the default: `insert_text` (or, when absent, `label`) is inserted verbatim. [`Snippet`](Self::Snippet)
+/// marks `insert_text` as LSP/TextMate snippet syntax (`$0`, `$1`, `${1:placeholder}`) — tab-stops the
+/// client's editor walks through after insertion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InsertFormat {
+    /// `insert_text` (or `label`) is plain text, inserted as-is.
+    #[default]
+    Plain,
+    /// `insert_text` is LSP snippet syntax: tab-stops and placeholders the client's editor expands.
+    Snippet,
+}
+
 /// One completion candidate, protocol-agnostic (spec §6).
 ///
 /// The engine emits these for the OTML **closed sets** it knows exhaustively (`$state` names, anchor
@@ -216,6 +232,12 @@ pub struct CompletionItem {
     /// Used where several categories share one position (e.g. a widget's own Lua properties ranked
     /// above the global catalog, above child-widget names) so the most relevant float to the top.
     pub sort_text: Option<String>,
+    /// The text to insert in place of `label`, or `None` to insert `label` verbatim. Set only where a
+    /// structural snippet (a property `key: $0`, a child widget's `id:` skeleton, …) is worth more
+    /// than the bare name; `insert_format` says how to interpret it.
+    pub insert_text: Option<String>,
+    /// How `insert_text` is interpreted. `Plain` unless `insert_text` carries snippet syntax.
+    pub insert_format: InsertFormat,
 }
 
 /// The contract every language backend implements. Kept intentionally minimal for now; symbols,
