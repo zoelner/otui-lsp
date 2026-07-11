@@ -14,12 +14,18 @@
 //!   or `rgb(1,2,3)` is unambiguously a color regardless of which property it sits on, so they are
 //!   always swatched.
 //! * **Named colors** (`red`, `blue`, …) — a bare word is lexically indistinguishable from an `id:`
-//!   value or any other identifier, so it is swatched **only in a color-typed property value
-//!   position**: the value (or an inline-array item of the value) of a `property` whose key is in
+//!   value or any other identifier, so it is swatched **only as the scalar value of a color-typed
+//!   property**: the `plain_value` of a `property` whose key is in
 //!   [`crate::catalog::COLOR_PROPERTIES`] (the engine's `value<Color>` dispatch sites — `color`,
 //!   `background`, `border-color*`, `icon-color`, `image-color`, `ttf-stroke-color`). So
 //!   `color: red` / `border-color: blue` swatch, but `id: red` / `text: blue` do NOT — an
 //!   `id_property` or a non-color property never triggers a named swatch.
+//!
+//!   A named item **inside a `[...]` list** is deliberately NOT swatched: `color: [a, b]` is not a
+//!   valid multi-color form — the engine parses the list into child nodes and leaves the color
+//!   node's value empty, so `value<Color>()` throws (this is a [`crate::diagnostics`] error). A
+//!   hex/functional literal inside such a list still swatches, but only via the context-free rule
+//!   below (a color literal is unambiguous anywhere), never because it sits in a color property.
 
 use lang_api::ByteSpan;
 use tree_sitter::Node;
@@ -45,9 +51,10 @@ pub fn document_colors(source: &str) -> Vec<(ByteSpan, Rgba)> {
 /// Pre-order walk emitting `(span, rgba)` for every color occurrence under `node`.
 ///
 /// A `color` literal node is always emitted (context-free). A `property` whose key is a color-typed
-/// tag additionally contributes its **named** color value(s) — a bare `plain_value`, or the
-/// `identifier` items of an `inline_array` value. Color-literal children (`color` nodes) are left to
-/// the context-free rule as the recursion reaches them, so nothing is double-counted.
+/// tag additionally contributes its **named** color value when the value is a bare `plain_value`. A
+/// `[...]` list value is not a valid color (the engine throws on it), so its items are not swatched
+/// here — a color literal among them is still emitted by the context-free rule as the recursion
+/// reaches its `color` node, so nothing is double-counted.
 fn collect(node: Node<'_>, source: &str, out: &mut Vec<(ByteSpan, Rgba)>) {
     if node.kind() == "color" {
         push_color(node, source, out);
@@ -75,21 +82,13 @@ fn color_typed_value<'a>(property: Node<'a>, source: &str) -> Option<Node<'a>> {
     property.child_by_field_name("value")
 }
 
-/// Emit the named-color swatch(es) carried by a color-typed property's `value`: a whole
-/// `plain_value` bare name, or the `identifier` items of an `inline_array`. A `color`-literal value
-/// is intentionally skipped here — the context-free rule in [`collect`] handles it.
+/// Emit the named-color swatch carried by a color-typed property's `value`: only a whole
+/// `plain_value` bare name. A `[...]` list is not a valid color value (the engine throws — see
+/// [`crate::diagnostics`]), so its items are not swatched; and a `color`-literal value is skipped
+/// here because the context-free rule in [`collect`] already handles it.
 fn collect_named_in_value(value: Node<'_>, source: &str, out: &mut Vec<(ByteSpan, Rgba)>) {
-    match value.kind() {
-        "plain_value" => push_color(value, source, out),
-        "inline_array" => {
-            let mut cursor = value.walk();
-            for item in value.named_children(&mut cursor) {
-                if item.kind() == "identifier" {
-                    push_color(item, source, out);
-                }
-            }
-        }
-        _ => {}
+    if value.kind() == "plain_value" {
+        push_color(value, source, out);
     }
 }
 
@@ -163,14 +162,18 @@ mod tests {
     }
 
     #[test]
-    fn named_color_in_a_color_property_inline_array_is_swatched() {
-        // Both items of a color-typed property's inline array swatch: the named `red` (identifier)
-        // and the `#00ff00` literal.
+    fn a_named_item_in_a_color_list_is_not_swatched_but_a_literal_still_is() {
+        // `color: [a, b]` is not a valid multi-color form — the engine throws on it (a
+        // `crate::diagnostics` error). So a *named* item (`red`) is NOT swatched. A hex literal
+        // (`#00ff00`) still swatches, but only via the context-free rule (a color literal is a color
+        // anywhere), so exactly one swatch is reported.
         let found = colors_with_text("Widget\n  color: [red, #00ff00]\n");
         let texts: Vec<&str> = found.iter().map(|(t, _)| *t).collect();
-        assert!(texts.contains(&"red"));
-        assert!(texts.contains(&"#00ff00"));
-        assert_eq!(found.len(), 2);
+        assert_eq!(
+            texts,
+            ["#00ff00"],
+            "only the context-free literal swatches, not the named list item"
+        );
     }
 
     #[test]
