@@ -475,6 +475,10 @@ fn uri_from_file_path(path: &Path) -> Option<Uri> {
 ///   (there may be several workspace folders, or none — in which case a `/`-rooted path yields no
 ///   candidates offline).
 /// * Any **other** (relative) path is resolved against the current document's directory.
+/// * **Extensionless** paths get a `.png` variant probed first: OTClient's texture loader appends
+///   `.png` to a source with no extension, and OTUI authors almost always omit it
+///   (`image-source: /images/ui/button` → `button.png` on disk). Without this the link would never
+///   resolve for the overwhelmingly common extensionless form. See [`asset_probe_variants`].
 ///
 /// Returns the candidates in probe order; the caller keeps the first that exists.
 fn resolve_asset_candidates(
@@ -486,12 +490,26 @@ fn resolve_asset_candidates(
     if path.is_empty() {
         return Vec::new();
     }
-    if let Some(rest) = path.strip_prefix('/') {
+    let bases: Vec<PathBuf> = if let Some(rest) = path.strip_prefix('/') {
         // OTClient "absolute" = relative to the data root; approximate the data root as each
         // workspace root. Strip the leading `/` so `join` does not discard the root.
         workspace_roots.iter().map(|root| root.join(rest)).collect()
     } else {
         vec![doc_dir.join(path)]
+    };
+    bases.into_iter().flat_map(asset_probe_variants).collect()
+}
+
+/// Expand one resolved base path into the on-disk variants to probe, mirroring OTClient's texture
+/// loader. A path that already carries an extension (`window.png`) is probed as-is. An
+/// **extensionless** path (`.../button`) probes its `.png` form first — the engine's default for a
+/// source with no extension — then the literal as a harmless fallback (an extensionless file on disk
+/// is unusual but not impossible).
+fn asset_probe_variants(base: PathBuf) -> Vec<PathBuf> {
+    if base.extension().is_some() {
+        vec![base]
+    } else {
+        vec![base.with_extension("png"), base]
     }
 }
 
@@ -4423,6 +4441,63 @@ end
         // Offline, a `/`-rooted path has no data root to resolve against when no workspace is open.
         let candidates = resolve_asset_candidates("/images/x.png", Path::new("/project/sub"), &[]);
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn resolve_asset_candidates_appends_png_to_an_extensionless_path() {
+        // OTUI authors omit the extension; the engine appends `.png`. The `.png` variant is probed
+        // first, then the literal as a fallback.
+        let roots = vec![PathBuf::from("/data")];
+        let candidates =
+            resolve_asset_candidates("/images/ui/button", Path::new("/project"), &roots);
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/data/images/ui/button.png"),
+                PathBuf::from("/data/images/ui/button"),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_asset_candidates_keeps_an_explicit_extension_as_is() {
+        // A path that already carries an extension is probed verbatim — no `.png.png`.
+        let candidates = resolve_asset_candidates(
+            "sprites/ok.png",
+            Path::new("/project/mod"),
+            &[PathBuf::from("/data")],
+        );
+        assert_eq!(
+            candidates,
+            vec![PathBuf::from("/project/mod/sprites/ok.png")]
+        );
+    }
+
+    #[test]
+    fn document_link_resolves_an_extensionless_image_source() {
+        // The real-world shape: `image-source` written without `.png`, resolving to `<name>.png`.
+        let base = std::env::temp_dir().join(format!("otui-links-noext-{}", std::process::id()));
+        let assets = base.join("images").join("ui");
+        std::fs::create_dir_all(&assets).expect("mkdir");
+        std::fs::write(assets.join("button.png"), b"png").expect("write asset");
+
+        let doc_path = base.join("window.otui");
+        let doc_uri = uri_from_file_path(&doc_path).expect("doc uri");
+        let text = "Panel\n  image-source: images/ui/button\n";
+        let backend = backend_with_doc(&doc_uri, text, Vec::new());
+
+        let links = backend
+            .document_link(link_params(&doc_uri))
+            .expect("known document");
+        assert_eq!(
+            links.len(),
+            1,
+            "extensionless source should link, got {links:?}"
+        );
+        let target = uri_from_file_path(&assets.join("button.png")).expect("target uri");
+        assert_eq!(links[0].target.as_ref(), Some(&target));
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// Build a `Backend` with an open `file://` document and the given workspace roots, for driving
