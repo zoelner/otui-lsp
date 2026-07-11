@@ -89,10 +89,14 @@ Every widget with an `id:` becomes a literal field on its parent, in the C++ eng
 
 `anchors.<edge>: <targetId>.<targetEdge>` (`UIWidget::parseBaseStyle`), plus the shorthands
 `anchors.fill: <target>` and `anchors.centerIn: <target>`. `<edge>` ∈ `top | bottom | left |
-right | horizontalCenter | verticalCenter` (case-insensitive, `Fw::translateAnchorEdge`).
-`<targetId>` is either a magic keyword — `parent`, `next`/`prev` — or a sibling/ancestor's `id:`
-value, resolved via `UIAnchor::getHookedWidget`/`parentWidget->getChildById(targetId)`. Value
-`none` removes an existing anchor for that edge.
+right | horizontalCenter | verticalCenter` (case-**and-whitespace**-insensitive,
+`Fw::translateAnchorEdge` lowercases and strips spaces). `<targetId>` is either a magic keyword —
+`parent`, `next`/`prev` (the adjacent siblings) — or a **direct sibling's** `id:` value: resolution
+is `UIAnchor::getHookedWidget` → `parentWidget->getChildById(targetId)`, which searches only the
+parent's **direct children** (not a recursive/ancestor lookup), so anchoring to an ancestor or a
+non-sibling id silently fails to resolve at layout time. A missing target id is **not** a parse
+error — it is a runtime no-op (only a bad *edge* or a malformed `id.edge` throws). Value `none`
+removes an existing anchor for that edge.
 
 ### 2.5 Embedded Lua — `@tag:` event handlers
 
@@ -282,7 +286,7 @@ of the paired `.lua` controller for the same Lua-reference shapes (dot chains an
 - `id:` value → "this widget's id" plus a reference count (from 5.4).
 - `&tag:` key → **both** meanings from 2.6, rendered together.
 - `Name < Base` header's base name → resolved location (5.2) or "built-in widget class" for `UI*`.
-- Anchor target identifier → the resolved sibling/ancestor's kind, or "not found".
+- Anchor target identifier → the resolved direct-sibling's kind, or "not found".
 
 ## 6. Completion interface
 
@@ -291,7 +295,7 @@ A **context-dispatch table** — completions differ by where in the grammar the 
 | Cursor context | Completion source |
 |---|---|
 | Property-name position | The §2.10 property schema names |
-| Property-value position (keyed by property) | Enum values for that property (e.g. `text-align` → `left\|center\|right`), the color-name list (2.9) for color-kind properties, or — for `anchors.*` — sibling/ancestor ids plus `parent\|next\|prev` |
+| Property-value position (keyed by property) | Enum values for that property (e.g. `text-align` → `left\|center\|right`), the color-name list (2.9) for color-kind properties, or — for `anchors.*` — direct-sibling ids plus `parent\|next\|prev` |
 | Inside a `$state` selector | The closed 14-name list (2.8) |
 | `Name < Base` header's base slot | The workspace style index (5.2) names, plus the `UI*` built-in class list |
 | `@tag:` **key** position | The known event-name list (2.5) |

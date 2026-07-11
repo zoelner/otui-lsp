@@ -1225,28 +1225,37 @@ fn render_property_hover(
     encoding: PositionEncoding,
 ) -> Hover {
     let name = &desc.name;
-    let body = match &desc.value {
-        PropertyValueKind::Color => "a color value".to_owned(),
-        PropertyValueKind::AssetPath => {
-            "an asset path (a texture) — the `.png` extension is optional".to_owned()
+    // Prefer the curated behavior sentence; fall back to a value-kind description when the property
+    // is known but outside the curated canonical set.
+    let title = match desc.doc {
+        Some(doc) => format!("**`{name}`** — {doc}"),
+        None => {
+            let body = match &desc.value {
+                PropertyValueKind::Color => "a color value",
+                PropertyValueKind::AssetPath => {
+                    "an asset path (a texture) — the `.png` extension is optional"
+                }
+                PropertyValueKind::Enum { .. } => "one of a fixed value set (see below)",
+                PropertyValueKind::Border => "a border shorthand: a width and a color (or `none`)",
+                PropertyValueKind::Plain => "an OTUI style property",
+            };
+            format!("**`{name}`** — {body}")
         }
-        PropertyValueKind::Enum { values } => {
-            let list = values
-                .iter()
-                .map(|v| format!("`{v}`"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("one of: {list}")
-        }
-        PropertyValueKind::Border => {
-            "a border shorthand: a width and a color (or `none`)".to_owned()
-        }
-        PropertyValueKind::Plain => "an OTUI style property".to_owned(),
     };
+    let mut value = title;
+    // For a fixed-value-set property (display, layout), always append the full accepted list.
+    if let PropertyValueKind::Enum { values } = &desc.value {
+        let list = values
+            .iter()
+            .map(|v| format!("`{v}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        value.push_str(&format!("\n\nOne of: {list}"));
+    }
     Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
-            value: format!("**`{name}`** — {body}"),
+            value,
         }),
         range: Some(line_index.range(desc.span.start, desc.span.end, encoding)),
     }
@@ -4356,24 +4365,24 @@ end
     fn hover_on_an_asset_path_property_describes_it() {
         let t = property_hover_text("Panel\n  image-source: /images/ui/x\n", "image-source");
         assert!(t.contains("**`image-source`**"), "{t}");
-        assert!(t.contains("asset path"), "{t}");
+        // Curated behavior for image-source mentions the texture path.
+        assert!(t.contains("texture path"), "{t}");
     }
 
     #[test]
     fn hover_on_an_enum_property_lists_its_values() {
         let t = property_hover_text("Panel\n  display: flex\n", "display");
         assert!(t.contains("**`display`**"), "{t}");
-        assert!(t.contains("one of:"), "{t}");
+        // Enum properties always append the full accepted value list.
+        assert!(t.contains("One of:"), "{t}");
         assert!(t.contains("`flex`"), "{t}");
     }
 
     #[test]
     fn hover_on_a_color_property_describes_it() {
         let t = property_hover_text("Panel\n  color: red\n", "color");
-        assert!(
-            t.contains("**`color`**") && t.contains("color value"),
-            "{t}"
-        );
+        // Curated behavior for color describes the draw color.
+        assert!(t.contains("**`color`**") && t.contains("draw color"), "{t}");
     }
 
     /// The [`CodeAction`] inside a [`CodeActionOrCommand`] (panics if it is a bare command).

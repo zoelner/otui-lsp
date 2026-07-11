@@ -25,13 +25,18 @@ use crate::syntax::SyntaxTree;
 use lang_api::ByteSpan;
 
 /// A structured, protocol-agnostic description of a property key under the cursor (spec §5.5). The
-/// server maps [`span`](Self::span) to a range and renders [`value`](Self::value) into Markdown.
+/// server maps [`span`](Self::span) to a range and renders [`doc`](Self::doc) + [`value`](Self::value)
+/// into Markdown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PropertyHover {
     /// The byte span of the property-key token the cursor is on.
     pub span: ByteSpan,
     /// The property name (the key text).
     pub name: String,
+    /// A one-line behavior description for the canonical global properties (what the property does),
+    /// or `None` for a known property outside the curated set. Sourced from the engine's widget
+    /// style parsers; see [`PROPERTY_DOCS`].
+    pub doc: Option<&'static str>,
     /// What value the property expects.
     pub value: PropertyValueKind,
 }
@@ -79,10 +84,70 @@ pub fn property_hover_at(source: &str, offset: usize) -> Option<PropertyHover> {
     }
     Some(PropertyHover {
         span,
+        doc: property_doc(&name),
         value: classify_value(&name),
         name,
     })
 }
+
+/// The curated one-line behavior for a canonical global property, or `None` if not in the set.
+#[must_use]
+pub fn property_doc(name: &str) -> Option<&'static str> {
+    PROPERTY_DOCS
+        .binary_search_by(|(k, _)| (*k).cmp(name))
+        .ok()
+        .map(|i| PROPERTY_DOCS[i].1)
+}
+
+/// Curated one-line descriptions of the **canonical global** OTUI widget-style properties — what each
+/// does — for hover. Sourced from the engine's widget style parsers (`parseBaseStyle` /
+/// `parseImageStyle` / `parseTextStyle`, per opentibiabr's OTClient). Deliberately covers the common
+/// base/image/text properties; per-widget style tags (a `UITable`'s `column-style`, `UIItem`'s
+/// `item-id`, …) are not here. **Kept sorted by key** for the binary search in [`property_doc`].
+pub static PROPERTY_DOCS: &[(&str, &str)] = &[
+    ("anchors.bottom", "Anchor an edge of this widget to a target's edge (`<target>.<edge>`; target = parent/next/prev or a sibling id)."),
+    ("background", "Filled background color drawn behind the widget."),
+    ("background-color", "Filled background color drawn behind the widget."),
+    ("border", "Border shorthand: a width and a color (or `none`)."),
+    ("border-color", "Border color on all four edges."),
+    ("checked", "The widget's checked state (checkboxes, radio-like widgets)."),
+    ("clipping", "Clip the widget's children to its own rect."),
+    ("color", "Foreground/text draw color."),
+    ("display", "CSS-style display / layout mode (`flex`, `grid`, `table`, `none`, …); drives the flexbox/grid layout."),
+    ("draggable", "Whether the widget can be dragged with the mouse."),
+    ("enabled", "Whether the widget is interactive (a disabled widget is greyed and ignores input)."),
+    ("fixed-size", "Lock the widget's size so a parent layout cannot resize it."),
+    ("focusable", "Whether the widget can receive keyboard focus."),
+    ("font", "The text font by name (resolved via `g_fonts`)."),
+    ("height", "Fixed height, in pixels."),
+    ("icon", "Icon texture path (extension optional; `.png` assumed)."),
+    ("icon-color", "Tint color applied to the icon."),
+    ("icon-source", "Icon texture path (extension optional; `.png` assumed)."),
+    ("id", "The widget's id — used by `getChildById` and as an anchor target by its siblings."),
+    ("image-clip", "Source rect (`x y w h`) clipped out of the image texture."),
+    ("image-color", "Tint color multiplied into the image."),
+    ("image-fixed-ratio", "Keep the image's aspect ratio when scaling."),
+    ("image-repeated", "Tile (repeat) the image instead of stretching it."),
+    ("image-source", "Background texture path (extension optional; `.png` assumed)."),
+    ("layout", "Layout manager for the children: `verticalBox`, `horizontalBox`, `grid`, or `anchor`."),
+    ("margin", "Outer spacing shorthand (1–4 values: all / v h / t h b / t r b l)."),
+    ("opacity", "Opacity from 0 (transparent) to 1 (opaque)."),
+    ("padding", "Inner spacing shorthand (1–4 values: all / v h / t h b / t r b l)."),
+    ("phantom", "Make the widget ignore mouse events (pass-through); alias `pointer-events: none`."),
+    ("pos", "Position as `x y`, relative to the parent."),
+    ("rect", "Absolute rect as `x y w h`."),
+    ("rotation", "Rotation in degrees."),
+    ("shader", "Named GPU shader applied when drawing the widget."),
+    ("size", "Fixed size as `w h`, in pixels."),
+    ("text", "The widget's displayed text."),
+    ("text-align", "Text alignment: `center`, `left`, `right`, `top`, `bottom`, `topleft`, …"),
+    ("text-auto-resize", "Resize the widget to fit its text on both axes."),
+    ("text-wrap", "Wrap the text to the widget's width."),
+    ("visible", "Whether the widget is shown."),
+    ("width", "Fixed width, in pixels."),
+    ("x", "X position, relative to the parent."),
+    ("y", "Y position, relative to the parent."),
+];
 
 /// Classify a known property's expected value from the catalog/schema metadata.
 fn classify_value(name: &str) -> PropertyValueKind {
@@ -169,6 +234,38 @@ mod tests {
         let src = "Panel\n  width: 10\n";
         let h = hover(src, "width").expect("hover");
         assert_eq!(&src[h.span.start..h.span.end], "width");
+    }
+
+    #[test]
+    fn property_docs_are_sorted_for_binary_search() {
+        // `property_doc` binary-searches PROPERTY_DOCS; an out-of-order key would silently miss.
+        for pair in PROPERTY_DOCS.windows(2) {
+            assert!(
+                pair[0].0 < pair[1].0,
+                "PROPERTY_DOCS must be strictly sorted: `{}` !< `{}`",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+    }
+
+    #[test]
+    fn a_canonical_property_carries_its_curated_doc() {
+        let h = hover("Panel\n  phantom: true\n", "phantom").expect("hover");
+        assert!(
+            h.doc.is_some_and(|d| d.contains("ignore mouse")),
+            "phantom should carry a behavior doc, got {:?}",
+            h.doc
+        );
+    }
+
+    #[test]
+    fn a_known_property_outside_the_curated_set_has_no_doc_but_still_hovers() {
+        // `rotation` is known + curated; pick one that is known but not in PROPERTY_DOCS to prove the
+        // fallback. `min-width` is a real catalog property not in the curated set.
+        let h = hover("Panel\n  min-width: 10\n", "min-width").expect("hover");
+        assert_eq!(h.doc, None);
+        assert_eq!(h.value, PropertyValueKind::Plain);
     }
 
     #[test]
