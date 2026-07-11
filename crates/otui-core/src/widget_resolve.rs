@@ -95,12 +95,19 @@ pub fn resolve_ancestry(start: &str, styles: &StyleIndex, lua: &LuaWidgetIndex) 
     let mut current = start.to_owned();
     while seen.insert(current.clone()) {
         chain.push(current.clone());
-        if is_native_base(&current) {
-            native = Some(current.clone());
-            break;
-        }
+        // A **defined** style wins over the native-name heuristic. [`is_native_base`] only asks
+        // whether a name *looks* like a built-in (`UI` + uppercase); it cannot know that the engine's
+        // own `data/styles/10-items.otui` declares `UIDragIcon < UIItem` — a user style wearing a
+        // native-looking name. Treating that as a built-in stops the walk dead, so `UIDragIcon` never
+        // reaches `UIItem` and loses every property `UIItem` declares (`virtual`, `item-id`, …).
+        //
+        // So: walk a definition whenever one exists, and fall back to the heuristic only for a name
+        // nothing defines — which is exactly what a genuine built-in is.
         let Some(def) = pick_def(styles, &current) else {
-            break; // undefined base or malformed header — dead end, no native class
+            if is_native_base(&current) {
+                native = Some(current.clone());
+            }
+            break; // a built-in, or an undefined base / malformed header — either way, the walk ends
         };
         // `__class:` names the class the engine actually instantiates for this style, regardless of
         // what it inherits its look from. Record it; the base walk continues as normal.
@@ -315,6 +322,33 @@ mod tests {
         let thing = resolve_ancestry("Thing", &styles, &lua);
         assert!(!thing.chain.contains(&"UIWidget".to_owned()));
         assert_eq!(thing.native, None);
+    }
+
+    #[test]
+    fn a_user_style_with_a_native_looking_name_is_still_walked() {
+        // The engine's own `data/styles/10-items.otui` declares `UIDragIcon < UIItem` — a *user*
+        // style whose name trips the `UI`-prefix heuristic. Treating it as a built-in stops the walk
+        // at `UIDragIcon`, so it never reaches `UIItem` and loses `virtual` / `item-id` / ….
+        let styles = styles(&[("a.otui", "UIDragIcon < UIItem\n")]);
+        let lua = lua(&[]);
+
+        let icon = resolve_ancestry("UIDragIcon", &styles, &lua);
+        assert_eq!(icon.chain, ["UIDragIcon", "UIItem", "UIWidget"]);
+        assert_eq!(icon.native.as_deref(), Some("UIItem"));
+        // `virtual` is one of `UIItem`'s native C++ `onStyleApply` tags.
+        assert!(icon.declares_custom_property(&lua, "virtual"));
+    }
+
+    #[test]
+    fn an_undefined_native_looking_name_is_still_treated_as_a_built_in() {
+        // Nothing defines `UIButton`, so the heuristic still applies — that is what a genuine
+        // built-in looks like, and the walk must land on it as the native class.
+        let styles = styles(&[("a.otui", "Button < UIButton\n")]);
+        let lua = lua(&[]);
+
+        let button = resolve_ancestry("Button", &styles, &lua);
+        assert_eq!(button.native.as_deref(), Some("UIButton"));
+        assert_eq!(button.chain, ["Button", "UIButton", "UIWidget"]);
     }
 
     #[test]
