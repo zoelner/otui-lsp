@@ -5,14 +5,14 @@
 
 use lang_api::{
     ByteSpan, CompletionItem as CoreCompletionItem, CompletionKind as CoreCompletionKind,
-    Diagnostic as CoreDiagnostic, DocumentSymbol as CoreSymbol, Severity,
-    SymbolKind as CoreSymbolKind,
+    Diagnostic as CoreDiagnostic, DocumentSymbol as CoreSymbol, InsertFormat as CoreInsertFormat,
+    Severity, SymbolKind as CoreSymbolKind,
 };
 use lsp_types::{
     Color, ColorInformation, CompletionItem as LspCompletionItem,
     CompletionItemKind as LspCompletionItemKind, Diagnostic as LspDiagnostic, DiagnosticSeverity,
-    DocumentSymbol as LspSymbol, FoldingRange, FoldingRangeKind, Location, NumberOrString,
-    Position, Range, SymbolInformation, SymbolKind as LspSymbolKind, TextEdit, Uri,
+    DocumentSymbol as LspSymbol, FoldingRange, FoldingRangeKind, InsertTextFormat, Location,
+    NumberOrString, Position, Range, SymbolInformation, SymbolKind as LspSymbolKind, TextEdit, Uri,
 };
 use otui_core::folding::{FoldKind as CoreFoldKind, FoldRange as CoreFoldRange};
 use otui_core::schema::Rgba;
@@ -215,19 +215,46 @@ fn completion_kind_to_lsp(kind: CoreCompletionKind) -> LspCompletionItemKind {
 /// Convert a single core [`CompletionItem`](CoreCompletionItem) into an `lsp_types::CompletionItem`,
 /// carrying its label, kind and detail. Completion labels are already the value to insert (no span
 /// remapping needed — the client applies them at the cursor).
-pub fn completion_item_to_lsp(item: &CoreCompletionItem) -> LspCompletionItem {
+///
+/// `snippet_support` gates whether the item's snippet (`insert_text` + `Snippet` format) is sent at
+/// all: a client that never advertised
+/// `textDocument.completion.completionItem.snippetSupport` would paste `$0`/`$1` placeholders into
+/// the buffer **literally** — it has no tab-stop engine to interpret them — so with `false` this
+/// always falls back to the plain `label`, exactly as before snippets existed.
+pub fn completion_item_to_lsp(
+    item: &CoreCompletionItem,
+    snippet_support: bool,
+) -> LspCompletionItem {
+    let (insert_text, insert_text_format) = match (&item.insert_text, item.insert_format) {
+        (Some(text), CoreInsertFormat::Snippet) if snippet_support => {
+            (Some(text.clone()), Some(InsertTextFormat::SNIPPET))
+        }
+        // Either there is no snippet body (`Plain`, or `insert_text` is `None`), or the client can't
+        // consume one: insert the label verbatim, plain-text format (LSP's default when the field is
+        // omitted, but stated explicitly here for clarity).
+        _ => (None, Some(InsertTextFormat::PLAIN_TEXT)),
+    };
     LspCompletionItem {
         label: item.label.clone(),
         kind: Some(completion_kind_to_lsp(item.kind)),
         detail: item.detail.clone(),
         sort_text: item.sort_text.clone(),
+        insert_text,
+        insert_text_format,
         ..LspCompletionItem::default()
     }
 }
 
-/// Convert every core completion item into its LSP form, preserving order.
-pub fn completions_to_lsp(items: &[CoreCompletionItem]) -> Vec<LspCompletionItem> {
-    items.iter().map(completion_item_to_lsp).collect()
+/// Convert every core completion item into its LSP form, preserving order. `snippet_support` is
+/// forwarded to [`completion_item_to_lsp`] for every item — see its doc for why the gate exists.
+pub fn completions_to_lsp(
+    items: &[CoreCompletionItem],
+    snippet_support: bool,
+) -> Vec<LspCompletionItem> {
+    items
+        .iter()
+        .map(|item| completion_item_to_lsp(item, snippet_support))
+        .collect()
 }
 
 /// Build a single whole-document [`TextEdit`] replacing all of `text` (from the start to its end
@@ -460,12 +487,51 @@ mod tests {
             kind: CoreCompletionKind::EnumMember,
             detail: Some("state".to_owned()),
             sort_text: Some("0_hover".to_owned()),
+            insert_text: None,
+            insert_format: CoreInsertFormat::Plain,
         };
-        let lsp = completion_item_to_lsp(&core);
+        let lsp = completion_item_to_lsp(&core, true);
         assert_eq!(lsp.label, "hover");
         assert_eq!(lsp.kind, Some(LspCompletionItemKind::ENUM_MEMBER));
         assert_eq!(lsp.detail.as_deref(), Some("state"));
         assert_eq!(lsp.sort_text.as_deref(), Some("0_hover"));
+        // No snippet on this item: insert_text stays unset, format is plain text.
+        assert_eq!(lsp.insert_text, None);
+        assert_eq!(lsp.insert_text_format, Some(InsertTextFormat::PLAIN_TEXT));
+    }
+
+    #[test]
+    fn snippet_item_carries_insert_text_and_snippet_format_when_client_supports_it() {
+        let core = CoreCompletionItem {
+            label: "width".to_owned(),
+            kind: CoreCompletionKind::Keyword,
+            detail: Some("property".to_owned()),
+            sort_text: None,
+            insert_text: Some("width: $0".to_owned()),
+            insert_format: CoreInsertFormat::Snippet,
+        };
+        let lsp = completion_item_to_lsp(&core, true);
+        assert_eq!(lsp.insert_text.as_deref(), Some("width: $0"));
+        assert_eq!(lsp.insert_text_format, Some(InsertTextFormat::SNIPPET));
+    }
+
+    #[test]
+    fn snippet_item_falls_back_to_the_plain_label_when_the_client_lacks_snippet_support() {
+        // A client that never advertised `snippetSupport` has no tab-stop engine: sending `$0` would
+        // paste it literally into the buffer. The gate must suppress the snippet body entirely,
+        // leaving the LSP item exactly as it was before snippets existed (label-only, plain text).
+        let core = CoreCompletionItem {
+            label: "width".to_owned(),
+            kind: CoreCompletionKind::Keyword,
+            detail: Some("property".to_owned()),
+            sort_text: None,
+            insert_text: Some("width: $0".to_owned()),
+            insert_format: CoreInsertFormat::Snippet,
+        };
+        let lsp = completion_item_to_lsp(&core, false);
+        assert_eq!(lsp.insert_text, None);
+        assert_eq!(lsp.insert_text_format, Some(InsertTextFormat::PLAIN_TEXT));
+        assert_eq!(lsp.label, "width");
     }
 
     #[test]
@@ -498,7 +564,7 @@ mod tests {
         let position = Position::new(1, 3);
         let offset = LineIndex::new(text).offset_at(position, PositionEncoding::Utf16);
         let core = OtuiService::new().complete_at(text, offset);
-        let lsp = completions_to_lsp(&core);
+        let lsp = completions_to_lsp(&core, true);
         // Every state name comes back, as ENUM_MEMBER, in schema order.
         let labels: Vec<&str> = lsp.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels, otui_core::schema::STATES);

@@ -61,7 +61,7 @@ use crate::schema;
 use crate::style_index::StyleIndex;
 use crate::syntax::SyntaxTree;
 use crate::widget_resolve;
-use lang_api::{CompletionItem, CompletionKind};
+use lang_api::{CompletionItem, CompletionKind, InsertFormat};
 use tree_sitter::Node;
 
 /// The closed set that applies at the cursor, once the line prefix has been classified.
@@ -202,14 +202,25 @@ fn indented_slot_items(
 ) -> Vec<CompletionItem> {
     let mut items: Vec<CompletionItem> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut push = |label: String, kind: CompletionKind, detail: &str, group: char| {
+    let mut push = |label: String,
+                    kind: CompletionKind,
+                    detail: &str,
+                    group: char,
+                    insert_text: Option<String>| {
         if seen.insert(label.clone()) {
             let sort_text = Some(format!("{group}_{label}"));
+            let insert_format = if insert_text.is_some() {
+                InsertFormat::Snippet
+            } else {
+                InsertFormat::Plain
+            };
             items.push(CompletionItem {
                 label,
                 kind,
                 detail: Some(detail.to_owned()),
                 sort_text,
+                insert_text,
+                insert_format,
             });
         }
     };
@@ -218,18 +229,74 @@ fn indented_slot_items(
     if let Some(widget) = tree.and_then(|t| enclosing_widget_type(t, source, offset)) {
         let ancestry = widget_resolve::resolve_ancestry(&widget, styles, lua);
         for prop in ancestry.custom_properties(lua) {
-            push(prop, CompletionKind::Keyword, "lua property", '0');
+            let insert = Some(property_key_snippet(&prop));
+            push(prop, CompletionKind::Keyword, "lua property", '0', insert);
         }
     }
     // 2. The global C++ property catalog.
     for &prop in catalog::PROPERTIES {
-        push(prop.to_owned(), CompletionKind::Keyword, "property", '1');
+        let insert = Some(property_key_snippet(prop));
+        push(
+            prop.to_owned(),
+            CompletionKind::Keyword,
+            "property",
+            '1',
+            insert,
+        );
     }
-    // 3. Child-widget names in scope across the workspace.
+    // 3. Child-widget names in scope across the workspace. Each carries a snippet: the widget name
+    // plus an indented `id:` skeleton one level deeper than the current slot, tab-stopped so the id
+    // value and "what's next" are typed without extra keystrokes.
+    let child_indent = format!("{}  ", line_indent(source, offset));
     for (name, detail) in widget_names(styles, lua) {
-        push(name, CompletionKind::Class, detail, '2');
+        let insert = Some(child_widget_snippet(&name, &child_indent));
+        push(name, CompletionKind::Class, detail, '2', insert);
     }
     items
+}
+
+/// The snippet body for completing a property **key**: the key, a colon-space, and a final tab-stop
+/// for the value — `key: $0`. Saves the colon-space keystrokes on every property, the single biggest
+/// cheap win here. `key` is schema/catalog/Lua-property text, so it is snippet-escaped defensively
+/// (see [`snippet_escape`]) even though none of today's names carry a literal `$`/`}`/`\`.
+fn property_key_snippet(key: &str) -> String {
+    format!("{}: $0", snippet_escape(key))
+}
+
+/// The snippet body for completing a child **widget**: the widget name, then one line indented a
+/// level deeper (`child_indent`) with an `id:` tab-stop, then a final tab-stop back at `child_indent`
+/// for whatever comes next inside the new widget.
+fn child_widget_snippet(label: &str, child_indent: &str) -> String {
+    format!(
+        "{}\n{child_indent}id: $1\n{child_indent}$0",
+        snippet_escape(label)
+    )
+}
+
+/// The leading run of spaces on the line containing `offset` (the current line's indentation). By
+/// the time this runs, [`classify`] has already rejected tab-indented lines, so this is always pure
+/// spaces. Used to compute one level deeper (`+ "  "`) for a nested snippet.
+fn line_indent(source: &str, offset: usize) -> &str {
+    let line_start = source[..offset].rfind('\n').map_or(0, |nl| nl + 1);
+    let line = &source[line_start..];
+    &line[..line.len() - line.trim_start_matches(' ').len()]
+}
+
+/// Escape the LSP/TextMate snippet metacharacters (`\`, `$`, `}`) in `text` so it is inserted
+/// literally when embedded in a snippet body. OTML property values and identifiers routinely start
+/// with `$` (a `$state` selector, a `$variable` reference) — a real hazard, not a theoretical one, if
+/// any data-derived text (a property/widget name from the catalog, schema or a scanned Lua widget)
+/// ever flowed unescaped into a snippet: the client would read a stray `$` as the start of its own
+/// tab-stop syntax instead of pasting it literally.
+fn snippet_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '\\' | '$' | '}') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// The widget/style type names usable as a nested child tag, each with a short origin `detail`:
@@ -453,25 +520,32 @@ fn items_for(context: Context, source: &str, offset: usize) -> Vec<CompletionIte
     match context {
         Context::States => set_items(schema::STATES, CompletionKind::EnumMember, "state"),
         Context::AnchorEdgeKey => {
-            let mut items = set_items(
+            // Both the edges and the shorthands sit on the key side of `anchors.<edge>: <target>`, so
+            // completing either continues straight into the target slot: `top: $0`.
+            let mut items = key_snippet_items(
                 schema::ANCHOR_EDGES,
                 CompletionKind::EnumMember,
                 "anchor edge",
             );
-            items.extend(set_items(
+            items.extend(key_snippet_items(
                 schema::SHORTHAND_ANCHORS,
                 CompletionKind::EnumMember,
                 "anchor shorthand",
             ));
             items
         }
+        // A target-side edge (`parent.top`) is the last token of the value — no `:`/value slot
+        // follows it, so it stays a plain label.
         Context::AnchorTargetEdge => set_items(
             schema::ANCHOR_EDGES,
             CompletionKind::EnumMember,
             "anchor edge",
         ),
         Context::AnchorTarget => anchor_target_items(source, offset),
-        Context::Events => set_items(schema::EVENTS, CompletionKind::Event, "event handler"),
+        // An `@event` key always continues into its handler body: `@onClick: $0`.
+        Context::Events => {
+            key_snippet_items(schema::EVENTS, CompletionKind::Event, "event handler")
+        }
         // The indented statement slot is workspace-aware (catalog + Lua props + widget names), so it
         // is built by `indented_slot_items` and routed before this function is reached.
         Context::IndentedSlot => {
@@ -497,6 +571,8 @@ fn property_value_items(key: &str) -> Vec<CompletionItem> {
                 kind: CompletionKind::Value,
                 detail: Some("named color".to_owned()),
                 sort_text: None,
+                insert_text: None,
+                insert_format: InsertFormat::Plain,
             })
             .collect(),
         _ => Vec::new(),
@@ -524,6 +600,8 @@ fn anchor_target_items(source: &str, offset: usize) -> Vec<CompletionItem> {
             kind: CompletionKind::Value,
             detail: Some("widget id".to_owned()),
             sort_text: None,
+            insert_text: None,
+            insert_format: InsertFormat::Plain,
         });
     }
     items
@@ -609,7 +687,7 @@ fn widget_id(widget: Node, source: &str) -> Option<String> {
 }
 
 /// Map a schema const slice to completion items with a shared `kind` and `detail`, preserving the
-/// slice's order.
+/// slice's order. No snippet — plain-label insertion.
 fn set_items(set: &[&str], kind: CompletionKind, detail: &str) -> Vec<CompletionItem> {
     set.iter()
         .map(|&label| CompletionItem {
@@ -617,6 +695,24 @@ fn set_items(set: &[&str], kind: CompletionKind, detail: &str) -> Vec<Completion
             kind,
             detail: Some(detail.to_owned()),
             sort_text: None,
+            insert_text: None,
+            insert_format: InsertFormat::Plain,
+        })
+        .collect()
+}
+
+/// Like [`set_items`], but each item's insert text continues straight into the value slot the key
+/// always opens onto: `{label}: $0`. Used for the `@event` and `anchors.<edge>` closed sets, whose
+/// grammar shape (`key: value`) is fixed the moment the key is chosen.
+fn key_snippet_items(set: &[&str], kind: CompletionKind, detail: &str) -> Vec<CompletionItem> {
+    set.iter()
+        .map(|&label| CompletionItem {
+            label: label.to_owned(),
+            kind,
+            detail: Some(detail.to_owned()),
+            sort_text: None,
+            insert_text: Some(property_key_snippet(label)),
+            insert_format: InsertFormat::Snippet,
         })
         .collect()
 }
@@ -1296,5 +1392,184 @@ Window < UIWindow
             labels(&complete_at(src, at(src, "col") + "col".len())),
             catalog::PROPERTIES
         );
+    }
+
+    // --- snippets --------------------------------------------------------------------------------
+
+    #[test]
+    fn catalog_property_key_snippet_is_key_colon_dollar_zero() {
+        // `width` → `width: $0`: the colon-space and a final tab-stop for the value, saving a
+        // keystroke on every property.
+        let src = "Button\n  wid\n";
+        let items = complete_at(src, at(src, "wid") + "wid".len());
+        let width = items.iter().find(|i| i.label == "width").expect("width");
+        assert_eq!(width.insert_text.as_deref(), Some("width: $0"));
+        assert_eq!(width.insert_format, InsertFormat::Snippet);
+    }
+
+    #[test]
+    fn lua_property_key_also_carries_the_key_colon_snippet() {
+        let styles = styles(&[]);
+        let lua = lua(&[("uitable.lua", UITABLE_LUA)]);
+        let src = "Table < UITable\n  col\n";
+        let items = complete_at_with_widgets(src, at(src, "col") + "col".len(), &styles, &lua);
+        let col = items
+            .iter()
+            .find(|i| i.label == "column-style")
+            .expect("lua prop");
+        assert_eq!(col.insert_text.as_deref(), Some("column-style: $0"));
+        assert_eq!(col.insert_format, InsertFormat::Snippet);
+    }
+
+    #[test]
+    fn child_widget_snippet_carries_a_nested_id_tab_stop_one_level_deeper() {
+        // Cursor at 2-space indent (top-level child slot): the snippet's `id:` line sits at 4 spaces
+        // — one level deeper than the widget itself.
+        let styles = styles(&[("lib.otui", "Button < UIButton\n")]);
+        let lua = lua(&[]);
+        let src = "Panel\n  But\n";
+        let items = complete_at_with_widgets(src, at(src, "But") + "But".len(), &styles, &lua);
+        let button = items.iter().find(|i| i.label == "Button").expect("Button");
+        assert_eq!(
+            button.insert_text.as_deref(),
+            Some("Button\n    id: $1\n    $0")
+        );
+        assert_eq!(button.insert_format, InsertFormat::Snippet);
+    }
+
+    #[test]
+    fn child_widget_snippet_nests_relative_to_a_deeper_current_indent() {
+        // A child slot at 4-space indent (already one level deep): the nested `id:` line sits at 6
+        // spaces, still exactly one level deeper than the current slot, not a fixed absolute amount.
+        let styles = styles(&[("lib.otui", "Button < UIButton\n")]);
+        let lua = lua(&[]);
+        let src = "Panel\n  Child\n    But\n";
+        let items = complete_at_with_widgets(src, at(src, "But") + "But".len(), &styles, &lua);
+        let button = items.iter().find(|i| i.label == "Button").expect("Button");
+        assert_eq!(
+            button.insert_text.as_deref(),
+            Some("Button\n      id: $1\n      $0")
+        );
+    }
+
+    #[test]
+    fn event_key_snippet_continues_into_the_value_slot() {
+        let src = "Button\n  @onCl\n";
+        let items = complete_at(src, at(src, "@onCl") + "@onCl".len());
+        let on_click = items
+            .iter()
+            .find(|i| i.label == "onClick")
+            .expect("onClick");
+        assert_eq!(on_click.insert_text.as_deref(), Some("onClick: $0"));
+        assert_eq!(on_click.insert_format, InsertFormat::Snippet);
+    }
+
+    #[test]
+    fn anchor_edge_key_snippet_continues_into_the_target_slot() {
+        let src = "Widget\n  anchors.\n";
+        let items = complete_at(src, at(src, "anchors.") + "anchors.".len());
+        let top = items.iter().find(|i| i.label == "top").expect("top edge");
+        assert_eq!(top.insert_text.as_deref(), Some("top: $0"));
+        assert_eq!(top.insert_format, InsertFormat::Snippet);
+    }
+
+    #[test]
+    fn anchor_shorthand_key_also_carries_the_key_colon_snippet() {
+        let src = "Widget\n  anchors.\n";
+        let items = complete_at(src, at(src, "anchors.") + "anchors.".len());
+        for &shorthand in schema::SHORTHAND_ANCHORS {
+            let item = items
+                .iter()
+                .find(|i| i.label == shorthand)
+                .unwrap_or_else(|| panic!("{shorthand} offered"));
+            assert_eq!(
+                item.insert_text.as_deref(),
+                Some(format!("{shorthand}: $0")).as_deref()
+            );
+        }
+    }
+
+    #[test]
+    fn anchor_target_edge_and_states_and_property_values_stay_plain() {
+        // The target-side edge (`parent.top`), a `$state`, and a fixed-set value (`display: flex`)
+        // have no natural "what comes next" — they stay plain-label insertion (no snippet).
+        let src = "Widget\n  anchors.top: parent.\n";
+        let items = complete_at(src, at(src, "parent.") + "parent.".len());
+        assert!(items
+            .iter()
+            .all(|i| i.insert_text.is_none() && i.insert_format == InsertFormat::Plain));
+
+        let src = "Button\n  $\n";
+        let items = complete_at(src, at(src, "$") + 1);
+        assert!(items
+            .iter()
+            .all(|i| i.insert_text.is_none() && i.insert_format == InsertFormat::Plain));
+
+        let src = "Widget\n  display: fl\n";
+        let items = complete_at(src, at(src, "fl") + 2);
+        assert!(items
+            .iter()
+            .all(|i| i.insert_text.is_none() && i.insert_format == InsertFormat::Plain));
+
+        // Anchor targets (magic keywords / widget ids) are also plain.
+        let src = "Widget\n  anchors.top: \n";
+        let items = complete_at(src, at(src, "anchors.top: ") + "anchors.top: ".len());
+        assert!(items
+            .iter()
+            .all(|i| i.insert_text.is_none() && i.insert_format == InsertFormat::Plain));
+    }
+
+    #[test]
+    fn snippet_escape_protects_dollar_backslash_and_closing_brace() {
+        // The direct unit: a literal `$`, `\` or `}` in text embedded into a snippet body must come
+        // back escaped, or the client would read it as the client's own tab-stop syntax instead of
+        // literal text. Not a theoretical hazard: OTML property values and identifiers routinely
+        // start with `$` (`$state`, `$variable`).
+        assert_eq!(snippet_escape("plain"), "plain");
+        assert_eq!(snippet_escape("$state"), "\\$state");
+        assert_eq!(snippet_escape("a}b"), "a\\}b");
+        assert_eq!(snippet_escape("a\\b"), "a\\\\b");
+        assert_eq!(snippet_escape("$a}b\\c"), "\\$a\\}b\\\\c");
+    }
+
+    #[test]
+    fn property_key_snippet_escapes_a_dollar_bearing_key() {
+        // A defensive, end-to-end check through the actual snippet builder (not just the escape
+        // helper): a hypothetical key containing `$` must not corrupt the emitted snippet's tab-stop
+        // syntax.
+        assert_eq!(property_key_snippet("$weird"), "\\$weird: $0");
+    }
+
+    #[test]
+    fn child_widget_snippet_escapes_a_dollar_bearing_widget_name() {
+        assert_eq!(
+            child_widget_snippet("$Weird", "  "),
+            "\\$Weird\n  id: $1\n  $0"
+        );
+    }
+
+    #[test]
+    fn a_lua_property_named_with_a_dollar_sign_is_escaped_in_its_snippet() {
+        // End-to-end through the workspace-aware path: a Lua-scanned custom property name flowing
+        // into the snippet body is escaped, not just the schema/catalog constants.
+        const WEIRD_LUA: &str = "\
+Weird = extends(UIWidget, 'Weird')
+
+function Weird:onStyleApply(styleName, styleNode)
+  for name, value in pairs(styleNode) do
+    if name == '$odd-style' then
+    end
+  end
+end
+";
+        let styles = styles(&[]);
+        let lua = lua(&[("weird.lua", WEIRD_LUA)]);
+        let src = "Table < Weird\n  od\n";
+        let items = complete_at_with_widgets(src, at(src, "od") + "od".len(), &styles, &lua);
+        let odd = items
+            .iter()
+            .find(|i| i.label == "$odd-style")
+            .expect("lua prop offered even with a $ in its name");
+        assert_eq!(odd.insert_text.as_deref(), Some("\\$odd-style: $0"));
     }
 }

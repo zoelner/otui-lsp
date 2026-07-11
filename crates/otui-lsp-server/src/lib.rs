@@ -94,6 +94,12 @@ pub struct Backend {
     /// decides the `textDocument/documentSymbol` response shape (nested vs. flat). Defaults to
     /// `false` (the LSP default when the capability is absent). Guarded like [`encoding`].
     hierarchical_symbols: Mutex<bool>,
+    /// Whether the client advertised
+    /// `textDocument.completion.completionItem.snippetSupport` during `initialize`; gates whether
+    /// `textDocument/completion` responses carry a snippet body (`$0`/`$1` tab-stops) or fall back to
+    /// the plain label — see [`convert::completion_item_to_lsp`]. Defaults to `false` (the LSP
+    /// default when the capability is absent). Guarded like [`encoding`].
+    snippet_support: Mutex<bool>,
     /// Open documents by URL, full text (text document sync = FULL) plus sync version. An open
     /// buffer is authoritative for its URI — it may carry unsaved edits — so it always wins over the
     /// on-disk copy cached in [`disk_texts`](Self::disk_texts). Wrapped in an [`Arc`] so the
@@ -162,6 +168,7 @@ impl Backend {
             service: OtuiService::new(),
             encoding: Mutex::new(negotiate_encoding(params)),
             hierarchical_symbols: Mutex::new(client_supports_hierarchical_symbols(params)),
+            snippet_support: Mutex::new(client_supports_snippets(params)),
             documents: Arc::new(RwLock::new(HashMap::new())),
             style_index: Arc::new(RwLock::new(StyleIndex::new())),
             lua_index: Arc::new(RwLock::new(LuaWidgetIndex::new())),
@@ -188,6 +195,13 @@ impl Backend {
             .hierarchical_symbols
             .lock()
             .expect("hierarchical_symbols mutex poisoned")
+    }
+
+    fn snippet_support(&self) -> bool {
+        *self
+            .snippet_support
+            .lock()
+            .expect("snippet_support mutex poisoned")
     }
 
     /// Send a `window/logMessage` notification to the client (the sync replacement for the old
@@ -1384,6 +1398,23 @@ fn client_supports_hierarchical_symbols(params: &InitializeParams) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the client can consume a snippet `insert_text` (`$0`/`$1` tab-stops, `${1:placeholder}`).
+/// Per LSP 3.17, a client signals this via
+/// `textDocument.completion.completionItem.snippetSupport`; when the capability is absent the
+/// default is `false` — a client that never opted in has no tab-stop engine, so sending it snippet
+/// syntax would paste the placeholders literally into the buffer. See
+/// [`convert::completion_item_to_lsp`] for where this is enforced.
+fn client_supports_snippets(params: &InitializeParams) -> bool {
+    params
+        .capabilities
+        .text_document
+        .as_ref()
+        .and_then(|td| td.completion.as_ref())
+        .and_then(|c| c.completion_item.as_ref())
+        .and_then(|ci| ci.snippet_support)
+        .unwrap_or(false)
+}
+
 /// Build a JSON-RPC [`Response`] for a request whose handler returns a serializable value.
 ///
 /// Extracts the typed params (the `$method` string was already matched, so only a JSON shape
@@ -2437,6 +2468,7 @@ impl Backend {
                 &self
                     .service
                     .complete_with_widgets(&text, offset, &styles, &lua),
+                self.snippet_support(),
             )
         };
         Some(CompletionResponse::Array(items))
@@ -2658,7 +2690,8 @@ pub fn serve(
 mod tests {
     use super::*;
     use lsp_types::{
-        ClientCapabilities, DocumentSymbolClientCapabilities, GeneralClientCapabilities, Position,
+        ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability,
+        DocumentSymbolClientCapabilities, GeneralClientCapabilities, InsertTextFormat, Position,
         Range, TextDocumentClientCapabilities,
     };
 
@@ -2789,6 +2822,127 @@ mod tests {
         assert!(!client_supports_hierarchical_symbols(
             &params_with_hierarchical(Some(false))
         ));
+    }
+
+    fn params_with_snippet_support(support: Option<bool>) -> InitializeParams {
+        InitializeParams {
+            capabilities: ClientCapabilities {
+                text_document: Some(TextDocumentClientCapabilities {
+                    completion: Some(CompletionClientCapabilities {
+                        completion_item: Some(CompletionItemCapability {
+                            snippet_support: support,
+                            ..CompletionItemCapability::default()
+                        }),
+                        ..CompletionClientCapabilities::default()
+                    }),
+                    ..TextDocumentClientCapabilities::default()
+                }),
+                ..ClientCapabilities::default()
+            },
+            ..InitializeParams::default()
+        }
+    }
+
+    #[test]
+    fn snippet_support_default_false_when_client_is_silent() {
+        // No textDocument capabilities at all → the LSP default (no snippets) applies.
+        assert!(!client_supports_snippets(&InitializeParams::default()));
+        // completion/completionItem present but the flag omitted → still the default.
+        assert!(!client_supports_snippets(&params_with_snippet_support(
+            None
+        )));
+    }
+
+    #[test]
+    fn snippet_support_true_only_when_client_opts_in() {
+        assert!(client_supports_snippets(&params_with_snippet_support(
+            Some(true)
+        )));
+        assert!(!client_supports_snippets(&params_with_snippet_support(
+            Some(false)
+        )));
+    }
+
+    #[test]
+    fn backend_new_reads_snippet_support_from_init_params() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let backend = Backend::new(tx, &params_with_snippet_support(Some(true)));
+        assert!(backend.snippet_support());
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let backend = Backend::new(tx, &InitializeParams::default());
+        assert!(!backend.snippet_support());
+    }
+
+    /// Build the `CompletionParams` for a cursor `position` in `uri`.
+    fn completion_params(uri: &Uri, position: Position) -> CompletionParams {
+        use lsp_types::{
+            PartialResultParams, TextDocumentIdentifier, TextDocumentPositionParams,
+            WorkDoneProgressParams,
+        };
+        CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+            context: None,
+        }
+    }
+
+    #[test]
+    fn completion_handler_sends_snippets_only_when_the_client_negotiated_support() {
+        // End-to-end through the real `textDocument/completion` handler: a property-key completion
+        // carries the `key: $0` snippet when the client opted in, and is bare-label plain text
+        // otherwise — the gate lives entirely in capability negotiation, not in the engine.
+        let uri = Uri::from_str("file:///ws/win.otui").expect("uri");
+        let text = "Button\n  wid\n";
+        let position = Position::new(1, 5); // just past "wid"
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let backend = Backend::new(tx, &params_with_snippet_support(Some(true)));
+        backend.documents.write().expect("documents").insert(
+            uri.clone(),
+            Document {
+                text: text.to_owned(),
+                version: 0,
+            },
+        );
+        let response = backend
+            .completion(completion_params(&uri, position))
+            .expect("completion response");
+        let CompletionResponse::Array(items) = response else {
+            panic!("expected an array response");
+        };
+        let width = items
+            .iter()
+            .find(|i| i.label == "width")
+            .expect("width offered");
+        assert_eq!(width.insert_text.as_deref(), Some("width: $0"));
+        assert_eq!(width.insert_text_format, Some(InsertTextFormat::SNIPPET));
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let backend = Backend::new(tx, &InitializeParams::default());
+        backend.documents.write().expect("documents").insert(
+            uri.clone(),
+            Document {
+                text: text.to_owned(),
+                version: 0,
+            },
+        );
+        let response = backend
+            .completion(completion_params(&uri, position))
+            .expect("completion response");
+        let CompletionResponse::Array(items) = response else {
+            panic!("expected an array response");
+        };
+        let width = items
+            .iter()
+            .find(|i| i.label == "width")
+            .expect("width offered");
+        assert_eq!(width.insert_text, None);
+        assert_eq!(width.insert_text_format, Some(InsertTextFormat::PLAIN_TEXT));
     }
 
     /// Build a `(StyleIndex, documents)` pair from `(uri, text)` entries, indexing each document's
