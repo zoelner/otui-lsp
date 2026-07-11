@@ -360,9 +360,21 @@ fn classify(prefix: &str) -> Option<Context> {
         if indent.is_empty() {
             return None;
         }
+        let value = trimmed[colon + 1..].trim_start();
         // A `$variable` reference in the value is not a literal from the property's fixed set, so
         // offer nothing there (the client is typing a variable name, not a `display`/color value).
-        if trimmed[colon + 1..].trim_start().starts_with('$') {
+        if value.starts_with('$') {
+            return None;
+        }
+        // The offered value sets are single-token (a `display`/`layout` keyword, a color name), so
+        // offer only while the first value token is being built — not after a completed value plus
+        // whitespace, nor for a second token (mirrors the state / anchor-target slots).
+        let building = match value.split_whitespace().count() {
+            0 => true,
+            1 => !value.ends_with(char::is_whitespace),
+            _ => false,
+        };
+        if !building {
             return None;
         }
         return Some(Context::PropertyValue(
@@ -775,10 +787,21 @@ mod tests {
     }
 
     #[test]
-    fn value_dollar_reference_is_not_a_state_selector() {
-        // A `$var` in value position sits after `key:`, so the line does not open with `$`.
+    fn value_dollar_reference_offers_nothing() {
+        // A `$var` value is a variable reference, not a literal from the property's fixed set, so the
+        // value branch suppresses it (even for a color property that would otherwise offer colors).
         let src = "Widget\n  color: $pri\n";
         assert!(complete_at(src, at(src, "$pri") + "$pri".len()).is_empty());
+    }
+
+    #[test]
+    fn a_completed_value_followed_by_whitespace_offers_nothing() {
+        // The value sets are single-token, so after a completed value the branch stops offering —
+        // no re-offering of the whole set on a trailing space or a second token.
+        let src = "Widget\n  color: red \n";
+        assert!(complete_at(src, at(src, "red ") + "red ".len()).is_empty());
+        let src2 = "Widget\n  color: red gr\n";
+        assert!(complete_at(src2, at(src2, "gr\n") + 2).is_empty());
     }
 
     #[test]
