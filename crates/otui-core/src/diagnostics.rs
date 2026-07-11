@@ -2311,4 +2311,26 @@ Window < UIWindow
             "{diags:?}"
         );
     }
+
+    #[test]
+    fn a_dangling_base_on_a_declaration_with_a_body_is_still_flagged() {
+        // Every other UNKNOWN_BASE case here is a body-less header, but a real style declaration
+        // always has an indented body. The grammar's `_block` is a hidden rule — the body's
+        // statements become direct children of the `style_header` itself rather than of a wrapper
+        // node — so a header with a body is still a top-level `style_header` and is still scanned.
+        // Pinning that: if the body ever started producing a different top-level node kind, the
+        // check would silently stop firing on every real-world file and the corpus would read a
+        // reassuring zero for the wrong reason.
+        let styles = styles(&[]);
+        let lua = lua(&[]);
+        let ctx = WidgetContext {
+            styles: &styles,
+            lua: &lua,
+        };
+        let src = "Derived < Nonexistent\n  id: x\n  color: red\n";
+        let diags = analyze_with_widgets(src, &ctx);
+        let d = only(&diags, UNKNOWN_BASE);
+        assert_eq!(d.severity, Severity::Warning);
+        assert_eq!(&src[d.span.start..d.span.end], "Nonexistent");
+    }
 }
