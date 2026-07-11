@@ -74,11 +74,12 @@ pub fn encode(text: &str, tokens: &[CoreToken], encoding: PositionEncoding) -> V
         // Release-build fail-safe for the invariant the `debug_assert` guards: if a span ever did
         // cross a newline, `length` measured across the whole span would encode a corrupt run-on
         // highlight. Clamp the end to the token's start line so the worst case is a bounded,
-        // single-line token rather than a mis-encoded one. For every real (single-line) token this
-        // is a no-op: `span.end` already sits at or before the line end.
+        // single-line token rather than a mis-encoded one. Stop at the first `\r` OR `\n` so a CRLF
+        // terminator is never counted into the length. For every real (single-line) token this is a
+        // no-op: `span.end` already sits at or before the line end.
         let line_end = text
             .get(tok.span.start..)
-            .and_then(|rest| rest.find('\n').map(|rel| tok.span.start + rel))
+            .and_then(|rest| rest.find(['\r', '\n']).map(|rel| tok.span.start + rel))
             .unwrap_or(text.len());
         let length = index.encoded_len(tok.span.start, tok.span.end.min(line_end), encoding);
         let delta_line = pos.line - prev_line;
