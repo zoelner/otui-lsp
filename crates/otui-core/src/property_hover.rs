@@ -118,7 +118,7 @@ pub static PROPERTY_DOCS: &[(&str, &str)] = &[
     ("fixed-size", "Lock the widget's size so a parent layout cannot resize it."),
     ("focusable", "Whether the widget can receive keyboard focus."),
     ("font", "The text font by name (resolved via `g_fonts`)."),
-    ("height", "Fixed height, in pixels."),
+    ("height", "Height as a CSS-like dimension: a bare number is pixels, or `%` / `em` / `auto`."),
     ("icon", "Icon texture path (extension optional; `.png` assumed)."),
     ("icon-color", "Tint color applied to the icon."),
     ("icon-source", "Icon texture path (extension optional; `.png` assumed)."),
@@ -132,7 +132,7 @@ pub static PROPERTY_DOCS: &[(&str, &str)] = &[
     ("opacity", "Opacity from 0 (transparent) to 1 (opaque)."),
     ("padding", "Inner spacing shorthand (1–4 values: all / v h / t h b / t r b l)."),
     ("phantom", "Make the widget ignore mouse events (pass-through); alias `pointer-events: none`."),
-    ("pos", "Position as `x y`, relative to the parent."),
+    ("pos", "Absolute position as `x y` (same coordinate space as `rect`)."),
     ("rect", "Absolute rect as `x y w h`."),
     ("rotation", "Rotation in degrees."),
     ("shader", "Named GPU shader applied when drawing the widget."),
@@ -142,9 +142,9 @@ pub static PROPERTY_DOCS: &[(&str, &str)] = &[
     ("text-auto-resize", "Resize the widget to fit its text on both axes."),
     ("text-wrap", "Wrap the text to the widget's width."),
     ("visible", "Whether the widget is shown."),
-    ("width", "Fixed width, in pixels."),
-    ("x", "X position, relative to the parent."),
-    ("y", "Y position, relative to the parent."),
+    ("width", "Width as a CSS-like dimension: a bare number is pixels, or `%` / `em` / `auto`."),
+    ("x", "Absolute X position (same coordinate space as `rect`)."),
+    ("y", "Absolute Y position (same coordinate space as `rect`)."),
 ];
 
 /// Classify a known property's expected value from the catalog/schema metadata.
