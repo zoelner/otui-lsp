@@ -630,43 +630,26 @@ fn check_property_value(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>)
         // `image-color`, `ttf-stroke-color`, and the `border-color*` family) is applied via
         // `node->value<Color>()`, which THROWS on a value it cannot parse — so a bad color is a hard
         // engine error, not just for `border-color`. Validate the whole set from the catalog.
-        k if catalog::COLOR_PROPERTIES.contains(&k) => check_color_value(node, source, out),
+        //
+        // A `[a, b]` list is included here on purpose: OTML parses `key: [a, b]` by splitting on `,`
+        // and writing each item as a *child* node (otmlparser `writeIn`), which leaves the color
+        // node's own value empty — so `value<Color>()` casts the empty string and throws. A color
+        // property takes a single color, never a list, so `leaf_value` (which yields the whole
+        // `[...]` token) flagging it is faithful, matching how `border`/`display`/`layout` treat a
+        // list too.
+        k if catalog::COLOR_PROPERTIES.contains(&k) => {
+            if let Some((text, span)) = leaf_value(node, source) {
+                if !schema::is_border_color_value(text) {
+                    let message = if text.starts_with('[') {
+                        format!("`{text}`: a color property takes a single color, not a list")
+                    } else {
+                        format!("`{text}` is not a valid color")
+                    };
+                    push_invalid_value(out, message, span);
+                }
+            }
+        }
         _ => {}
-    }
-}
-
-/// Validate a color-typed property's value against `node->value<Color>()` (which **throws** on a
-/// color it cannot parse). A scalar value is validated whole; an **inline array** — the multi-color
-/// form the `documentColor` pass ([`crate::colors`]) swatches item by item — is validated the same
-/// way, per item, so a valid `color: [red, #00ff00]` is never mis-reported as one bad color while a
-/// bad item (`color: [red, 5]`) is still caught on the offending token.
-fn check_color_value(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
-    let Some(value) = node.child_by_field_name("value") else {
-        return;
-    };
-    if value.kind() == "inline_array" {
-        let mut cursor = value.walk();
-        for item in value.named_children(&mut cursor) {
-            let text = slice(source, item).trim();
-            // A `color` literal item is a color by construction; a `$variable` resolves at runtime;
-            // an empty item is nothing to validate.
-            if text.is_empty() || text.starts_with('$') || item.kind() == "color" {
-                continue;
-            }
-            if !schema::is_border_color_value(text) {
-                push_invalid_value(
-                    out,
-                    format!("`{text}` is not a valid color"),
-                    SyntaxTree::span_of(item),
-                );
-            }
-        }
-        return;
-    }
-    if let Some((text, span)) = leaf_value(node, source) {
-        if !schema::is_border_color_value(text) {
-            push_invalid_value(out, format!("`{text}` is not a valid color"), span);
-        }
     }
 }
 
@@ -1395,32 +1378,28 @@ Panel
     }
 
     #[test]
-    fn a_color_inline_array_is_validated_per_item_not_as_one_value() {
-        // The multi-color inline-array form the `documentColor` pass swatches item by item must not
-        // be reported as one bad color: every item is a valid color, so it is silent.
+    fn a_color_list_value_is_flagged_because_the_engine_cannot_cast_it() {
+        // OTML parses `color: [red, #00ff00]` into child nodes (otmlparser `writeIn`), leaving the
+        // color node's own value empty, so `node->value<Color>()` casts "" and throws. A color
+        // property takes a single color, never a list — so the whole `[...]` token is an error.
         for src in [
             "Panel\n  color: [red, #00ff00]\n",
-            "Panel\n  background-color: [red, blue, #ffffff]\n",
-            // A `$var` item resolves at runtime and is skipped, so a partly-dynamic array is silent.
-            "Panel\n  color: [red, $accent]\n",
+            "Panel\n  background-color: [red, blue]\n",
         ] {
             let diags = analyze(src);
+            let d = only(&diags, INVALID_PROPERTY_VALUE);
+            assert_eq!(d.severity, Severity::Error);
+            let flagged = &src[d.span.start..d.span.end];
             assert!(
-                diags.iter().all(|d| d.code != INVALID_PROPERTY_VALUE),
-                "a valid color array must not be flagged: {src:?} -> {diags:?}"
+                flagged.starts_with('[') && flagged.ends_with(']'),
+                "flags the list: {flagged:?}"
+            );
+            assert!(
+                d.message.contains("single color, not a list"),
+                "message: {}",
+                d.message
             );
         }
-    }
-
-    #[test]
-    fn a_bad_item_inside_a_color_array_is_flagged_on_that_item() {
-        // A genuinely invalid item is still caught, and the diagnostic points at the item, not the
-        // whole `[...]`.
-        let src = "Panel\n  color: [red, notacolor]\n";
-        let diags = analyze(src);
-        let d = only(&diags, INVALID_PROPERTY_VALUE);
-        assert_eq!(d.severity, Severity::Error);
-        assert_eq!(&src[d.span.start..d.span.end], "notacolor");
     }
 
     #[test]
