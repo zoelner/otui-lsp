@@ -199,8 +199,19 @@ mod tests {
     }
 
     #[test]
-    fn unparsable_source_yields_no_colors() {
-        // An unterminated inline array parses to an ERROR node — no panic, and no colors emitted.
+    fn malformed_input_never_panics_and_recovers_only_real_color_nodes() {
+        // An unterminated inline array parses to an ERROR-bearing tree; the walk must not panic. With
+        // no color token in it, nothing is emitted.
         assert!(document_colors("x: [a, b\n").is_empty());
+
+        // The pass is error-tolerant: a hex literal tree-sitter can still recover from mildly
+        // malformed input IS surfaced — color literals are context-free (a `#00ff00` is a color in
+        // any position), so this is intentionally not empty even though the line is broken and `x` is
+        // not a color property.
+        let recovered: Vec<&str> = colors_with_text("x: [a, #00ff00\n")
+            .iter()
+            .map(|(t, _)| *t)
+            .collect();
+        assert_eq!(recovered, ["#00ff00"]);
     }
 }
