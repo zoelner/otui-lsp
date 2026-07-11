@@ -45,6 +45,37 @@ pub fn document_links(source: &str) -> Vec<PathRef> {
     out
 }
 
+/// Point-locate the file-path-valued property **value** the cursor is on: if `offset` falls inside
+/// the trimmed path text of a `property` whose key is in [`schema::PATH_PROPERTIES`], return that
+/// property's [`PathRef`]; otherwise `None`.
+///
+/// This complements [`document_links`]'s bulk sweep with a point query — "what asset, if any, is
+/// under the cursor?" (e.g. to drive a sprite-preview hover). A cursor on the **key**
+/// (`image-source`) is deliberately not a hit here — that position is
+/// [`property_hover_at`](crate::property_hover::property_hover_at)'s job — nor is a cursor on the
+/// value of a non-path property, or anywhere outside a property.
+///
+/// Spans are half-open `[start, end)`, matching the rest of this crate's locators (see
+/// `navigation::base_reference_at`): an offset exactly at the end of the path text is not inside it.
+#[must_use]
+pub fn asset_ref_at(source: &str, offset: usize) -> Option<PathRef> {
+    let tree = SyntaxTree::parse(source)?;
+    let start = tree.root().descendant_for_byte_range(offset, offset)?;
+    let mut node = start;
+    let property = loop {
+        if node.kind() == "property" {
+            break node;
+        }
+        node = node.parent()?;
+    };
+    let path_ref = path_ref(property, source)?;
+    if path_ref.span.start <= offset && offset < path_ref.span.end {
+        Some(path_ref)
+    } else {
+        None
+    }
+}
+
 /// Pre-order walk emitting a [`PathRef`] for every path-valued `property` under `node`.
 fn collect(node: Node<'_>, source: &str, out: &mut Vec<PathRef>) {
     if node.kind() == "property" {
@@ -89,6 +120,12 @@ fn path_ref(property: Node<'_>, source: &str) -> Option<PathRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Byte offset of the first occurrence of `needle` in `src` (panics if absent) — the house cursor
+    /// helper shared across this crate's `*_at` locator tests.
+    fn at(src: &str, needle: &str) -> usize {
+        src.find(needle).expect("needle present")
+    }
 
     /// The `(text slice, path)` for each link found, for readable assertions.
     fn links_with_text(source: &str) -> Vec<(&str, String)> {
@@ -172,5 +209,80 @@ mod tests {
             "A\n  image-source: a.png\nB\n  image-source: b.png\nC\n  image-source: c.png\n";
         let paths: Vec<String> = document_links(source).into_iter().map(|r| r.path).collect();
         assert_eq!(paths, ["a.png", "b.png", "c.png"]);
+    }
+
+    #[test]
+    fn asset_ref_at_cursor_in_image_source_value_returns_it() {
+        let source = "Panel\n  image-source: /images/ui/window\n";
+        let offset = at(source, "/images") + 1;
+        let got = asset_ref_at(source, offset).expect("hit");
+        assert_eq!(got.path, "/images/ui/window");
+        assert_eq!(&source[got.span.start..got.span.end], "/images/ui/window");
+    }
+
+    #[test]
+    fn asset_ref_at_cursor_on_key_is_none() {
+        // The key position is `property_hover_at`'s job, not this locator's.
+        let source = "Panel\n  image-source: /images/ui/window\n";
+        assert!(asset_ref_at(source, at(source, "image-source") + 1).is_none());
+    }
+
+    #[test]
+    fn asset_ref_at_cursor_in_non_path_property_value_is_none() {
+        let source = "Panel\n  text: Hello World\n  color: red\n";
+        assert!(asset_ref_at(source, at(source, "Hello") + 1).is_none());
+        assert!(asset_ref_at(source, at(source, "red") + 1).is_none());
+    }
+
+    #[test]
+    fn asset_ref_at_cursor_outside_any_property_is_none() {
+        let source = "Panel\n  image-source: /images/ui/window\n";
+        // On the widget tag name.
+        assert!(asset_ref_at(source, at(source, "Panel")).is_none());
+        assert!(asset_ref_at("", 0).is_none());
+    }
+
+    #[test]
+    fn asset_ref_at_covers_each_path_property() {
+        let source =
+            "Button\n  icon: a.png\nOther\n  icon-source: b.png\nThird\n  image-source: c.png\n";
+        assert_eq!(
+            asset_ref_at(source, at(source, "a.png") + 1).map(|r| r.path),
+            Some("a.png".to_owned())
+        );
+        assert_eq!(
+            asset_ref_at(source, at(source, "b.png") + 1).map(|r| r.path),
+            Some("b.png".to_owned())
+        );
+        assert_eq!(
+            asset_ref_at(source, at(source, "c.png") + 1).map(|r| r.path),
+            Some("c.png".to_owned())
+        );
+    }
+
+    #[test]
+    fn asset_ref_at_boundary_matches_half_open_convention() {
+        // Half-open `[start, end)`: the first char of the path is a hit, and the last char is a hit,
+        // but the offset exactly at `end` (one past the last char) is not — consistent with
+        // `navigation::base_reference_at`'s `offset_just_past_base_is_not_a_hit`.
+        let source = "Panel\n  image-source: a.png\n";
+        let start = at(source, "a.png");
+        let end = start + "a.png".len();
+        assert!(asset_ref_at(source, start).is_some());
+        assert!(asset_ref_at(source, end - 1).is_some());
+        assert!(asset_ref_at(source, end).is_none());
+    }
+
+    #[test]
+    fn asset_ref_at_agrees_with_document_links_no_regression_from_refactor() {
+        // The shared `path_ref` helper still produces exactly what `document_links` produced before
+        // the point-locator was factored out.
+        let source = "A\n  image-source: a.png\nB\n  icon: b.png\nC\n  icon-source: c.png\n";
+        let bulk = document_links(source);
+        assert_eq!(bulk.len(), 3);
+        for r in &bulk {
+            let offset = r.span.start;
+            assert_eq!(asset_ref_at(source, offset).as_ref(), Some(r));
+        }
     }
 }
