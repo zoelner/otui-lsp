@@ -396,6 +396,39 @@ pub fn is_layout_block_property(name: &str) -> bool {
     crate::catalog::LAYOUT_PROPERTIES.contains(&name)
 }
 
+/// True if the **native** widget class `widget` dispatches `prop` in its own `onStyleApply` override
+/// ([`crate::catalog::NATIVE_WIDGET_PROPERTIES`]).
+///
+/// A C++ widget subclass can read style tags the base parser knows nothing about — `UITextEdit` reads
+/// `placeholder` / `max-length` / `multiline`, `UIItem` reads `item-id` / `virtual`, `UIGraph` reads
+/// `capacity`. These reach neither [`is_known_property`] (they are not in the base style parser) nor
+/// the Lua scanner (the class is C++, so it has no `extends` line), so without this they look unknown.
+///
+/// Unlike [`is_known_property`] this is **per widget**, not global: the tag is valid only on that
+/// class and its descendants. Callers must therefore resolve the widget's ancestry and test each
+/// native class on it — see `widget_resolve::WidgetAncestry::declares_custom_property`. That keeps a
+/// `change-cursor-image:` on a `Button` correctly unknown (it is `UITextEdit`'s, and the engine reads
+/// it nowhere on a button), while accepting it on a `TextEdit`.
+///
+/// Both names are matched exactly, as the engine dispatches them.
+#[must_use]
+pub fn native_widget_declares(widget: &str, prop: &str) -> bool {
+    crate::catalog::NATIVE_WIDGET_PROPERTIES
+        .iter()
+        .any(|(class, props)| *class == widget && props.contains(&prop))
+}
+
+/// Every style property the native widget class `widget` adds in its own `onStyleApply`
+/// ([`crate::catalog::NATIVE_WIDGET_PROPERTIES`]), or an empty slice when it adds none. The
+/// enumeration counterpart to [`native_widget_declares`], for completion.
+#[must_use]
+pub fn native_widget_properties(widget: &str) -> &'static [&'static str] {
+    crate::catalog::NATIVE_WIDGET_PROPERTIES
+        .iter()
+        .find(|(class, _)| *class == widget)
+        .map_or(&[], |(_, props)| *props)
+}
+
 /// Classify a color value by its parseable form, faithful to `Color::operator>>` in the engine.
 /// Returns `None` for anything that is not a well-formed hex or functional color (including named
 /// colors — use [`is_named_color`] for those).

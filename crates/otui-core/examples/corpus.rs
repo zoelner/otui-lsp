@@ -1,0 +1,102 @@
+//! Fidelity harness: run the widget-aware diagnostics over a real engine corpus and report each
+//! `unknown-property` finding **with the widget it sits on**, so a genuine dead property (one the
+//! engine reads nowhere) can be told apart from a gap in the LSP's catalog.
+//!
+//! Usage: `cargo run -p otui-core --example corpus -- <engine-source-root>`
+use otui_core::diagnostics::{analyze_with_widgets, WidgetContext};
+use otui_core::lua_widgets::{scan_widgets, LuaWidgetIndex};
+use otui_core::style_index::{extract_style_defs, StyleIndex};
+use otui_core::syntax::SyntaxTree;
+use std::collections::BTreeMap;
+
+fn main() {
+    let root = std::env::args()
+        .nth(1)
+        .expect("usage: corpus <engine-root>");
+    let root = std::path::Path::new(&root);
+    let (otui, lua) = (files(root, "otui"), files(root, "lua"));
+
+    let mut styles = StyleIndex::new();
+    let mut luas = LuaWidgetIndex::new();
+    for f in &otui {
+        if let Ok(s) = std::fs::read_to_string(f) {
+            if let Some(t) = SyntaxTree::parse(&s) {
+                styles.set_document(f.display().to_string(), extract_style_defs(&t));
+            }
+        }
+    }
+    for f in &lua {
+        if let Ok(s) = std::fs::read_to_string(f) {
+            luas.set_document(f.display().to_string(), scan_widgets(&s));
+        }
+    }
+    let ctx = WidgetContext {
+        styles: &styles,
+        lua: &luas,
+    };
+
+    let mut pairs: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut by_code: BTreeMap<&str, usize> = BTreeMap::new();
+    for f in &otui {
+        let Ok(src) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        for d in analyze_with_widgets(&src, &ctx) {
+            *by_code.entry(d.code).or_default() += 1;
+            if d.code != "unknown-property" {
+                continue;
+            }
+            let prop = src[d.span.start..d.span.end].to_string();
+            let w = enclosing_widget(&src, d.span.start).unwrap_or_else(|| "?".into());
+            *pairs.entry((prop, w)).or_default() += 1;
+        }
+    }
+    println!(
+        "{} .otui | {} .lua | by code: {by_code:?}\n",
+        otui.len(),
+        lua.len()
+    );
+    let mut v: Vec<_> = pairs.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    println!("   n  property                     widget");
+    for ((prop, w), c) in v.iter().take(30) {
+        println!("{c:>4}  {prop:<28} {w}");
+    }
+}
+
+/// The nearest enclosing widget — the same rule `diagnostics` uses: walk up to the first
+/// `container` (its `tag`) or `style_header` (its `base`).
+fn enclosing_widget(src: &str, offset: usize) -> Option<String> {
+    let tree = SyntaxTree::parse(src)?;
+    let mut node = tree.root().descendant_for_byte_range(offset, offset)?;
+    loop {
+        let field = match node.kind() {
+            "container" => Some("tag"),
+            "style_header" => Some("base"),
+            _ => None,
+        };
+        if let Some(f) = field {
+            if let Some(n) = node.child_by_field_name(f) {
+                return Some(src[n.start_byte()..n.end_byte()].trim().to_string());
+            }
+        }
+        node = node.parent()?;
+    }
+}
+
+fn files(dir: &std::path::Path, ext: &str) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    fn go(d: &std::path::Path, ext: &str, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(d) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                go(&p, ext, out)
+            } else if p.extension().is_some_and(|x| x == ext) {
+                out.push(p)
+            }
+        }
+    }
+    go(dir, ext, &mut out);
+    out
+}

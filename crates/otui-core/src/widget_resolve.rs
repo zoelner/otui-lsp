@@ -18,6 +18,7 @@
 //! owned `String`s, with no I/O and no `lsp-types`.
 
 use crate::lua_widgets::LuaWidgetIndex;
+use crate::schema;
 use crate::style_index::{is_native_base, StyleDef, StyleIndex};
 use std::collections::HashSet;
 
@@ -35,16 +36,25 @@ pub struct WidgetAncestry {
 }
 
 impl WidgetAncestry {
-    /// Whether any widget in the ancestry declares `prop` as a Lua custom style property (per
-    /// `lua`). This is the membership test [`diagnostics`](crate::diagnostics) consults before
-    /// emitting an `unknown-property` hint.
+    /// Whether any widget in the ancestry declares `prop` as a custom style property — either in
+    /// **Lua** (per `lua`, e.g. `UITable` reading `column-style`) or in a **native C++**
+    /// `onStyleApply` override (per [`schema::native_widget_declares`], e.g. `UITextEdit` reading
+    /// `placeholder`). This is the membership test [`diagnostics`](crate::diagnostics) consults
+    /// before emitting an `unknown-property` hint.
+    ///
+    /// Both sources are per-widget, so the property is accepted only when the widget *is-a* the
+    /// declarer: `placeholder` resolves on `TextEdit < UITextEdit` but not on a `Button`, where the
+    /// engine reads it nowhere.
     #[must_use]
     pub fn declares_custom_property(&self, lua: &LuaWidgetIndex, prop: &str) -> bool {
-        self.chain.iter().any(|name| lua.declares(name, prop))
+        self.chain
+            .iter()
+            .any(|name| lua.declares(name, prop) || schema::native_widget_declares(name, prop))
     }
 
-    /// Every Lua custom style property valid on this widget — the union of the `custom_props` of
-    /// each widget in the ancestry (per `lua`), sorted and de-duplicated. This is the enumeration
+    /// Every custom style property valid on this widget — the union, over the whole ancestry, of the
+    /// Lua-declared `custom_props` (per `lua`) and the native C++ `onStyleApply` tags (per
+    /// [`schema::native_widget_properties`]), sorted and de-duplicated. This is the enumeration
     /// [`completion`](crate::completion) offers, the counterpart to the
     /// [`declares_custom_property`](Self::declares_custom_property) membership test.
     #[must_use]
@@ -54,6 +64,11 @@ impl WidgetAncestry {
             for def in lua.lookup(name) {
                 props.extend(def.custom_props.iter().cloned());
             }
+            props.extend(
+                schema::native_widget_properties(name)
+                    .iter()
+                    .map(|p| (*p).to_owned()),
+            );
         }
         props
     }
@@ -239,6 +254,32 @@ mod tests {
         // UIA is native, so phase 2 follows UIA -> UIB, then UIB -> UIA is already seen and stops.
         assert_eq!(a.chain, ["UIA", "UIB"]);
         assert_eq!(a.native.as_deref(), Some("UIA"));
+    }
+
+    #[test]
+    fn declares_a_native_cpp_widget_property() {
+        // `UITextEdit::onStyleApply` (C++) dispatches `placeholder` — there is no Lua `extends` line
+        // for it, so only the native table can accept it. It must resolve down the `.otui` chain.
+        let styles = styles(&[("a.otui", "TextEdit < UITextEdit\nSearchBox < TextEdit\n")]);
+        let lua = LuaWidgetIndex::new();
+
+        let search = resolve_ancestry("SearchBox", &styles, &lua);
+        assert!(search.declares_custom_property(&lua, "placeholder"));
+        assert!(search.declares_custom_property(&lua, "max-length"));
+        assert!(search.custom_properties(&lua).contains("multiline"));
+    }
+
+    #[test]
+    fn a_native_widget_property_does_not_leak_to_unrelated_widgets() {
+        // `change-cursor-image` is `UITextEdit`'s. On a Button the engine reads it nowhere, so it
+        // must stay unknown — the per-widget table must not become a global one.
+        let styles = styles(&[("a.otui", "Button < UIButton\nTextEdit < UITextEdit\n")]);
+        let lua = LuaWidgetIndex::new();
+
+        assert!(resolve_ancestry("TextEdit", &styles, &lua)
+            .declares_custom_property(&lua, "change-cursor-image"));
+        assert!(!resolve_ancestry("Button", &styles, &lua)
+            .declares_custom_property(&lua, "change-cursor-image"));
     }
 
     #[test]

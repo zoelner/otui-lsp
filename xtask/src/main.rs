@@ -67,6 +67,17 @@ const LAYOUT_FILES: &[&str] = &[
     "src/framework/ui/uianchorlayout.cpp",
 ];
 
+/// Engine-source directories (relative to the engine-source root) holding the **native widget**
+/// classes. A widget subclass may override `onStyleApply` and dispatch OTML tags of its own — e.g.
+/// `UITextEdit` reads `placeholder`, `max-length`, `multiline`; `UIItem` reads `item-id`, `virtual`.
+///
+/// These tags reach neither [`PROPERTY_FILES`] (they are not in the base style parser) nor the Lua
+/// scanner (the class is C++, so there is no `extends` line), so without them a perfectly valid
+/// `placeholder:` on a `TextEdit` looks unknown. Unlike the base catalog they are keyed **per
+/// widget**: they are valid only on that class and its descendants, so `change-cursor-image` on a
+/// `Button` stays unknown — as it is, the engine reads it nowhere there.
+const NATIVE_WIDGET_DIRS: &[&str] = &["src/framework/ui", "src/client"];
+
 /// Relative path (under the engine-source root) of the CSS named-color table + legacy color names.
 const COLOR_FILE: &str = "src/framework/util/color.cpp";
 
@@ -87,6 +98,10 @@ struct Catalog {
     /// Sorted. Dispatched by the layout object, not the widget style parser, so these are disjoint
     /// from [`Catalog::properties`] and must be checked in the `layout:` block context.
     layout_properties: Vec<String>,
+    /// The OTML tags each **native widget subclass** dispatches in its own `onStyleApply` override,
+    /// as `(UI class name, sorted tags)`, sorted by class. Keyed per widget — unlike
+    /// [`Catalog::properties`] these are valid only on that class and its descendants.
+    native_widget_properties: Vec<(String, Vec<String>)>,
     /// The CSS named-color table: `(lowercased name, packed 0xRRGGBB)`, sorted by name. The value is
     /// captured from the `rgb_to_abgr(0xRRGGBB)` literal in the engine's `kCss` table.
     named_colors: Vec<(String, u32)>,
@@ -163,11 +178,12 @@ fn gen_catalog(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         .map_err(|e| format!("failed to write '{}': {e}", out_path.display()))?;
 
     println!(
-        "gen-catalog: wrote {} properties ({} color-typed), {} layout-block keys, {} named colors, \
-         {} legacy colors and {} legacy names to {}",
+        "gen-catalog: wrote {} properties ({} color-typed), {} layout-block keys, {} native \
+         widgets, {} named colors, {} legacy colors and {} legacy names to {}",
         catalog.properties.len(),
         catalog.color_properties.len(),
         catalog.layout_properties.len(),
+        catalog.native_widget_properties.len(),
         catalog.named_colors.len(),
         catalog.legacy_colors.len(),
         catalog.legacy_color_names.len(),
@@ -278,10 +294,95 @@ fn extract(src: &Path) -> Result<Catalog, String> {
         properties: sorted_dedup(properties),
         color_properties: sorted_dedup(color_properties),
         layout_properties: sorted_dedup(layout_properties),
+        native_widget_properties: extract_native_widget_properties(src)?,
         named_colors,
         legacy_colors,
         legacy_color_names: sorted_dedup(legacy_color_names),
     })
+}
+
+/// Extract, per native widget class, the OTML tags it dispatches in its **own** `onStyleApply`
+/// override — the mechanism by which a C++ subclass adds style properties the base parser knows
+/// nothing about (`UITextEdit` → `placeholder`, `UIItem` → `item-id`, `UIGraph` → `capacity`, …).
+///
+/// Scans every `.cpp` under [`NATIVE_WIDGET_DIRS`] for a `void <Class>::onStyleApply(` definition,
+/// takes its body up to the next column-0 `}` (engine style puts every method body at column 0, so
+/// this bounds it reliably), and pulls the `node->tag() == "..."` tags out of it — the same dispatch
+/// shape the base catalog uses.
+///
+/// `UIWidget` is skipped: its `onStyleApply` delegates to `parseBaseStyle`, whose tags are already
+/// the global catalog, and re-listing them per-widget would say they are *only* valid on `UIWidget`.
+///
+/// Classes with no dispatched tag are dropped, so the table holds only widgets that genuinely add
+/// properties. Missing directories are tolerated (a fork may not ship `src/client`).
+fn extract_native_widget_properties(src: &Path) -> Result<Vec<(String, Vec<String>)>, String> {
+    let def_re =
+        Regex::new(r"\bvoid\s+(UI\w+)::onStyleApply\s*\(").expect("valid onStyleApply regex");
+    let tag_re = Regex::new(r#"\btag\s*(?:\(\))?\s*==\s*"([^"]+)""#).expect("valid property regex");
+
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for dir in NATIVE_WIDGET_DIRS {
+        let dir = src.join(dir);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            eprintln!(
+                "gen-catalog: note: optional widget dir '{}' not found; skipping.",
+                dir.display()
+            );
+            continue;
+        };
+        let mut files: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "cpp"))
+            .collect();
+        files.sort();
+
+        for path in files {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let stripped = strip_comments(&text);
+            for caps in def_re.captures_iter(&stripped) {
+                let class = caps[1].to_string();
+                if class == "UIWidget" {
+                    continue; // its tags are the base catalog, not a per-widget addition
+                }
+                // Body: from the end of the signature to the next column-0 `}`.
+                let start = caps.get(0).expect("match 0").end();
+                let rest = &stripped[start..];
+                let end = rest.find("\n}").map_or(rest.len(), |i| i + 1);
+                let tags: Vec<String> = tag_re
+                    .captures_iter(&rest[..end])
+                    .map(|c| c[1].to_string())
+                    .collect();
+                if tags.is_empty() {
+                    continue;
+                }
+                out.push((class, sorted_dedup(tags)));
+            }
+        }
+    }
+
+    // Merge duplicate class entries (a class split across translation units) and sort by class.
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut merged: Vec<(String, Vec<String>)> = Vec::new();
+    for (class, tags) in out {
+        match merged.last_mut() {
+            Some((prev, prev_tags)) if *prev == class => {
+                prev_tags.extend(tags);
+                let taken = std::mem::take(prev_tags);
+                *prev_tags = sorted_dedup(taken);
+            }
+            _ => merged.push((class, tags)),
+        }
+    }
+    if merged.is_empty() {
+        return Err(
+            "extracted zero native-widget properties — is the widget-source layout as expected?"
+                .into(),
+        );
+    }
+    Ok(merged)
 }
 
 /// The keys the widget style parser reads directly out of a `layout:` block — the `type` in
@@ -464,6 +565,9 @@ fn render(catalog: &Catalog) -> String {
          //! * [`LAYOUT_PROPERTIES`] — the keys read inside a `layout:` block (the union of the\n\
          //!   layout classes' `applyStyle` tags, plus the block's `type`). Disjoint from\n\
          //!   [`PROPERTIES`] — valid only *inside* a `layout:` block.\n\
+         //! * [`NATIVE_WIDGET_PROPERTIES`] — the tags each native widget subclass dispatches in its\n\
+         //!   own `onStyleApply` override, keyed by `UI` class. Valid only on that class and its\n\
+         //!   descendants, so they are resolved through the widget ancestry, not globally.\n\
          //! * [`NAMED_COLORS`] — the CSS named-color table as `(name, 0xRRGGBB)` pairs, lowercased\n\
          //!   to match the engine's case-insensitive lookup. The packed value is the color's RGB.\n\
          //! * [`LEGACY_COLORS`] — the legacy engine color statics as `(name, 0xRRGGBBAA)` pairs\n\
@@ -498,6 +602,18 @@ fn render(catalog: &Catalog) -> String {
     ));
     s.push('\n');
     s.push_str(
+        "/// OTML tags each native widget subclass dispatches in its own `onStyleApply` override: \
+         `(UI class,\n\
+         /// sorted tags)`. Valid **only** on that class and its descendants — unlike \
+         [`PROPERTIES`], which is\n\
+         /// global. Resolved through the widget's ancestry; see `widget_resolve`.\n",
+    );
+    s.push_str(&render_native_widgets(
+        "NATIVE_WIDGET_PROPERTIES",
+        &catalog.native_widget_properties,
+    ));
+    s.push('\n');
+    s.push_str(
         "/// CSS named colors recognized by the engine's color parser: `(lowercased name, packed \
          0xRRGGBB)`.\n",
     );
@@ -518,6 +634,28 @@ fn render(catalog: &Catalog) -> String {
         &catalog.legacy_color_names,
     ));
 
+    s
+}
+
+/// Render the per-widget native property table as a `&[(&str, &[&str])]`: one row per widget class,
+/// each holding that class's own `onStyleApply` tags.
+fn render_native_widgets(name: &str, rows: &[(String, Vec<String>)]) -> String {
+    let mut s = format!("pub static {name}: &[(&str, &[&str])] = &[\n");
+    for (class, tags) in rows {
+        s.push_str("    (\"");
+        s.push_str(class);
+        s.push_str("\", &[");
+        for (i, tag) in tags.iter().enumerate() {
+            if i > 0 {
+                s.push_str(", ");
+            }
+            s.push('"');
+            s.push_str(tag);
+            s.push('"');
+        }
+        s.push_str("]),\n");
+    }
+    s.push_str("];\n");
     s
 }
 

@@ -14,6 +14,9 @@
 //! * [`LAYOUT_PROPERTIES`] — the keys read inside a `layout:` block (the union of the
 //!   layout classes' `applyStyle` tags, plus the block's `type`). Disjoint from
 //!   [`PROPERTIES`] — valid only *inside* a `layout:` block.
+//! * [`NATIVE_WIDGET_PROPERTIES`] — the tags each native widget subclass dispatches in its
+//!   own `onStyleApply` override, keyed by `UI` class. Valid only on that class and its
+//!   descendants, so they are resolved through the widget ancestry, not globally.
 //! * [`NAMED_COLORS`] — the CSS named-color table as `(name, 0xRRGGBB)` pairs, lowercased
 //!   to match the engine's case-insensitive lookup. The packed value is the color's RGB.
 //! * [`LEGACY_COLORS`] — the legacy engine color statics as `(name, 0xRRGGBBAA)` pairs
@@ -212,6 +215,92 @@ pub static LAYOUT_PROPERTIES: &[&str] = &[
     "num-lines",
     "spacing",
     "type",
+];
+
+/// OTML tags each native widget subclass dispatches in its own `onStyleApply` override: `(UI class,
+/// sorted tags)`. Valid **only** on that class and its descendants — unlike [`PROPERTIES`], which is
+/// global. Resolved through the widget's ancestry; see `widget_resolve`.
+pub static NATIVE_WIDGET_PROPERTIES: &[(&str, &[&str])] = &[
+    (
+        "UICreature",
+        &[
+            "creature-center",
+            "creature-size",
+            "outfit-body",
+            "outfit-direction",
+            "outfit-feet",
+            "outfit-head",
+            "outfit-id",
+            "outfit-legs",
+        ],
+    ),
+    (
+        "UIEffect",
+        &["effect-id", "effect-visible", "show-id", "virtual"],
+    ),
+    (
+        "UIGraph",
+        &["capacity", "show-info", "show-labels", "title"],
+    ),
+    (
+        "UIItem",
+        &[
+            "always-show-count",
+            "flip-direction",
+            "item-count",
+            "item-id",
+            "item-visible",
+            "show-id",
+            "virtual",
+        ],
+    ),
+    ("UIMap", &["draw-lights"]),
+    ("UIMinimap", &["max-zoom", "min-zoom", "zoom"]),
+    (
+        "UIMissile",
+        &[
+            "direction",
+            "missile-id",
+            "missile-visible",
+            "show-id",
+            "virtual",
+        ],
+    ),
+    ("UIParticles", &["effect", "reference-pos"]),
+    (
+        "UIProgressRect",
+        &["duration", "percent", "show-progress", "show-time"],
+    ),
+    ("UISprite", &["sprite-color", "sprite-id", "sprite-visible"]),
+    (
+        "UITextEdit",
+        &[
+            "auto-scroll",
+            "change-cursor-image",
+            "cursor-visible",
+            "editable",
+            "font",
+            "font-scale",
+            "max-length",
+            "multiline",
+            "placeholder",
+            "placeholder-align",
+            "placeholder-color",
+            "placeholder-font",
+            "selectable",
+            "selection",
+            "selection-background-color",
+            "selection-color",
+            "shift-navigation",
+            "stroke",
+            "text",
+            "text-hidden",
+            "ttf-font",
+            "ttf-font-size",
+            "ttf-stroke-color",
+            "ttf-stroke-width",
+        ],
+    ),
 ];
 
 /// CSS named colors recognized by the engine's color parser: `(lowercased name, packed 0xRRGGBB)`.
