@@ -62,19 +62,24 @@ pub fn run(root: &Path) {
     }
 }
 
-/// The nearest enclosing widget — the same rule `diagnostics` uses: walk up to the first
-/// `container` (its `tag`) or `style_header` (its `base`).
+/// The nearest enclosing widget — mirroring the rule `diagnostics` resolves a property against: a
+/// `container`'s `tag`, or a `style_header`'s **declared name** (falling back to its `base`).
+///
+/// The name, not the base: `diagnostics` seeds a style body from the declared name so a `__class:`
+/// re-root in that body applies. Reporting the base here would label a finding inside
+/// `SpinBox < TextEdit` as `TextEdit` — misattributing it to the wrong widget, which is exactly the
+/// column this report exists to get right.
 fn enclosing_widget(src: &str, offset: usize) -> Option<String> {
     let tree = SyntaxTree::parse(src)?;
     let mut node = tree.root().descendant_for_byte_range(offset, offset)?;
     loop {
-        let field = match node.kind() {
-            "container" => Some("tag"),
-            "style_header" => Some("base"),
-            _ => None,
+        let fields: &[&str] = match node.kind() {
+            "container" => &["tag"],
+            "style_header" => &["name", "base"],
+            _ => &[],
         };
-        if let Some(f) = field {
-            if let Some(n) = node.child_by_field_name(f) {
+        for field in fields {
+            if let Some(n) = node.child_by_field_name(field) {
                 return Some(src[n.start_byte()..n.end_byte()].trim().to_string());
             }
         }
