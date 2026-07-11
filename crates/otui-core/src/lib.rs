@@ -23,6 +23,7 @@ pub mod hover;
 pub mod links;
 pub mod lua_widgets;
 pub mod navigation;
+pub mod property_hover;
 pub mod references;
 pub mod schema;
 pub mod semantic;
@@ -177,6 +178,20 @@ impl OtuiService {
         index: &StyleIndex,
     ) -> Option<StyleHover> {
         hover::style_hover_at(source, offset, index)
+    }
+
+    /// Describe the **property key** under `offset` for hover (spec §5.5): what value the property
+    /// expects (color / asset path / a fixed value set / border shorthand / a plain known property),
+    /// derived from the catalog + schema metadata. `None` when the cursor is not on a known property
+    /// key. Pure — needs no workspace index (property meaning is global). The server renders the
+    /// returned [`property_hover::PropertyHover`] into Markdown; see [`property_hover`].
+    #[must_use]
+    pub fn property_hover_at(
+        &self,
+        source: &str,
+        offset: usize,
+    ) -> Option<property_hover::PropertyHover> {
+        property_hover::property_hover_at(source, offset)
     }
 
     /// Locate the style name the symbol under `offset` resolves to for type navigation

@@ -62,6 +62,7 @@ use otui_core::fixes::Fix;
 use otui_core::hover::{Inheritance, StyleHover, StyleHoverKind};
 use otui_core::links::PathRef;
 use otui_core::lua_widgets::LuaWidgetIndex;
+use otui_core::property_hover::{PropertyHover, PropertyValueKind};
 use otui_core::style_index::{is_native_base, DocId, StyleDef, StyleIndex};
 use otui_core::OtuiService;
 
@@ -1215,6 +1216,42 @@ fn render_hover(desc: &StyleHover, line_index: &LineIndex, encoding: PositionEnc
     }
 }
 
+/// Format a [`PropertyHover`] (a property-key description from the engine) into an LSP Markdown
+/// [`Hover`]. Pure presentation: [`otui_core`] decided the property's value kind from its catalog +
+/// schema metadata; here we only word it and map the key span to a range.
+fn render_property_hover(
+    desc: &PropertyHover,
+    line_index: &LineIndex,
+    encoding: PositionEncoding,
+) -> Hover {
+    let name = &desc.name;
+    let body = match &desc.value {
+        PropertyValueKind::Color => "a color value".to_owned(),
+        PropertyValueKind::AssetPath => {
+            "an asset path (a texture) — the `.png` extension is optional".to_owned()
+        }
+        PropertyValueKind::Enum { values } => {
+            let list = values
+                .iter()
+                .map(|v| format!("`{v}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("one of: {list}")
+        }
+        PropertyValueKind::Border => {
+            "a border shorthand: a width and a color (or `none`)".to_owned()
+        }
+        PropertyValueKind::Plain => "an OTUI style property".to_owned(),
+    };
+    Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: format!("**`{name}`** — {body}"),
+        }),
+        range: Some(line_index.range(desc.span.start, desc.span.end, encoding)),
+    }
+}
+
 /// Append an "Inherits from `Base`" line (marking a native base as `(built-in)`) when `inherits` is
 /// present; a no-op otherwise.
 fn append_inherits(value: &mut String, inherits: Option<&Inheritance>) {
@@ -2354,8 +2391,14 @@ impl Backend {
         let line_index = LineIndex::new(&text);
         let offset = line_index.offset_at(position, encoding);
         let index = self.style_index.read().expect("style_index lock poisoned");
-        let desc = self.service.style_hover_at(&text, offset, &index)?;
-        Some(render_hover(&desc, &line_index, encoding))
+        if let Some(desc) = self.service.style_hover_at(&text, offset, &index) {
+            return Some(render_hover(&desc, &line_index, encoding));
+        }
+        drop(index);
+        // Not a style token — fall back to a property-key hover (value type from the catalog/schema
+        // metadata; no workspace index needed).
+        let pdesc = self.service.property_hover_at(&text, offset)?;
+        Some(render_property_hover(&pdesc, &line_index, encoding))
     }
 
     fn completion(&self, params: CompletionParams) -> Option<CompletionResponse> {
@@ -4293,6 +4336,44 @@ end
         assert!(OtuiService::new()
             .style_hover_at(src, offset, &index)
             .is_none());
+    }
+
+    /// Render the property-key hover at `needle` in `text` (the fallback path of the hover handler).
+    fn property_hover_text(text: &str, needle: &str) -> String {
+        let offset = text.find(needle).expect("needle present") + 1;
+        let desc = OtuiService::new()
+            .property_hover_at(text, offset)
+            .expect("cursor is on a known property key");
+        let line_index = LineIndex::new(text);
+        let h = render_property_hover(&desc, &line_index, PositionEncoding::Utf16);
+        match h.contents {
+            HoverContents::Markup(m) => m.value,
+            other => panic!("expected markup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hover_on_an_asset_path_property_describes_it() {
+        let t = property_hover_text("Panel\n  image-source: /images/ui/x\n", "image-source");
+        assert!(t.contains("**`image-source`**"), "{t}");
+        assert!(t.contains("asset path"), "{t}");
+    }
+
+    #[test]
+    fn hover_on_an_enum_property_lists_its_values() {
+        let t = property_hover_text("Panel\n  display: flex\n", "display");
+        assert!(t.contains("**`display`**"), "{t}");
+        assert!(t.contains("one of:"), "{t}");
+        assert!(t.contains("`flex`"), "{t}");
+    }
+
+    #[test]
+    fn hover_on_a_color_property_describes_it() {
+        let t = property_hover_text("Panel\n  color: red\n", "color");
+        assert!(
+            t.contains("**`color`**") && t.contains("color value"),
+            "{t}"
+        );
     }
 
     /// The [`CodeAction`] inside a [`CodeActionOrCommand`] (panics if it is a bare command).
