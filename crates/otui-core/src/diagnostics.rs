@@ -1,12 +1,14 @@
-//! Parse-level diagnostics (spec §4), a faithful mirror of the OTClient OTML parser.
+//! Diagnostics (spec §4), a faithful mirror of the OTClient OTML parser and style resolver.
 //!
-//! This is the *parse* category only — every finding here is a [`Severity::Error`], because these
-//! are conditions the real engine treats as fatal (`OTMLException`) or that leave the tree-sitter
-//! grammar unable to form a valid node. Higher-level, engine-tolerated authoring mistakes
-//! (unknown properties, unknown `$state`, style-resolution warnings) are *hints/warnings* handled
-//! by later milestones and are intentionally **not** produced here.
+//! Severity is **not** uniform here, and that is the point: it tracks what the *engine* does with
+//! each mistake. A condition the engine treats as fatal (`OTMLException`), or that leaves the
+//! tree-sitter grammar unable to form a valid node, is a [`Severity::Error`]. A mistake the engine
+//! silently tolerates is a *hint* — never an error, however wrong it looks (spec §2.10). Style
+//! resolution sits between the two: a dangling base still registers its style, so it is a
+//! [`Severity::Warning`]; an unresolvable *root* instance means the file does not load, so it is an
+//! error.
 //!
-//! Three passes contribute:
+//! Four passes contribute:
 //!
 //! 1. A **line-based indentation** pass mirroring `OTMLParser::getLineDepth` / `parseLine`:
 //!    tabs in leading whitespace, odd (non-multiple-of-2) indentation, and invalid depth jumps.
@@ -20,11 +22,15 @@
 //!    unknown ordinary property name ([`UNKNOWN_PROPERTY`], a *hint* — the engine silently *ignores*
 //!    a tag it does not recognize, so a misspelled/unknown property never errors, it just has no
 //!    effect).
+//! 4. A **style-resolution** pass over the top-level nodes only ([`UNKNOWN_BASE`], a *warning*, and
+//!    [`UNKNOWN_ROOT_STYLE`], an *error*). This one is **workspace-aware**: it needs the
+//!    [`WidgetContext`] and therefore fires only under [`analyze_with_widgets`] — plain [`analyze`]
+//!    has no style index and must never invent a resolution failure it cannot actually check.
 
 use crate::catalog;
 use crate::lua_widgets::LuaWidgetIndex;
 use crate::schema;
-use crate::style_index::StyleIndex;
+use crate::style_index::{is_native_base, StyleIndex};
 use crate::syntax::SyntaxTree;
 use crate::widget_resolve;
 use lang_api::{ByteSpan, Diagnostic, Severity};
@@ -72,6 +78,24 @@ pub const UNKNOWN_PROPERTY: &str = "unknown-property";
 /// dedicated [`INVALID_ANCHOR_EDGE`] check.)
 pub const INVALID_PROPERTY_VALUE: &str = "invalid-property-value";
 
+/// Diagnostic code: a top-level `Name < Base` style declaration whose `Base` resolves to no
+/// workspace style and is not a native `UI*` built-in (spec §2.2, §4.2). Severity
+/// [`Severity::Warning`], **not** error: `UIManager::importStyleFromOTML` still registers `Name`
+/// into the global style namespace even when `Base` cannot be found — nothing about parsing or
+/// loading the *declaring* file fails, so a dangling base only ever bites whoever later
+/// instantiates `Name` (a separate, already-covered resolution). Widget-aware, so it only fires
+/// under [`analyze_with_widgets`] — see the [`WidgetContext`] field docs.
+pub const UNKNOWN_BASE: &str = "unknown-base";
+/// Diagnostic code: the file's root/main-widget instance — its one top-level `container` (a bare
+/// tag, no `< Base`, spec §2.2 `UIManager::findMainWidgetNode`) — whose tag resolves to no
+/// workspace style and is not a native `UI*` built-in. Severity [`Severity::Error`]: unlike
+/// [`UNKNOWN_BASE`], this node is the one the file actually instantiates
+/// (`UIManager::loadUIFromString` → `UIManager::getStyle` on the root node's tag), so an unknown
+/// style here means the file itself fails to load. A `.otui` fragment with no such root instance —
+/// only `Name < Base` declarations — is a valid "style-only" file and never triggers this check
+/// (spec §4.2). Widget-aware, so it only fires under [`analyze_with_widgets`].
+pub const UNKNOWN_ROOT_STYLE: &str = "unknown-root-style";
+
 /// The workspace state that makes [`analyze_with_widgets`] **widget-aware**: the `.otui` style index
 /// and the Lua widget index, both borrowed. Threaded down to [`check_property`] so a property the
 /// C++ catalog does not know can still be accepted when the enclosing widget's Lua ancestry declares
@@ -108,6 +132,7 @@ fn analyze_inner(source: &str, ctx: Option<&WidgetContext>) -> Vec<Diagnostic> {
     if let Some(tree) = SyntaxTree::parse(source) {
         collect_structural_errors(tree.root(), &mut out);
         collect_semantic_diagnostics(tree.root(), source, None, ctx, &mut out);
+        check_top_level_style_resolution(tree.root(), source, ctx, &mut out);
     }
     out.sort_by_key(|d| (d.span.start, d.span.end));
     out
@@ -432,6 +457,73 @@ fn collect_semantic_diagnostics<'a>(
     for child in node.children(&mut cursor) {
         collect_semantic_diagnostics(child, source, child_enclosing, ctx, out);
     }
+}
+
+/// The two style-resolution checks of spec §2.2/§4.2 — [`UNKNOWN_BASE`] and
+/// [`UNKNOWN_ROOT_STYLE`] — over `root`'s **top-level** children only.
+///
+/// Both need to tell "genuinely unresolved" apart from "resolves cross-file", which only the
+/// workspace [`WidgetContext`] can answer; with no `ctx` (plain [`analyze`]) this is a no-op, so a
+/// catalog-only buffer degrades exactly as before this check existed.
+///
+/// Only top-level nodes are considered — a nested `Name < Base` or bare tag inside a widget's body
+/// is a child-widget *instance*, not a style declaration or the file's root, and is out of scope
+/// here (see the [`crate::style_index`] module docs: "only top-level declarations are styles").
+fn check_top_level_style_resolution(
+    root: Node<'_>,
+    source: &str,
+    ctx: Option<&WidgetContext>,
+    out: &mut Vec<Diagnostic>,
+) {
+    let Some(ctx) = ctx else { return };
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        match child.kind() {
+            "style_header" => {
+                let Some(base) = child.child_by_field_name("base") else {
+                    continue;
+                };
+                let name = slice(source, base).trim();
+                if name.is_empty() || resolves_style(name, ctx) {
+                    continue;
+                }
+                out.push(Diagnostic {
+                    severity: Severity::Warning,
+                    code: UNKNOWN_BASE,
+                    message: format!(
+                        "unknown base `{name}`: no workspace style or built-in widget class named `{name}`"
+                    ),
+                    span: SyntaxTree::span_of(base),
+                });
+            }
+            "container" => {
+                let Some(tag) = child.child_by_field_name("tag") else {
+                    continue;
+                };
+                let name = slice(source, tag).trim();
+                if name.is_empty() || resolves_style(name, ctx) {
+                    continue;
+                }
+                out.push(Diagnostic {
+                    severity: Severity::Error,
+                    code: UNKNOWN_ROOT_STYLE,
+                    message: format!(
+                        "root widget style `{name}` does not resolve: the file fails to load"
+                    ),
+                    span: SyntaxTree::span_of(tag),
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether `name` resolves to *something* the engine would accept as a widget type: a native `UI*`
+/// built-in ([`is_native_base`]), a workspace `.otui` style declaration, or a Lua-declared widget
+/// class (`extends`/`onStyleApply`) — the latter covers a custom base whose only declaration is a
+/// Lua module, never an `.otui` `Name < Base` line.
+fn resolves_style(name: &str, ctx: &WidgetContext) -> bool {
+    is_native_base(name) || !ctx.styles.lookup(name).is_empty() || !ctx.lua.lookup(name).is_empty()
 }
 
 /// The key of the `property` **block** this node sits directly inside, or `None` when the node is not
@@ -2065,6 +2157,158 @@ Window < UIWindow
         assert_eq!(
             only(&with, UNKNOWN_PROPERTY).span,
             only(&without, UNKNOWN_PROPERTY).span
+        );
+    }
+
+    // --- style-resolution: dangling base / dangling root style (spec §2.2, §4.2) ---------------
+
+    #[test]
+    fn a_base_that_resolves_in_the_workspace_index_is_silent() {
+        let styles = styles(&[("a.otui", "Base < UIWidget\n")]);
+        let lua = lua(&[]);
+        let ctx = WidgetContext {
+            styles: &styles,
+            lua: &lua,
+        };
+        let src = "Derived < Base\n";
+        let diags = analyze_with_widgets(src, &ctx);
+        assert!(diags.iter().all(|d| d.code != UNKNOWN_BASE), "{diags:?}");
+    }
+
+    #[test]
+    fn a_native_ui_prefixed_base_is_never_flagged() {
+        let styles = styles(&[]);
+        let lua = lua(&[]);
+        let ctx = WidgetContext {
+            styles: &styles,
+            lua: &lua,
+        };
+        let src = "MainWindow < UIWindow\n";
+        let diags = analyze_with_widgets(src, &ctx);
+        assert!(diags.iter().all(|d| d.code != UNKNOWN_BASE), "{diags:?}");
+    }
+
+    #[test]
+    fn a_base_declared_only_in_lua_is_not_flagged() {
+        // A widget class whose only declaration is a Lua module (an `extends` line with no
+        // `.otui` `Name < Base`, and not a `UI*`-prefixed name) must still resolve.
+        let styles = styles(&[]);
+        let lua = lua(&[("w.lua", "MyThing = extends(UIWidget, 'MyThing')\n")]);
+        let ctx = WidgetContext {
+            styles: &styles,
+            lua: &lua,
+        };
+        let src = "Derived < MyThing\n";
+        let diags = analyze_with_widgets(src, &ctx);
+        assert!(diags.iter().all(|d| d.code != UNKNOWN_BASE), "{diags:?}");
+    }
+
+    #[test]
+    fn a_dangling_base_is_a_warning_on_the_base_token_span() {
+        let styles = styles(&[]);
+        let lua = lua(&[]);
+        let ctx = WidgetContext {
+            styles: &styles,
+            lua: &lua,
+        };
+        let src = "Derived < Nonexistent\n";
+        let diags = analyze_with_widgets(src, &ctx);
+        let d = only(&diags, UNKNOWN_BASE);
+        assert_eq!(d.severity, Severity::Warning);
+        assert_eq!(&src[d.span.start..d.span.end], "Nonexistent");
+    }
+
+    #[test]
+    fn a_dangling_base_nested_in_a_widget_body_is_not_flagged() {
+        // Only *top-level* `Name < Base` headers are style declarations; a nested one is a
+        // child-widget instance, out of scope for this check.
+        let styles = styles(&[]);
+        let lua = lua(&[]);
+        let ctx = WidgetContext {
+            styles: &styles,
+            lua: &lua,
+        };
+        let src = "MainWindow < UIWindow\n  Inner < NoSuchBase\n";
+        let diags = analyze_with_widgets(src, &ctx);
+        assert!(diags.iter().all(|d| d.code != UNKNOWN_BASE), "{diags:?}");
+    }
+
+    #[test]
+    fn a_style_only_file_with_no_root_instance_is_silent() {
+        // Only `Name < Base` declarations, no bare-tag instance node — a valid "style-only" file
+        // (spec §4.2): neither check fires, even when the base is dangling (covered separately).
+        let styles = styles(&[]);
+        let lua = lua(&[]);
+        let ctx = WidgetContext {
+            styles: &styles,
+            lua: &lua,
+        };
+        let src = "MainWindow < UIWindow\nButton < UIButton\n";
+        let diags = analyze_with_widgets(src, &ctx);
+        assert!(
+            diags.iter().all(|d| d.code != UNKNOWN_ROOT_STYLE),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn the_root_instance_resolving_is_silent() {
+        let styles = styles(&[("a.otui", "Base < UIWidget\n")]);
+        let lua = lua(&[]);
+        let ctx = WidgetContext {
+            styles: &styles,
+            lua: &lua,
+        };
+        let src = "Base\n  id: main\n";
+        let diags = analyze_with_widgets(src, &ctx);
+        assert!(
+            diags.iter().all(|d| d.code != UNKNOWN_ROOT_STYLE),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_root_instance_is_an_error_on_the_tag_span() {
+        let styles = styles(&[]);
+        let lua = lua(&[]);
+        let ctx = WidgetContext {
+            styles: &styles,
+            lua: &lua,
+        };
+        let src = "NoSuchWidget\n  id: main\n";
+        let diags = analyze_with_widgets(src, &ctx);
+        let d = only(&diags, UNKNOWN_ROOT_STYLE);
+        assert_eq!(d.severity, Severity::Error);
+        assert_eq!(&src[d.span.start..d.span.end], "NoSuchWidget");
+    }
+
+    #[test]
+    fn a_native_root_instance_is_never_flagged() {
+        let styles = styles(&[]);
+        let lua = lua(&[]);
+        let ctx = WidgetContext {
+            styles: &styles,
+            lua: &lua,
+        };
+        let src = "UIWidget\n  id: main\n";
+        let diags = analyze_with_widgets(src, &ctx);
+        assert!(
+            diags.iter().all(|d| d.code != UNKNOWN_ROOT_STYLE),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn plain_analyze_without_a_workspace_context_never_produces_style_resolution_diagnostics() {
+        // `analyze` (no `ctx`) cannot tell "unresolved" from "resolves cross-file", so it must
+        // never invent either diagnostic — behaviour is unchanged from before this check existed.
+        let src = "Derived < Nonexistent\nNoSuchWidget\n  id: main\n";
+        let diags = analyze(src);
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.code != UNKNOWN_BASE && d.code != UNKNOWN_ROOT_STYLE),
+            "{diags:?}"
         );
     }
 }
