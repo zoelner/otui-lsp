@@ -2371,11 +2371,20 @@ impl Backend {
             .get(&uri)
             .map(|doc| doc.text.clone())?;
 
-        // Map the cursor Position to a byte offset, then ask the engine for the closed set that
-        // applies. An empty list is a valid answer (no closed-set context here); return it as such
-        // rather than `None`, which some clients treat as "retry".
+        // Map the cursor Position to a byte offset, then ask the engine (widget-aware, so a `UITable`
+        // offers its Lua-added `column-style` etc.) for the set that applies. An empty list is a
+        // valid answer (no context here); return it as such rather than `None`, which some clients
+        // treat as "retry".
         let offset = LineIndex::new(&text).offset_at(position, encoding);
-        let items = convert::completions_to_lsp(&self.service.complete_at(&text, offset));
+        let items = {
+            let styles = self.style_index.read().expect("style_index lock poisoned");
+            let lua = self.lua_index.read().expect("lua_index lock poisoned");
+            convert::completions_to_lsp(
+                &self
+                    .service
+                    .complete_with_widgets(&text, offset, &styles, &lua),
+            )
+        };
         Some(CompletionResponse::Array(items))
     }
 

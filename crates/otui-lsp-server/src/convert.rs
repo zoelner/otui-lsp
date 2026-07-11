@@ -208,6 +208,7 @@ fn completion_kind_to_lsp(kind: CoreCompletionKind) -> LspCompletionItemKind {
         CoreCompletionKind::Value => LspCompletionItemKind::VALUE,
         CoreCompletionKind::Event => LspCompletionItemKind::EVENT,
         CoreCompletionKind::Keyword => LspCompletionItemKind::KEYWORD,
+        CoreCompletionKind::Class => LspCompletionItemKind::CLASS,
     }
 }
 
@@ -219,6 +220,7 @@ pub fn completion_item_to_lsp(item: &CoreCompletionItem) -> LspCompletionItem {
         label: item.label.clone(),
         kind: Some(completion_kind_to_lsp(item.kind)),
         detail: item.detail.clone(),
+        sort_text: item.sort_text.clone(),
         ..LspCompletionItem::default()
     }
 }
@@ -445,6 +447,10 @@ mod tests {
             completion_kind_to_lsp(CoreCompletionKind::Keyword),
             LspCompletionItemKind::KEYWORD
         );
+        assert_eq!(
+            completion_kind_to_lsp(CoreCompletionKind::Class),
+            LspCompletionItemKind::CLASS
+        );
     }
 
     #[test]
@@ -453,11 +459,13 @@ mod tests {
             label: "hover".to_owned(),
             kind: CoreCompletionKind::EnumMember,
             detail: Some("state".to_owned()),
+            sort_text: Some("0_hover".to_owned()),
         };
         let lsp = completion_item_to_lsp(&core);
         assert_eq!(lsp.label, "hover");
         assert_eq!(lsp.kind, Some(LspCompletionItemKind::ENUM_MEMBER));
         assert_eq!(lsp.detail.as_deref(), Some("state"));
+        assert_eq!(lsp.sort_text.as_deref(), Some("0_hover"));
     }
 
     #[test]

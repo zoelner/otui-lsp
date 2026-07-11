@@ -191,8 +191,11 @@ pub enum CompletionKind {
     Value,
     /// An `@event` handler name.
     Event,
-    /// An OTML property **name** (from the generated property catalog).
+    /// An OTML property **name** (from the generated property catalog or a widget's Lua additions).
     Keyword,
+    /// A widget/style type usable as a nested child tag (a workspace `Name < Base` style, a Lua
+    /// widget class, or a native `UI*` base).
+    Class,
 }
 
 /// One completion candidate, protocol-agnostic (spec §6).
@@ -209,6 +212,10 @@ pub struct CompletionItem {
     pub kind: CompletionKind,
     /// A short human-readable hint (e.g. `"anchor edge"`), or `None`.
     pub detail: Option<String>,
+    /// An opaque ordering key overriding the client's alphabetic sort, or `None` to sort by `label`.
+    /// Used where several categories share one position (e.g. a widget's own Lua properties ranked
+    /// above the global catalog, above child-widget names) so the most relevant float to the top.
+    pub sort_text: Option<String>,
 }
 
 /// The contract every language backend implements. Kept intentionally minimal for now; symbols,
