@@ -106,8 +106,8 @@ struct Catalog {
     /// captured from the `rgb_to_abgr(0xRRGGBB)` literal in the engine's `kCss` table.
     named_colors: Vec<(String, u32)>,
     /// The legacy engine color statics (`const Color Color::NAME = 0xAABBGGRR;`, e.g. `red`, `teal`,
-    /// `darkPink`) as `(lowercased name, packed 0xRRGGBBAA)`, converted from the source's AABBGGRR
-    /// literal so alpha is preserved. Sorted by name.
+    /// `darkPink`) as `(exact engine spelling, packed 0xRRGGBBAA)`, converted from the source's
+    /// AABBGGRR literal so alpha is preserved. Sorted by name.
     legacy_colors: Vec<(String, u32)>,
     /// Legacy color names recognized by the engine but with no extractable RGB value (the
     /// `transparent` alias, matched as `key == "transparent"` in `css_lookup`) — kept names-only for
@@ -277,15 +277,18 @@ fn extract(src: &Path) -> Result<Catalog, String> {
     // the CSS table or the legacy statics — those extras are recognized but have no extractable RGB,
     // so they are membership-only (e.g. `transparent`).
     let name_re = Regex::new(r#"\b(?:tmp|key)\s*==\s*"([^"]+)""#).expect("valid color-name regex");
-    let valued: std::collections::HashSet<&str> = named_colors
+    // Compared case-insensitively purely as a *dedup* key: the legacy names now carry the engine's
+    // exact camelCase, so a case-sensitive membership test would let `darkPink` through as a
+    // "valueless" name and re-introduce the case-insensitive match this table exists to avoid.
+    let valued: std::collections::HashSet<String> = named_colors
         .iter()
         .chain(legacy_colors.iter())
-        .map(|(n, _)| n.as_str())
+        .map(|(n, _)| n.to_ascii_lowercase())
         .collect();
     let mut legacy_color_names: Vec<String> = Vec::new();
     for caps in name_re.captures_iter(&color_text) {
         let lower = caps[1].to_ascii_lowercase();
-        if !valued.contains(lower.as_str()) {
+        if !valued.contains(&lower) {
             legacy_color_names.push(lower);
         }
     }
@@ -439,14 +442,21 @@ fn extract_color_properties(stripped: &str) -> Vec<String> {
 }
 
 /// Extract the legacy engine color statics (`const Color Color::NAME = 0xAABBGGRR;`) as
-/// `(lowercased name, packed 0xRRGGBBAA)`, converting the source's AABBGGRR (little-endian channel)
-/// literal into RGBA so alpha survives. Sorted by name, de-duped (first wins).
+/// `(name, packed 0xRRGGBBAA)`, converting the source's AABBGGRR (little-endian channel) literal into
+/// RGBA so alpha survives. Sorted by name, de-duped (first wins).
+///
+/// The name keeps the engine's **exact** spelling (`darkRed`, `lightGray`, …), because the engine
+/// matches these statics case-**sensitively**: `Color::operator>>` compares `tmp == "darkRed"` before
+/// falling back to the case-insensitive CSS table. Lowercasing them here would erase that
+/// distinction — and it matters, because for eight of these names the CSS table holds a *different*
+/// RGB (legacy `green` is `0x00FF00`, CSS `green` is `0x008000`), so `darkred` and `darkRed` are two
+/// different colors in the engine.
 fn extract_legacy_colors(color_text: &str) -> Vec<(String, u32)> {
     let re = Regex::new(r#"const\s+Color\s+Color::(\w+)\s*=\s*0x([0-9A-Fa-f]+)U?\s*;"#)
         .expect("valid legacy-color regex");
     let mut out: Vec<(String, u32)> = Vec::new();
     for caps in re.captures_iter(color_text) {
-        let name = caps[1].to_ascii_lowercase();
+        let name = caps[1].to_string();
         // Parse the AABBGGRR literal, then repack as 0xRRGGBBAA.
         if let Ok(abgr) = u32::from_str_radix(&caps[2], 16) {
             let a = (abgr >> 24) & 0xFF;
@@ -571,7 +581,8 @@ fn render(catalog: &Catalog) -> String {
          //! * [`NAMED_COLORS`] — the CSS named-color table as `(name, 0xRRGGBB)` pairs, lowercased\n\
          //!   to match the engine's case-insensitive lookup. The packed value is the color's RGB.\n\
          //! * [`LEGACY_COLORS`] — the legacy engine color statics as `(name, 0xRRGGBBAA)` pairs\n\
-         //!   (alpha preserved), lowercased.\n\
+         //!   (alpha preserved), in the engine's **exact** spelling: it matches them\n\
+         //!   case-sensitively before falling back to the case-insensitive CSS table.\n\
          //! * [`LEGACY_COLOR_NAMES`] — recognized color names with no extractable RGB value (the\n\
          //!   `transparent` alias); membership only.\n\
          //!\n\
@@ -620,8 +631,10 @@ fn render(catalog: &Catalog) -> String {
     s.push_str(&render_pairs("NAMED_COLORS", &catalog.named_colors, 6));
     s.push('\n');
     s.push_str(
-        "/// Legacy engine color statics: `(lowercased name, packed 0xRRGGBBAA)` (alpha \
-         preserved).\n",
+        "/// Legacy engine color statics: `(exact engine spelling, packed 0xRRGGBBAA)` (alpha \
+         preserved).\n/// Matched **case-sensitively** — the engine compares `tmp == \"darkRed\"` \
+         before its case-insensitive\n/// CSS fallback, and for eight of these names the CSS table \
+         holds a different RGB.\n",
     );
     s.push_str(&render_pairs("LEGACY_COLORS", &catalog.legacy_colors, 8));
     s.push('\n');

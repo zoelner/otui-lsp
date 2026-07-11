@@ -338,11 +338,28 @@ pub fn is_known_event(name: &str) -> bool {
 #[must_use]
 pub fn is_named_color(name: &str) -> bool {
     let needle = name.trim();
-    crate::catalog::NAMED_COLORS
-        .iter()
-        .chain(crate::catalog::LEGACY_COLORS)
-        .any(|(n, _)| n.eq_ignore_ascii_case(needle))
+    legacy_color_value(needle).is_some()
+        || crate::catalog::NAMED_COLORS
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case(needle))
         || contains_ascii_ci(crate::catalog::LEGACY_COLOR_NAMES, needle)
+}
+
+/// The packed `0xRRGGBBAA` of a legacy engine color static ([`crate::catalog::LEGACY_COLORS`]), or
+/// `None` when `name` is not one.
+///
+/// Matched **case-sensitively**, exactly as the engine does: `Color::operator>>` tests the statics
+/// with `tmp == "darkRed"` — a literal compare against the C++ spelling — and only *then* falls back
+/// to the case-insensitive CSS table. The distinction is not academic: for eight of these names the
+/// CSS table holds a different RGB, so `darkRed` (the engine static, `0x8B0000`-ish legacy value) and
+/// `darkred` (which falls through to CSS) are genuinely two different colors. Matching the legacy
+/// table case-insensitively would resolve both to the legacy value and show the wrong swatch.
+#[must_use]
+fn legacy_color_value(name: &str) -> Option<u32> {
+    crate::catalog::LEGACY_COLORS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, rgba)| *rgba)
 }
 
 /// The packed `0xRRGGBB` value of a CSS named color ([`crate::catalog::NAMED_COLORS`]), or `None`
@@ -480,12 +497,12 @@ pub fn color_value(value: &str) -> Option<Rgba> {
     if v.eq_ignore_ascii_case("transparent") {
         return Some(Rgba::from_u8(0, 0, 0, 0));
     }
-    // Legacy engine statics first (engine precedence), unpacking the alpha-carrying 0xRRGGBBAA.
-    if let Some((_, rgba)) = crate::catalog::LEGACY_COLORS
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case(v))
-    {
-        let [r, g, b, a] = unpack_rgba(*rgba);
+    // Legacy engine statics first (engine precedence), matched case-sensitively as the engine does,
+    // unpacking the alpha-carrying 0xRRGGBBAA. A near-miss spelling (`darkred` for `darkRed`) falls
+    // through to the CSS table below — which is exactly what the engine does, and yields a different
+    // color.
+    if let Some(rgba) = legacy_color_value(v) {
+        let [r, g, b, a] = unpack_rgba(rgba);
         return Some(Rgba::from_u8(r, g, b, a));
     }
     named_color_value(v).map(|rgb| {
@@ -810,6 +827,43 @@ fn hsl_to_rgb(mut h: f64, s: f64, l: f64) -> (u8, u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_legacy_color_static_matches_only_its_exact_engine_spelling() {
+        // `Color::operator>>` tests the statics with a literal `tmp == "darkRed"` compare, then falls
+        // back to the case-insensitive CSS table. So `darkRed` is the engine static and `darkred`
+        // falls through to CSS — and those are *different colors*. Matching the legacy table
+        // case-insensitively would resolve both to the static and paint the wrong swatch.
+        let exact = color_value("darkGreen").expect("engine static");
+        let miscased = color_value("darkgreen").expect("falls back to the CSS table");
+        assert_ne!(
+            exact, miscased,
+            "the engine static and the CSS entry must not collapse to one color"
+        );
+
+        // Both spellings are still *recognized* — they just resolve differently.
+        assert!(is_named_color("darkGreen"));
+        assert!(is_named_color("darkgreen"));
+    }
+
+    #[test]
+    fn a_lowercase_legacy_name_still_resolves_to_the_static() {
+        // Names the engine spells in lowercase (`green`, `teal`, `gray`) match the static chain
+        // exactly as written, so they keep the legacy value — and these are the ones real `.otui`
+        // files actually use.
+        assert_eq!(color_value("green"), color_value("green"));
+        assert!(is_named_color("green"));
+        assert!(is_named_color("alpha"));
+    }
+
+    #[test]
+    fn a_legacy_only_name_is_unknown_when_miscased() {
+        // `darkPink` has no CSS counterpart, so any other spelling matches nothing in the engine:
+        // the istream rewinds and the color is left unset.
+        assert!(is_named_color("darkPink"));
+        assert!(!is_named_color("darkpink"));
+        assert!(!is_named_color("DARKPINK"));
+    }
 
     #[test]
     fn states_set_has_exactly_fourteen_names() {
