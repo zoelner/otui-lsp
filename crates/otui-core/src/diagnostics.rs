@@ -1299,6 +1299,30 @@ Panel
     }
 
     #[test]
+    fn a_compound_state_selector_is_valid() {
+        // The engine splits the tag after `$` on SPACES and requires every state to match
+        // (`uiwidget.cpp`: `stdext::split(statesStr, " ")`), so `$pressed disabled:` is a
+        // conjunction — pressed AND disabled — and each token may carry its own `!`. This shape is
+        // all over the engine's own `data/styles/`; the grammar used to reject it as a syntax error.
+        for src in [
+            "Button\n  $pressed disabled:\n    color: #111111\n",
+            "Button\n  $checked hover !disabled:\n    color: #222222\n",
+            "Button\n  $first on:\n    color: #333333\n",
+        ] {
+            assert!(analyze(src).is_empty(), "{src:?} -> {:?}", analyze(src));
+        }
+    }
+
+    #[test]
+    fn the_states_of_a_compound_selector_are_still_validated() {
+        // Accepting the shape must not stop us checking the names in it.
+        let src = "Button\n  $bogus disabled:\n    color: #111111\n";
+        let diags = analyze(src);
+        let d = only(&diags, UNKNOWN_STATE);
+        assert_eq!(&src[d.span.start..d.span.end], "bogus");
+    }
+
+    #[test]
     fn a_style_meta_key_is_not_an_unknown_property() {
         // `__class:` re-roots the widget class and is read by the engine's style manager
         // (`styleNode->valueAt("__class")`); `__unique` likewise. Neither goes through the widget

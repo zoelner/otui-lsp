@@ -138,7 +138,16 @@
           "value": "$"
         },
         {
-          "type": "REPEAT1",
+          "type": "ALIAS",
+          "content": {
+            "type": "SYMBOL",
+            "name": "_head_state"
+          },
+          "named": true,
+          "value": "state"
+        },
+        {
+          "type": "REPEAT",
           "content": {
             "type": "SYMBOL",
             "name": "state"
@@ -160,6 +169,51 @@
               "name": "_block"
             }
           ]
+        }
+      ]
+    },
+    "_head_state": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "FIELD",
+              "name": "negated",
+              "content": {
+                "type": "ALIAS",
+                "content": {
+                  "type": "IMMEDIATE_TOKEN",
+                  "content": {
+                    "type": "STRING",
+                    "value": "!"
+                  }
+                },
+                "named": true,
+                "value": "state_negation"
+              }
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
+          "type": "FIELD",
+          "name": "name",
+          "content": {
+            "type": "ALIAS",
+            "content": {
+              "type": "IMMEDIATE_TOKEN",
+              "content": {
+                "type": "PATTERN",
+                "value": "[A-Za-z_][A-Za-z0-9_\\-]*"
+              }
+            },
+            "named": true,
+            "value": "state_name"
+          }
         }
       ]
     },
@@ -193,11 +247,8 @@
           "content": {
             "type": "ALIAS",
             "content": {
-              "type": "IMMEDIATE_TOKEN",
-              "content": {
-                "type": "PATTERN",
-                "value": "[A-Za-z_][A-Za-z0-9_\\-]*"
-              }
+              "type": "PATTERN",
+              "value": "[A-Za-z_][A-Za-z0-9_\\-]*"
             },
             "named": true,
             "value": "state_name"

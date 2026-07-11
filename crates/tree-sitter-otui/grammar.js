@@ -111,16 +111,29 @@ module.exports = grammar({
     style_base: $ => token(/\S([^\n]*\S)?/),
 
     // --- $state selector block (§2.8) ---------------------------------------
+    // The engine takes the tag after `$` and splits it on SPACES, requiring every
+    // state to match (`uiwidget.cpp`: `stdext::split(statesStr, " ")`, then `match
+    // &= ...` per token). So `$pressed disabled:` is a conjunction — pressed AND
+    // disabled — and each token may independently carry a `!` negation.
+    //
+    // The first state binds tight to the `$` (`$pressed`, `$!on`); the ones after it
+    // are separated by whitespace, so their name must NOT be `token.immediate`.
     state_selector: $ => seq(
       '$',
-      repeat1($.state),
+      alias($._head_state, $.state),
+      repeat($.state),
       ':',
       choice($._newline, $._block),
     ),
 
+    _head_state: $ => seq(
+      optional(field('negated', alias(token.immediate('!'), $.state_negation))),
+      field('name', alias(token.immediate(IDENT), $.state_name)),
+    ),
+
     state: $ => seq(
       optional(field('negated', alias('!', $.state_negation))),
-      field('name', alias(token.immediate(IDENT), $.state_name)),
+      field('name', alias(IDENT, $.state_name)),
     ),
 
     // --- @tag: / &tag: / !tag: Lua-bearing properties (§2.5-2.7) ------------
