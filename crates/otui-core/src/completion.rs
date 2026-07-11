@@ -106,9 +106,18 @@ pub fn complete_at_with_widgets(
         return Vec::new();
     }
 
+    // Parse once and share the tree with the CST-consulting steps below (the block-scalar/comment
+    // suppression check and, for the indented slot, the enclosing-widget lookup) — completion runs
+    // per keystroke, so a single parse per request matters. A parse failure degrades gracefully:
+    // nothing is suppressed and no enclosing widget is found.
+    let tree = SyntaxTree::parse(source);
+
     // A `|` block-scalar body is raw Lua/text: a line inside it may start with `$`/`@` yet is not
     // OTML markup, so suppress there. This is the only place the CST is consulted (see module docs).
-    if in_suppressed_context(source, offset) {
+    if tree
+        .as_ref()
+        .is_some_and(|t| in_suppressed_context(t, offset))
+    {
         return Vec::new();
     }
 
@@ -124,10 +133,32 @@ pub fn complete_at_with_widgets(
         Some(Context::IndentedSlot) if !diagnostics::line_indentation_is_valid(source, offset) => {
             Vec::new()
         }
-        Some(Context::IndentedSlot) => indented_slot_items(source, offset, styles, lua),
+        // An empty slot sitting *before* an existing special-form token ($state / @event / anchors. /
+        // &alias / !expr / `-` list) is not a property/widget position: the line's real content is a
+        // special form the (empty) prefix cannot see. Offer nothing rather than the wrong union.
+        Some(Context::IndentedSlot)
+            if prefix.trim().is_empty() && rest_of_line_is_special_form(source, offset) =>
+        {
+            Vec::new()
+        }
+        Some(Context::IndentedSlot) => {
+            indented_slot_items(tree.as_ref(), source, offset, styles, lua)
+        }
         Some(context) => items_for(context, source, offset),
         None => Vec::new(),
     }
+}
+
+/// Whether the current line, from `offset` to its end, begins (after whitespace) with a non-property
+/// special form — a `$state` selector, `@event`, `anchors.` object, `&alias`, `!expr`, or `-` list
+/// item. Used to keep an empty indented slot from offering the property/widget union when the line's
+/// real content (which the empty line prefix cannot see) is one of those.
+fn rest_of_line_is_special_form(source: &str, offset: usize) -> bool {
+    let line_end = source[offset..]
+        .find('\n')
+        .map_or(source.len(), |nl| offset + nl);
+    let rest = source[offset..line_end].trim_start();
+    rest.starts_with(['$', '@', '&', '!', '-']) || rest.starts_with("anchors.")
 }
 
 /// Build the union offered in an indented statement slot — the grammatically-ambiguous position that
@@ -145,6 +176,7 @@ pub fn complete_at_with_widgets(
 /// free: catalog/Lua properties are lowercase, widget names are capitalized, so typing one letter
 /// filters to the intended family.
 fn indented_slot_items(
+    tree: Option<&SyntaxTree>,
     source: &str,
     offset: usize,
     styles: &StyleIndex,
@@ -165,7 +197,7 @@ fn indented_slot_items(
     };
 
     // 1. The enclosing widget's Lua-added properties (ranked first — most specific to this widget).
-    if let Some(widget) = enclosing_widget_type(source, offset) {
+    if let Some(widget) = tree.and_then(|t| enclosing_widget_type(t, source, offset)) {
         let ancestry = widget_resolve::resolve_ancestry(&widget, styles, lua);
         for prop in ancestry.custom_properties(lua) {
             push(prop, CompletionKind::Keyword, "lua property", '0');
@@ -214,8 +246,7 @@ fn widget_names(styles: &StyleIndex, lua: &LuaWidgetIndex) -> Vec<(String, &'sta
 /// lowercase word with no `:` yet is grammatically a widget tag), which is **not** the enclosing
 /// widget — it is the property being typed. So any candidate widget that starts on the cursor's line
 /// is skipped; only a widget declared on an earlier line is a genuine encloser.
-fn enclosing_widget_type(source: &str, offset: usize) -> Option<String> {
-    let tree = SyntaxTree::parse(source)?;
+fn enclosing_widget_type(tree: &SyntaxTree, source: &str, offset: usize) -> Option<String> {
     let line_start = source[..offset].rfind('\n').map_or(0, |nl| nl + 1);
     let lo = offset.saturating_sub(1);
     let mut node = tree.root().descendant_for_byte_range(lo, offset)?;
@@ -512,10 +543,7 @@ fn set_items(set: &[&str], kind: CompletionKind, detail: &str) -> Vec<Completion
 /// True if `offset` sits inside a raw region where OTML completion must not fire — a `|` block-scalar
 /// body or a full-line comment. Best-effort: a parse failure (practically unreachable) is treated as
 /// "not suppressed" so the prefix classifier still runs.
-fn in_suppressed_context(source: &str, offset: usize) -> bool {
-    let Some(tree) = SyntaxTree::parse(source) else {
-        return false;
-    };
+fn in_suppressed_context(tree: &SyntaxTree, offset: usize) -> bool {
     // Probe the byte just before the cursor (the char last typed) through the cursor, so a cursor at
     // the very end of a block-scalar line still lands inside its content node.
     let lo = offset.saturating_sub(1);
@@ -1093,6 +1121,29 @@ Window < UIWindow
         let got = labels(&items);
         assert!(got.contains(&"width".to_owned()), "catalog present");
         assert!(got.contains(&"Button".to_owned()), "widget names present");
+    }
+
+    #[test]
+    fn empty_slot_before_a_special_form_offers_nothing() {
+        // The cursor sits at the start of a line whose real content is a `$state` / `@event` /
+        // `anchors.` token (the empty prefix cannot see it). The property/widget union must NOT fire
+        // there — offer nothing rather than the wrong set.
+        let styles = styles(&[("lib.otui", "Button < UIButton\n")]);
+        let lua = lua(&[]);
+        for line in [
+            "$hover",
+            "@onClick: x",
+            "anchors.top: parent",
+            "&alias: 1",
+            "- item",
+        ] {
+            let src = format!("Button\n  {line}\n");
+            let offset = src.find(line).expect("token present"); // cursor before the token
+            assert!(
+                complete_at_with_widgets(&src, offset, &styles, &lua).is_empty(),
+                "empty slot before `{line}` must offer nothing"
+            );
+        }
     }
 
     #[test]
