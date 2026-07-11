@@ -8,8 +8,8 @@
 //! Behavior is a faithful mirror of the real OTClient engine (opentibiabr), per the spec vendored at
 //! `docs/otui-language-service-spec.md`. The [`syntax`] tree-sitter substrate underpins every
 //! feature module: [`diagnostics`], [`completion`], [`hover`], [`property_hover`], [`symbols`],
-//! [`navigation`], [`references`], [`hierarchy`], [`format`], [`folding`], [`semantic`], [`colors`],
-//! [`links`], [`fixes`], plus the workspace-index building blocks ([`style_index`], [`lua_widgets`],
+//! [`navigation`], [`references`], [`hierarchy`], [`format`], [`indent`], [`folding`], [`semantic`],
+//! [`colors`], [`links`], [`fixes`], plus the workspace-index building blocks ([`style_index`], [`lua_widgets`],
 //! [`widget_resolve`]) and the engine data ([`schema`], [`catalog`]). The [`LanguageService`] trait
 //! and the inherent [`OtuiService`] methods below are the entry points the server drives.
 
@@ -22,6 +22,7 @@ pub mod folding;
 pub mod format;
 pub mod hierarchy;
 pub mod hover;
+pub mod indent;
 pub mod links;
 pub mod lua_widgets;
 pub mod navigation;
@@ -291,6 +292,22 @@ impl OtuiService {
         end_line: u32,
     ) -> Option<Vec<format::LineEdit>> {
         format::format_line_edits(source, start_line, end_line)
+    }
+
+    /// The number of leading spaces line `line` (0-based) should have, for
+    /// `textDocument/onTypeFormatting` fired the instant Enter is pressed (spec §8). Unlike
+    /// [`format`](Self::format) / [`format_line_edits`](Self::format_line_edits), this carries **no**
+    /// parse-cleanliness gate: it is computed purely lexically from the preceding lines, so it keeps
+    /// answering on exactly the mid-edit, broken document a fresh Enter always produces. Returns
+    /// [`None`] when reindenting would be wrong or destructive — inside a block-scalar body, or when
+    /// the line (or the line it would compute from) is tab-indented — in which case the server makes
+    /// no edit. See [`indent::indent_for_line`] for the full rule.
+    ///
+    /// Inherent (not on the [`LanguageService`] trait) so the protocol-agnostic trait stays minimal,
+    /// mirroring [`format_line_edits`](Self::format_line_edits).
+    #[must_use]
+    pub fn indent_for_line(&self, source: &str, line: u32) -> Option<usize> {
+        indent::indent_for_line(source, line)
     }
 
     /// Compute the folding ranges for `source` (spec §2): one collapsible region per multi-line
