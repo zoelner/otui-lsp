@@ -224,9 +224,12 @@ fn parse_connect_style_hooks(lines: &[&str]) -> Vec<(String, String)> {
                 out.push((class.clone(), handler));
                 break;
             }
-            // Stop at the end of this table. Checked *after* the entry test so a single-line
-            // `connect(C, { onStyleApply = h })` still resolves.
-            if offset > 0 && hook_line.trim_start().starts_with('}') {
+            // Stop at the end of this table — a `}` anywhere on the line closes it. Checked *after*
+            // the entry test, so a single-line `connect(C, {onStyleApply = h})` still resolves; and
+            // applied on the `connect(` line itself, so a hookless single-line
+            // `connect(C, {onHoverChange = f})` stops here rather than running on and adopting some
+            // later table's `onStyleApply`.
+            if hook_line.contains('}') {
                 break;
             }
         }
@@ -797,6 +800,28 @@ end
             defs.iter()
                 .all(|d| d.name != "UIButton" || d.custom_props.is_empty()),
             "the later hook leaked onto UIButton: {defs:?}"
+        );
+    }
+
+    #[test]
+    fn a_hookless_inline_connect_does_not_adopt_a_later_handler() {
+        // A single-line `connect(A, {...})` with no style hook closes its table on that same line.
+        // Scanning past it would let an unrelated later `onStyleApply = ...` be attributed to A.
+        let src = "\
+local function h(widget, styleName, styleNode)
+    if styleNode.tooltip then widget.tooltip = styleNode.tooltip end
+end
+
+function m.init()
+    connect(UIButton, { onHoverChange = f, onDestroy = g })
+    local handlers = { onStyleApply = h }
+end
+";
+        let defs = scan_widgets(src);
+        assert!(
+            defs.iter()
+                .all(|d| d.name != "UIButton" || d.custom_props.is_empty()),
+            "the later table's handler leaked onto UIButton: {defs:?}"
         );
     }
 

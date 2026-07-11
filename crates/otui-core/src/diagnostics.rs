@@ -683,9 +683,6 @@ fn check_property(
         // `map_or(true, …)` rather than `Option::is_none_or` — the latter is only stable since Rust
         // 1.82, but the workspace MSRV is 1.75.
         .any(|child| child.id() != key.id() && value.map_or(true, |v| child.id() != v.id()));
-    if has_block {
-        return;
-    }
     let name = slice(source, key);
     // A key nested directly under a `layout:` block is read by the *layout object*
     // (`UIBoxLayout`/`UIGridLayout`/…`::applyStyle`), not the widget style parser, so it lives in its
@@ -696,21 +693,28 @@ fn check_property(
     // (a bare `cell-size:` on a widget really is unknown), and conversely a widget property is not
     // valid inside a `layout:` block, so the block context replaces the widget check rather than
     // adding to it.
-    if let Some(block) = enclosing_block_key(node, source) {
-        if block == "layout" {
-            if schema::is_layout_block_property(name) {
-                return;
-            }
-            out.push(Diagnostic {
-                severity: Severity::Hint,
-                code: UNKNOWN_PROPERTY,
-                message: format!(
-                    "unknown layout property `{name}`: ignored by the engine, has no effect"
-                ),
-                span: SyntaxTree::span_of(key),
-            });
+    //
+    // Checked **before** the `has_block` skip, too. That skip exists because a container-form
+    // property is a child-widget group or a list parent, never a leaf style property — but *inside* a
+    // `layout:` block there is no such shape: every key a layout reads is a leaf. A block-shaped key
+    // there is read by nobody, so it is unknown like any other, and letting `has_block` swallow it
+    // would leave a hole in an otherwise exclusive check.
+    if enclosing_block_key(node, source) == Some("layout") {
+        if schema::is_layout_block_property(name) {
             return;
         }
+        out.push(Diagnostic {
+            severity: Severity::Hint,
+            code: UNKNOWN_PROPERTY,
+            message: format!(
+                "unknown layout property `{name}`: ignored by the engine, has no effect"
+            ),
+            span: SyntaxTree::span_of(key),
+        });
+        return;
+    }
+    if has_block {
+        return;
     }
     if schema::is_known_property(name) {
         return;
@@ -1503,6 +1507,20 @@ Panel
         let d = only(&diags, UNKNOWN_PROPERTY);
         assert_eq!(d.severity, Severity::Hint);
         assert_eq!(&src[d.span.start..d.span.end], "cell-siz");
+    }
+
+    #[test]
+    fn a_block_shaped_key_inside_a_layout_block_is_still_hinted() {
+        // Every key a layout reads is a leaf, so a *container-form* key inside `layout:` is read by
+        // nobody. The generic `has_block` skip (which exists for child-widget groups and list
+        // parents) must not swallow it, or the layout check stops being exclusive.
+        let src = "Panel\n  layout:\n    type: grid\n    bogus:\n      x: 1\n";
+        let diags = analyze(src);
+        let d = diags
+            .iter()
+            .find(|d| d.code == UNKNOWN_PROPERTY && &src[d.span.start..d.span.end] == "bogus")
+            .unwrap_or_else(|| panic!("`bogus` must be hinted: {diags:?}"));
+        assert_eq!(d.severity, Severity::Hint);
     }
 
     #[test]

@@ -45,7 +45,7 @@ pub fn run(root: &Path) {
                 continue;
             }
             let prop = src[d.span.start..d.span.end].to_string();
-            let w = enclosing_widget(&src, d.span.start).unwrap_or_else(|| "?".into());
+            let w = enclosing_widget(&src, d.span.start, &styles).unwrap_or_else(|| "?".into());
             *pairs.entry((prop, w)).or_default() += 1;
         }
     }
@@ -62,26 +62,37 @@ pub fn run(root: &Path) {
     }
 }
 
-/// The nearest enclosing widget — mirroring the rule `diagnostics` resolves a property against: a
-/// `container`'s `tag`, or a `style_header`'s **declared name** (falling back to its `base`).
+/// The nearest enclosing widget, resolved by **exactly** the rule `diagnostics` uses to decide what a
+/// property is checked against: a `container`'s `tag`; a `style_header`'s declared **name** when the
+/// style index knows it, else its `base`.
 ///
 /// The name, not the base: `diagnostics` seeds a style body from the declared name so a `__class:`
-/// re-root in that body applies. Reporting the base here would label a finding inside
-/// `SpinBox < TextEdit` as `TextEdit` — misattributing it to the wrong widget, which is exactly the
-/// column this report exists to get right.
-fn enclosing_widget(src: &str, offset: usize) -> Option<String> {
+/// re-root in that body applies. Reporting the base would label a finding inside `SpinBox < TextEdit`
+/// as `TextEdit` — misattributing it to the wrong widget, which is the one column this report exists
+/// to get right. And the index check, not a bare preference for the name: an un-indexed header falls
+/// back to the base in `diagnostics`, so mirroring that keeps the label honest about which widget the
+/// property was actually judged against.
+fn enclosing_widget(src: &str, offset: usize, styles: &StyleIndex) -> Option<String> {
     let tree = SyntaxTree::parse(src)?;
     let mut node = tree.root().descendant_for_byte_range(offset, offset)?;
     loop {
-        let fields: &[&str] = match node.kind() {
-            "container" => &["tag"],
-            "style_header" => &["name", "base"],
-            _ => &[],
+        let text = |field: &str| {
+            node.child_by_field_name(field)
+                .map(|n| src[n.start_byte()..n.end_byte()].trim().to_string())
         };
-        for field in fields {
-            if let Some(n) = node.child_by_field_name(field) {
-                return Some(src[n.start_byte()..n.end_byte()].trim().to_string());
+        match node.kind() {
+            "container" => {
+                if let Some(tag) = text("tag") {
+                    return Some(tag);
+                }
             }
+            "style_header" => {
+                let name = text("name").filter(|n| !styles.lookup(n).is_empty());
+                if let Some(w) = name.or_else(|| text("base")) {
+                    return Some(w);
+                }
+            }
+            _ => {}
         }
         node = node.parent()?;
     }
