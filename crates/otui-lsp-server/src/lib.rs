@@ -1662,13 +1662,15 @@ impl Backend {
                 // Completion: the OTML closed sets (spec §6). `$` / `@` / `.` / `!` re-trigger
                 // completion as those characters open a `$state` selector, an `@event` key, an
                 // `anchors.<edge>` / `<target>.<edge>` dotted position, or a `!`-negated state in a
-                // multi-state selector (`$hover !…`).
+                // multi-state selector (`$hover !…`); `:` opens the value position of a `key: value`
+                // property (offering the `display`/`layout` keyword set or the named-color list).
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![
                         "$".to_owned(),
                         "@".to_owned(),
                         ".".to_owned(),
                         "!".to_owned(),
+                        ":".to_owned(),
                     ]),
                     ..CompletionOptions::default()
                 }),
@@ -4383,6 +4385,19 @@ end
         let t = property_hover_text("Panel\n  color: red\n", "color");
         // Curated behavior for color describes the draw color.
         assert!(t.contains("**`color`**") && t.contains("draw color"), "{t}");
+    }
+
+    #[test]
+    fn hover_on_a_known_uncurated_property_uses_the_value_kind_fallback() {
+        // `min-width` is a real catalog property with no curated doc → the plain value-kind fallback.
+        let t = property_hover_text("Panel\n  min-width: 10\n", "min-width");
+        assert!(
+            t.contains("**`min-width`**") && t.contains("OTUI style property"),
+            "{t}"
+        );
+        // `border-color-bottom` is a color property with no curated doc → the color-value fallback.
+        let t2 = property_hover_text("Panel\n  border-color-bottom: red\n", "border-color-bottom");
+        assert!(t2.contains("a color value"), "{t2}");
     }
 
     /// The [`CodeAction`] inside a [`CodeActionOrCommand`] (panics if it is a bare command).

@@ -17,10 +17,16 @@
 //!   Lua-added properties (resolved cross-file via [`widget_resolve`]), and
 //! * child **widget** names — workspace `.otui` styles, Lua widget classes, and native `UI*` bases.
 //!
-//! **Deliberately out of scope** (returns an empty vec): property **values** — color names/forms and
-//! per-property value enums. Color completion needs per-property color-type metadata the catalog does
-//! not carry, so it is deferred until that metadata exists; likewise value enums. When no set applies,
-//! this returns nothing — never a guess.
+//! plus **property values** for the fixed-value-set properties:
+//!
+//! * after `display:` / `layout:` — the keyword set ([`schema::DISPLAY_VALUES`] /
+//!   [`schema::LAYOUT_TYPES`]), and after a color property (`color:`, `background-color:`, …) — the
+//!   named-color list ([`catalog::NAMED_COLORS`]). The property's value kind comes from the audited
+//!   [`property_hover::classify_value`].
+//!
+//! **Deliberately out of scope** (returns an empty vec): **freeform** property values — a number, an
+//! asset path, the `border` shorthand, or an arbitrary string offer nothing (there is no closed set
+//! to complete). When no set applies, this returns nothing — never a guess.
 //!
 //! No I/O and no `lsp-types`: byte offsets in, [`CompletionItem`]s out. The workspace-aware slot reads
 //! the in-memory style + Lua indexes ([`complete_at_with_widgets`]); [`complete_at`] passes empty ones.
@@ -50,6 +56,7 @@
 use crate::catalog;
 use crate::diagnostics;
 use crate::lua_widgets::LuaWidgetIndex;
+use crate::property_hover;
 use crate::schema;
 use crate::style_index::StyleIndex;
 use crate::syntax::SyntaxTree;
@@ -73,6 +80,10 @@ enum Context {
     /// ambiguous between a **property key** and a nested **child widget**, so offer the union —
     /// catalog + the widget's Lua properties + child-widget names — ranked, and let the client filter.
     IndentedSlot,
+    /// In the **value** position of an ordinary `key: value` property whose value is a fixed set:
+    /// offer that set (`display`/`layout` keywords, or named colors for a color property). The string
+    /// is the property key. A freeform-valued property yields nothing.
+    PropertyValue(String),
 }
 
 /// Compute the completion candidates for the cursor at byte `offset` in `source` (spec §6).
@@ -143,6 +154,13 @@ pub fn complete_at_with_widgets(
         }
         Some(Context::IndentedSlot) => {
             indented_slot_items(tree.as_ref(), source, offset, styles, lua)
+        }
+        // A property value on a structurally-invalid line (tab/odd/depth-jump) is not offered, same
+        // gate as the key slot.
+        Some(Context::PropertyValue(_))
+            if !diagnostics::line_indentation_is_valid(source, offset) =>
+        {
+            Vec::new()
         }
         Some(context) => items_for(context, source, offset),
         None => Vec::new(),
@@ -334,6 +352,24 @@ fn classify(prefix: &str) -> Option<Context> {
         };
     }
 
+    // A `key: value` property with the cursor past the `:` → the value position for that key. The
+    // engine splits on the first `:`, so the key is everything before it. Only an indented line is a
+    // property (a top-level word is a `Name < Base` header). Which values (if any) apply is resolved
+    // downstream from the property's value kind.
+    if let Some(colon) = trimmed.find(':') {
+        if indent.is_empty() {
+            return None;
+        }
+        // A `$variable` reference in the value is not a literal from the property's fixed set, so
+        // offer nothing there (the client is typing a variable name, not a `display`/color value).
+        if trimmed[colon + 1..].trim_start().starts_with('$') {
+            return None;
+        }
+        return Some(Context::PropertyValue(
+            trimmed[..colon].trim_end().to_owned(),
+        ));
+    }
+
     // An indented statement slot — a property key or a nested child widget being typed.
     classify_indented_slot(indent, trimmed)
 }
@@ -429,6 +465,29 @@ fn items_for(context: Context, source: &str, offset: usize) -> Vec<CompletionIte
         Context::IndentedSlot => {
             unreachable!("IndentedSlot is handled in complete_at_with_widgets")
         }
+        Context::PropertyValue(key) => property_value_items(&key),
+    }
+}
+
+/// The completion values for the value position of property `key`, from its audited value kind
+/// ([`property_hover::classify_value`]): the `display`/`layout` keyword set, or the named-color list
+/// for a color property. A freeform-valued property (a number, a path, the `border` shorthand, an
+/// arbitrary string, or an unknown key) offers nothing.
+fn property_value_items(key: &str) -> Vec<CompletionItem> {
+    match property_hover::classify_value(key) {
+        property_hover::PropertyValueKind::Enum { values } => {
+            set_items(values, CompletionKind::EnumMember, "value")
+        }
+        property_hover::PropertyValueKind::Color => catalog::NAMED_COLORS
+            .iter()
+            .map(|(name, _)| CompletionItem {
+                label: (*name).to_owned(),
+                kind: CompletionKind::Value,
+                detail: Some("named color".to_owned()),
+                sort_text: None,
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -656,17 +715,49 @@ mod tests {
     }
 
     #[test]
-    fn plain_property_value_offers_nothing() {
-        // After the `:` we are in VALUE position — property-value/color completion is deferred (no
-        // per-property color-type metadata), so nothing is offered there.
-        let src = "Widget\n  color: red\n";
-        assert!(complete_at(src, at(src, "red") + 1).is_empty());
-        // The KEY position, by contrast, now offers the catalog property names (see the property-key
-        // tests below): `  co` is a bare property key being typed.
+    fn freeform_property_value_offers_nothing() {
+        // A freeform value (an arbitrary string) has no closed set to complete.
+        let src = "Widget\n  text: hel\n";
+        assert!(complete_at(src, at(src, "hel") + 1).is_empty());
+    }
+
+    #[test]
+    fn value_position_for_display_offers_the_display_values() {
+        let src = "Widget\n  display: fl\n";
         assert_eq!(
-            labels(&complete_at(src, at(src, "color") + 2)),
-            catalog::PROPERTIES
+            labels(&complete_at(src, at(src, "fl") + 2)),
+            schema::DISPLAY_VALUES
         );
+    }
+
+    #[test]
+    fn value_position_right_after_the_colon_offers_the_whole_set() {
+        let src = "Widget\n  layout:\n";
+        let off = at(src, "layout:") + "layout:".len();
+        assert_eq!(labels(&complete_at(src, off)), schema::LAYOUT_TYPES);
+    }
+
+    #[test]
+    fn value_position_for_a_color_property_offers_named_colors() {
+        let src = "Widget\n  color: re\n";
+        let items = complete_at(src, at(src, "re\n") + 2);
+        assert!(
+            items.iter().any(|i| i.label == "red"),
+            "named colors offered"
+        );
+        assert!(items.iter().all(|i| i.kind == CompletionKind::Value));
+        // A different color property (background-color) also offers colors.
+        let src2 = "Widget\n  background-color: wh\n";
+        assert!(complete_at(src2, at(src2, "wh") + 2)
+            .iter()
+            .any(|i| i.label == "white"));
+    }
+
+    #[test]
+    fn value_completion_honors_the_indentation_gate() {
+        // A 3-space (odd) indent is a hard OTML error; no value is offered on such a line.
+        let src = "Widget\n   display: fl\n";
+        assert!(complete_at(src, at(src, "fl") + 2).is_empty());
     }
 
     #[test]

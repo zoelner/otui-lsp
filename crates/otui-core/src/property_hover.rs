@@ -147,8 +147,10 @@ pub static PROPERTY_DOCS: &[(&str, &str)] = &[
     ("y", "Absolute Y position (same coordinate space as `rect`)."),
 ];
 
-/// Classify a known property's expected value from the catalog/schema metadata.
-fn classify_value(name: &str) -> PropertyValueKind {
+/// Classify a property's expected value from the catalog/schema metadata. The single audited source
+/// of "what value kind does this property take", shared by property hover and value completion.
+#[must_use]
+pub fn classify_value(name: &str) -> PropertyValueKind {
     if catalog::COLOR_PROPERTIES.contains(&name) {
         return PropertyValueKind::Color;
     }
