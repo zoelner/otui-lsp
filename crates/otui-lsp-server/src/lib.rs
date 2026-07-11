@@ -234,6 +234,26 @@ impl Backend {
         self.send_diagnostics(uri, lsp_diags, Some(version));
     }
 
+    /// Recompute and republish diagnostics for every currently open document.
+    ///
+    /// Widget-aware `unknown-property` diagnostics depend on the workspace style + Lua indexes, so
+    /// when a watched file mutates either index the open buffers' diagnostics would otherwise go
+    /// stale until their next edit. Called from the main-loop watched-files handler (which holds the
+    /// sender) to refresh them immediately. A `(uri, text, version)` snapshot is taken so the
+    /// documents lock is not held across [`publish`](Self::publish) (which re-reads it and the index
+    /// locks); the version echoed is the current one, so nothing is dropped as stale.
+    fn republish_open_documents(&self) {
+        let open: Vec<(Uri, String, i32)> = {
+            let docs = self.documents.read().expect("documents lock poisoned");
+            docs.iter()
+                .map(|(uri, doc)| (uri.clone(), doc.text.clone(), doc.version))
+                .collect()
+        };
+        for (uri, text, version) in open {
+            self.publish(uri, &text, version);
+        }
+    }
+
     /// Re-index `uri`'s style definitions from `text` into the workspace [`StyleIndex`].
     ///
     /// Run on open/change; extraction is pure and cheap. The index lock is taken only for the
@@ -1631,6 +1651,10 @@ impl Backend {
             // possibly-long-running thread holding a `Sender<Message>` clone would keep the stdio
             // writer's channel open and make `IoThreads::join()` hang on shutdown until the scan
             // finished. It reports its result to stderr instead, which never blocks shutdown.
+            // Consequence: a document opened before this scan finishes is diagnosed against the
+            // still-building indexes; its widget-aware `unknown-property` hints refine on the next
+            // edit (`did_change`) or watched-file change (`republish_open_documents`). This startup
+            // transient is the accepted cost of keeping shutdown prompt.
             std::thread::spawn(move || {
                 let entries = scan_workspace(&roots);
                 // The scan is stateless, so a fresh service suffices for extraction.
@@ -1740,6 +1764,9 @@ impl Backend {
                 }
             }
         }
+        // A watched change mutated the style and/or Lua index; refresh open buffers so their
+        // widget-aware diagnostics reflect it instead of going stale until the next edit.
+        self.republish_open_documents();
     }
 
     /// Apply one watched-file change for a `.lua` module to the [`lua_index`](Self::lua_index): drop
@@ -2913,6 +2940,98 @@ end
         assert_eq!(defs[0].name, "UITable");
         assert_eq!(defs[0].lua_parent.as_deref(), Some("UIWidget"));
         assert!(defs[0].custom_props.contains("column-style"));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Drain every pending `publishDiagnostics` notification and return the diagnostic codes of the
+    /// last one addressed to `uri` (empty if none was sent).
+    fn drain_diagnostic_codes(rx: &crossbeam_channel::Receiver<Message>, uri: &Uri) -> Vec<String> {
+        let mut codes = None;
+        while let Ok(msg) = rx.try_recv() {
+            if let Message::Notification(note) = msg {
+                if note.method == "textDocument/publishDiagnostics" {
+                    let params: PublishDiagnosticsParams =
+                        serde_json::from_value(note.params).expect("diagnostics params");
+                    if &params.uri == uri {
+                        codes = Some(
+                            params
+                                .diagnostics
+                                .iter()
+                                .filter_map(|d| match &d.code {
+                                    Some(lsp_types::NumberOrString::String(s)) => Some(s.clone()),
+                                    _ => None,
+                                })
+                                .collect(),
+                        );
+                    }
+                }
+            }
+        }
+        codes.unwrap_or_default()
+    }
+
+    #[test]
+    fn watched_lua_change_republishes_open_documents() {
+        use lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let base = std::env::temp_dir().join(format!("otui-lua-republish-{}", std::process::id()));
+        std::fs::create_dir_all(&base).expect("mkdir");
+        let lua_path = base.join("uitable.lua");
+        let lua_uri = uri_from_file_path(&lua_path).expect("lua uri");
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let backend = Backend::new(tx, &InitializeParams::default());
+
+        // An open `.otui` that puts a Lua-added property (`column-style`) on a `UITable`.
+        let doc_uri = Uri::from_str("file:///ws/win.otui").expect("doc uri");
+        let text = "Table < UITable\n  column-style: SomeColumn\n";
+        backend.documents.write().expect("documents").insert(
+            doc_uri.clone(),
+            Document {
+                text: text.to_owned(),
+                version: 1,
+            },
+        );
+
+        // Before the Lua file exists/indexed: the property is unknown → hint.
+        backend.publish(doc_uri.clone(), text, 1);
+        assert!(
+            drain_diagnostic_codes(&rx, &doc_uri)
+                .iter()
+                .any(|c| c == "unknown-property"),
+            "column-style should hint before UITable's lua is indexed"
+        );
+
+        // Now the Lua module appears on disk and a watched-file event fires.
+        std::fs::write(
+            &lua_path,
+            "\
+UITable = extends(UIWidget, 'UITable')
+
+function UITable:onStyleApply(styleName, styleNode)
+  for name, value in pairs(styleNode) do
+    if name == 'column-style' then
+    end
+  end
+end
+",
+        )
+        .expect("write lua");
+        backend.did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: vec![FileEvent {
+                uri: lua_uri,
+                typ: FileChangeType::CREATED,
+            }],
+        });
+
+        // The open document was republished and the hint is gone.
+        assert!(
+            !drain_diagnostic_codes(&rx, &doc_uri)
+                .iter()
+                .any(|c| c == "unknown-property"),
+            "column-style must be accepted after UITable's lua is indexed"
+        );
 
         std::fs::remove_dir_all(&base).ok();
     }
