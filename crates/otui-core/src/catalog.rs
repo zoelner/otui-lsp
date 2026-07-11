@@ -11,6 +11,9 @@
 //! * [`COLOR_PROPERTIES`] — the subset of property tags whose value the engine parses as a
 //!   color (`node->value<Color>()` / `Color(node->value())`), used to gate named-color
 //!   swatches to genuine color-value positions.
+//! * [`LAYOUT_PROPERTIES`] — the keys read inside a `layout:` block (the union of the
+//!   layout classes' `applyStyle` tags, plus the block's `type`). Disjoint from
+//!   [`PROPERTIES`] — valid only *inside* a `layout:` block.
 //! * [`NAMED_COLORS`] — the CSS named-color table as `(name, 0xRRGGBB)` pairs, lowercased
 //!   to match the engine's case-insensitive lookup. The packed value is the color's RGB.
 //! * [`LEGACY_COLORS`] — the legacy engine color statics as `(name, 0xRRGGBBAA)` pairs
@@ -190,6 +193,25 @@ pub static COLOR_PROPERTIES: &[&str] = &[
     "icon-color",
     "image-color",
     "ttf-stroke-color",
+];
+
+/// Keys the engine reads inside a `layout:` block — the union of the layout classes' `applyStyle`
+/// tags plus the block's own `type` key. Disjoint from [`PROPERTIES`]: these are dispatched by the
+/// layout object, not the widget style parser, so they are only valid *inside* a `layout:` block.
+pub static LAYOUT_PROPERTIES: &[&str] = &[
+    "align-bottom",
+    "align-right",
+    "auto-spacing",
+    "cell-height",
+    "cell-size",
+    "cell-spacing",
+    "cell-width",
+    "fit-children",
+    "flow",
+    "num-columns",
+    "num-lines",
+    "spacing",
+    "type",
 ];
 
 /// CSS named colors recognized by the engine's color parser: `(lowercased name, packed 0xRRGGBB)`.

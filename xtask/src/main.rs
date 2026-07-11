@@ -37,9 +37,34 @@ use regex::Regex;
 /// translation units. The image/text files are treated as **optional** so the extractor still works
 /// against forks that inline them into the base file.
 const PROPERTY_FILES: &[(&str, bool)] = &[
-    ("src/framework/ui/uiwidgetbasestyle.cpp", true),
+    (BASE_STYLE_FILE, true),
     ("src/framework/ui/uiwidgetimage.cpp", false),
     ("src/framework/ui/uiwidgettext.cpp", false),
+];
+
+/// The widget style parser itself (`UIWidget::parseBaseStyle`). Required: it carries both the bulk
+/// of the property tags and the `layout:` block handler that names the block's `type` key.
+const BASE_STYLE_FILE: &str = "src/framework/ui/uiwidgetbasestyle.cpp";
+
+/// Engine-source files (relative to the engine-source root) whose `applyStyle` reads the keys of a
+/// `layout:` **block**. These keys are dispatched by the *layout* object, not by the widget style
+/// parser, so they never appear in [`PROPERTY_FILES`] — without them every `cell-size:` /
+/// `spacing:` / `flow:` under a `layout:` block looks like an unknown property.
+///
+/// The set is the **union** across the layout classes: the engine picks one layout per widget and
+/// each class silently ignores the keys it does not read, so a key that belongs to a *different*
+/// layout type is ignored rather than an error. Accepting the union therefore prefers a false
+/// negative (never flagging `spacing:` under `type: grid`) over a false positive, matching the
+/// diagnostics rule in `otui-core`.
+///
+/// All are optional: a fork may inline or drop a layout class, and the union just shrinks.
+const LAYOUT_FILES: &[&str] = &[
+    "src/framework/ui/uilayout.cpp",
+    "src/framework/ui/uiboxlayout.cpp",
+    "src/framework/ui/uiverticallayout.cpp",
+    "src/framework/ui/uihorizontallayout.cpp",
+    "src/framework/ui/uigridlayout.cpp",
+    "src/framework/ui/uianchorlayout.cpp",
 ];
 
 /// Relative path (under the engine-source root) of the CSS named-color table + legacy color names.
@@ -56,6 +81,12 @@ struct Catalog {
     /// `border-color*`, `icon-color`, `image-color`, `ttf-stroke-color`). Sorted. Used to gate
     /// named-color swatches to genuine color-value positions.
     color_properties: Vec<String>,
+    /// The keys the engine reads inside a `layout:` **block** — the union of every layout class's
+    /// `applyStyle` tags (`spacing`, `fit-children`, `cell-size`, `num-columns`, `flow`, …) plus the
+    /// `type` key the widget style parser itself reads via `valueAt<std::string>("type", "")`.
+    /// Sorted. Dispatched by the layout object, not the widget style parser, so these are disjoint
+    /// from [`Catalog::properties`] and must be checked in the `layout:` block context.
+    layout_properties: Vec<String>,
     /// The CSS named-color table: `(lowercased name, packed 0xRRGGBB)`, sorted by name. The value is
     /// captured from the `rgb_to_abgr(0xRRGGBB)` literal in the engine's `kCss` table.
     named_colors: Vec<(String, u32)>,
@@ -132,10 +163,11 @@ fn gen_catalog(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         .map_err(|e| format!("failed to write '{}': {e}", out_path.display()))?;
 
     println!(
-        "gen-catalog: wrote {} properties ({} color-typed), {} named colors, {} legacy colors and \
-         {} legacy names to {}",
+        "gen-catalog: wrote {} properties ({} color-typed), {} layout-block keys, {} named colors, \
+         {} legacy colors and {} legacy names to {}",
         catalog.properties.len(),
         catalog.color_properties.len(),
+        catalog.layout_properties.len(),
         catalog.named_colors.len(),
         catalog.legacy_colors.len(),
         catalog.legacy_color_names.len(),
@@ -188,6 +220,31 @@ fn extract(src: &Path) -> Result<Catalog, String> {
         );
     }
 
+    // Layout-block keys: the same `node->tag() == "..."` dispatch, but in the layout classes'
+    // `applyStyle` rather than the widget style parser, plus the `type` key the widget style parser
+    // reads out of the block itself.
+    let mut layout_properties: Vec<String> = Vec::new();
+    for rel in LAYOUT_FILES {
+        let path = src.join(rel);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            eprintln!(
+                "gen-catalog: note: optional layout file '{rel}' not found; skipping its keys."
+            );
+            continue;
+        };
+        let stripped = strip_comments(&text);
+        for caps in prop_re.captures_iter(&stripped) {
+            layout_properties.push(caps[1].to_string());
+        }
+    }
+    layout_properties.extend(extract_layout_type_keys(src)?);
+    if layout_properties.is_empty() {
+        return Err(
+            "extracted zero layout-block keys — is the layout `applyStyle` layout as expected?"
+                .into(),
+        );
+    }
+
     // Colors: the CSS table entries `{"name", rgb_to_abgr(0xRRGGBB)}` (name + RGB value), the legacy
     // engine color statics `const Color Color::NAME = 0xAABBGGRR` (name + RGBA value, alpha
     // preserved), and any remaining recognized names (the `transparent` alias). Names are lowercased
@@ -220,10 +277,48 @@ fn extract(src: &Path) -> Result<Catalog, String> {
     Ok(Catalog {
         properties: sorted_dedup(properties),
         color_properties: sorted_dedup(color_properties),
+        layout_properties: sorted_dedup(layout_properties),
         named_colors,
         legacy_colors,
         legacy_color_names: sorted_dedup(legacy_color_names),
     })
+}
+
+/// The keys the widget style parser reads directly out of a `layout:` block — the `type` in
+/// `layoutType = node->valueAt<std::string>("type", "")`, inside the `node->tag() == "layout"`
+/// handler of `uiwidgetbasestyle.cpp`.
+///
+/// Scoped to that handler (a window from the `"layout"` tag compare to the next tag compare) so an
+/// unrelated `valueAt` elsewhere in the style parser is never captured. Extracted rather than
+/// hard-coded so a fork that renames the key is picked up by a regenerate.
+fn extract_layout_type_keys(src: &Path) -> Result<Vec<String>, String> {
+    let path = src.join(BASE_STYLE_FILE);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read '{}': {e}", path.display()))?;
+    let stripped = strip_comments(&text);
+
+    // Narrow to the `layout` handler: from its tag compare up to the next one.
+    let handler_re =
+        Regex::new(r#"\btag\s*(?:\(\))?\s*==\s*"layout"([\s\S]*?)\btag\s*(?:\(\))?\s*==\s*""#)
+            .expect("valid layout-handler regex");
+    let Some(handler) = handler_re.captures(&stripped) else {
+        return Err(
+            "could not locate the `tag() == \"layout\"` handler — is the style-dispatch layout as \
+             expected?"
+                .into(),
+        );
+    };
+
+    let key_re =
+        Regex::new(r#"\bvalueAt\s*<[^>]*>\s*\(\s*"([^"]+)""#).expect("valid valueAt regex");
+    let keys: Vec<String> = key_re
+        .captures_iter(&handler[1])
+        .map(|caps| caps[1].to_string())
+        .collect();
+    if keys.is_empty() {
+        return Err("the `layout` handler yielded no `valueAt` key (expected `type`)".into());
+    }
+    Ok(keys)
 }
 
 /// Extract the OTML property tags whose value the engine parses as a color: a `tag == "..."` compare
@@ -366,6 +461,9 @@ fn render(catalog: &Catalog) -> String {
          //! * [`COLOR_PROPERTIES`] — the subset of property tags whose value the engine parses as a\n\
          //!   color (`node->value<Color>()` / `Color(node->value())`), used to gate named-color\n\
          //!   swatches to genuine color-value positions.\n\
+         //! * [`LAYOUT_PROPERTIES`] — the keys read inside a `layout:` block (the union of the\n\
+         //!   layout classes' `applyStyle` tags, plus the block's `type`). Disjoint from\n\
+         //!   [`PROPERTIES`] — valid only *inside* a `layout:` block.\n\
          //! * [`NAMED_COLORS`] — the CSS named-color table as `(name, 0xRRGGBB)` pairs, lowercased\n\
          //!   to match the engine's case-insensitive lookup. The packed value is the color's RGB.\n\
          //! * [`LEGACY_COLORS`] — the legacy engine color statics as `(name, 0xRRGGBBAA)` pairs\n\
@@ -385,6 +483,19 @@ fn render(catalog: &Catalog) -> String {
          `Color(node->value())` dispatch site).\n",
     );
     s.push_str(&render_slice("COLOR_PROPERTIES", &catalog.color_properties));
+    s.push('\n');
+    s.push_str(
+        "/// Keys the engine reads inside a `layout:` block — the union of the layout classes' \
+         `applyStyle`\n\
+         /// tags plus the block's own `type` key. Disjoint from [`PROPERTIES`]: these are \
+         dispatched by the\n\
+         /// layout object, not the widget style parser, so they are only valid *inside* a \
+         `layout:` block.\n",
+    );
+    s.push_str(&render_slice(
+        "LAYOUT_PROPERTIES",
+        &catalog.layout_properties,
+    ));
     s.push('\n');
     s.push_str(
         "/// CSS named colors recognized by the engine's color parser: `(lowercased name, packed \

@@ -381,7 +381,15 @@ fn collect_semantic_diagnostics<'a>(
         "anchor_property" => check_anchor_property(node, source, out),
         "property" => {
             check_property(node, source, enclosing, ctx, out);
-            check_property_value(node, source, out);
+            // Inside a `layout:` block the keys are consumed by the layout object, never by the
+            // widget style parser, so none of the value-validating families apply there — a
+            // `display:` nested under `layout:` is not a display value the engine would parse (and
+            // throw on), it is just a key the layout ignores. Validating it would be a false-positive
+            // error. The `layout` node itself is not inside a block, so its own value (including the
+            // block's `type:`) is still validated.
+            if enclosing_block_key(node, source) != Some("layout") {
+                check_property_value(node, source, out);
+            }
         }
         _ => {}
     }
@@ -398,6 +406,23 @@ fn collect_semantic_diagnostics<'a>(
     for child in node.children(&mut cursor) {
         collect_semantic_diagnostics(child, source, child_enclosing, ctx, out);
     }
+}
+
+/// The key of the `property` **block** this node sits directly inside, or `None` when the node is not
+/// nested in one (a top-level widget property, a list item, a `$state` block's child, …).
+///
+/// The grammar's `_block` is a hidden rule, so a block's statements are inlined as direct children of
+/// the owning `property` node: a `type:` inside `layout:` has the `layout` property node as its
+/// parent. A parent of any other kind (`container`, `state_selector`, `document`, …) is not a
+/// property block and yields `None`.
+fn enclosing_block_key<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    let parent = node.parent()?;
+    if parent.kind() != "property" {
+        return None;
+    }
+    parent
+        .child_by_field_name("key")
+        .map(|key| slice(source, key))
 }
 
 /// Slice `source` by a node's byte span.
@@ -549,6 +574,31 @@ fn check_property(
         return;
     }
     let name = slice(source, key);
+    // A key nested directly under a `layout:` block is read by the *layout object*
+    // (`UIBoxLayout`/`UIGridLayout`/…`::applyStyle`), not the widget style parser, so it lives in its
+    // own catalog. The grammar's `_block` is a hidden rule, so a block's statements are direct
+    // children of the `property` node — the enclosing block is simply this node's parent.
+    //
+    // Checked *before* the widget catalog and deliberately exclusive: these keys are valid only here
+    // (a bare `cell-size:` on a widget really is unknown), and conversely a widget property is not
+    // valid inside a `layout:` block, so the block context replaces the widget check rather than
+    // adding to it.
+    if let Some(block) = enclosing_block_key(node, source) {
+        if block == "layout" {
+            if schema::is_layout_block_property(name) {
+                return;
+            }
+            out.push(Diagnostic {
+                severity: Severity::Hint,
+                code: UNKNOWN_PROPERTY,
+                message: format!(
+                    "unknown layout property `{name}`: ignored by the engine, has no effect"
+                ),
+                span: SyntaxTree::span_of(key),
+            });
+            return;
+        }
+    }
     if schema::is_known_property(name) {
         return;
     }
@@ -1150,6 +1200,105 @@ Panel
         assert_ne!(d.severity, Severity::Error);
         assert_ne!(d.severity, Severity::Warning);
         assert_eq!(d.severity, Severity::Hint);
+    }
+
+    // --- semantic pass: `layout:` block keys ---------------------------------------------------
+
+    #[test]
+    fn layout_block_keys_are_not_unknown_properties() {
+        // Regression: every key inside a `layout:` block is read by the layout object
+        // (`UIGridLayout::applyStyle`), not the widget style parser, so none is an unknown property.
+        // Before this was handled, each of these raised a false `unknown property` hint.
+        let src = "\
+Panel
+  layout:
+    type: grid
+    cell-size: 32 32
+    cell-spacing: 2
+    num-columns: 4
+    fit-children: true
+    flow: true
+";
+        assert!(
+            analyze(src).is_empty(),
+            "a grid `layout:` block must be silent, got {:?}",
+            analyze(src)
+        );
+    }
+
+    #[test]
+    fn box_layout_block_keys_are_not_unknown_properties() {
+        // The box family: `spacing`/`fit-children` from `UIBoxLayout`, `align-bottom` from
+        // `UIVerticalLayout`, `align-right` from `UIHorizontalLayout`.
+        let src = "\
+Panel
+  layout:
+    type: verticalBox
+    spacing: 4
+    fit-children: true
+    align-bottom: true
+";
+        assert!(analyze(src).is_empty(), "{:?}", analyze(src));
+    }
+
+    #[test]
+    fn real_otclient_layout_fixture_is_silent() {
+        // Copied from the engine's own `data/styles/30-inputboxes.otui` — content the engine loads
+        // without complaint, so the LSP must not flag it.
+        let src = "\
+Panel
+  layout:
+    type: horizontalBox
+    spacing: 8
+";
+        assert!(analyze(src).is_empty(), "{:?}", analyze(src));
+    }
+
+    #[test]
+    fn layout_leaf_form_still_works() {
+        // The leaf form (`layout: <type>`) has no block, so it is value-validated as before.
+        assert!(analyze("Panel\n  layout: verticalBox\n").is_empty());
+        let diags = analyze("Panel\n  layout: bogusLayout\n");
+        assert_eq!(
+            only(&diags, INVALID_PROPERTY_VALUE).severity,
+            Severity::Error
+        );
+    }
+
+    #[test]
+    fn unknown_key_inside_layout_block_is_still_hinted() {
+        // The block context accepts the layout catalog, it does not blanket-accept: a key no layout
+        // class reads is still ignored by the engine, so it stays a hint.
+        let src = "Panel\n  layout:\n    type: grid\n    cell-siz: 32 32\n";
+        let diags = analyze(src);
+        let d = only(&diags, UNKNOWN_PROPERTY);
+        assert_eq!(d.severity, Severity::Hint);
+        assert_eq!(&src[d.span.start..d.span.end], "cell-siz");
+    }
+
+    #[test]
+    fn layout_key_at_widget_level_is_still_unknown() {
+        // The layout catalog is exclusive to the block: a bare `cell-size:` on a widget is read by
+        // nobody, so it remains an unknown property.
+        let src = "Panel\n  cell-size: 32 32\n";
+        let diags = analyze(src);
+        let d = only(&diags, UNKNOWN_PROPERTY);
+        assert_eq!(d.severity, Severity::Hint);
+        assert_eq!(&src[d.span.start..d.span.end], "cell-size");
+    }
+
+    #[test]
+    fn value_families_are_not_validated_inside_a_layout_block() {
+        // A `display:` nested under `layout:` is never parsed as a display value by the engine (the
+        // layout object reads the block and ignores the key), so it must not raise a value error —
+        // only the unknown-layout-key hint.
+        let src = "Panel\n  layout:\n    type: grid\n    display: bogus\n";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != INVALID_PROPERTY_VALUE),
+            "a key inside a layout block must not be value-validated, got {diags:?}"
+        );
+        assert_eq!(only(&diags, UNKNOWN_PROPERTY).severity, Severity::Hint);
     }
 
     // --- semantic pass: invalid property value (error) ----------------------------------------

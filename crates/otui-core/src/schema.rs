@@ -376,6 +376,26 @@ pub fn is_known_property(name: &str) -> bool {
     crate::catalog::PROPERTIES.contains(&name)
 }
 
+/// True if `name` is a key the engine reads **inside a `layout:` block**
+/// ([`crate::catalog::LAYOUT_PROPERTIES`]).
+///
+/// These keys (`type`, `spacing`, `fit-children`, `cell-size`, `num-columns`, `flow`, …) are
+/// dispatched by the *layout object* (`UIBoxLayout` / `UIGridLayout` / … `::applyStyle`), not by the
+/// widget style parser, so they are absent from [`crate::catalog::PROPERTIES`] and are **only** valid
+/// nested under a `layout:` block — at widget level they are genuinely unknown. Callers must
+/// therefore gate on the block context; see `diagnostics::check_property`.
+///
+/// **Exact match**, like [`is_known_property`]: the engine dispatches on `node->tag() == "..."`.
+///
+/// The catalog holds the **union** across the layout classes. The engine instantiates one layout per
+/// widget and each class ignores the keys it does not read, so a key belonging to a different layout
+/// type (`spacing:` under `type: grid`, say) is silently ignored rather than an error — accepting the
+/// union therefore prefers a false negative over a false positive, as the diagnostics rule requires.
+#[must_use]
+pub fn is_layout_block_property(name: &str) -> bool {
+    crate::catalog::LAYOUT_PROPERTIES.contains(&name)
+}
+
 /// Classify a color value by its parseable form, faithful to `Color::operator>>` in the engine.
 /// Returns `None` for anything that is not a well-formed hex or functional color (including named
 /// colors — use [`is_named_color`] for those).
