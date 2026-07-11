@@ -47,6 +47,14 @@ pub struct StyleDef {
     /// declaration always has a base. Whether the base resolves to a file or a `UI*` built-in is a
     /// later concern (see [`is_native_base`]).
     pub base: Option<String>,
+    /// The widget class named by a `__class:` property in the style's body, if it carries one.
+    ///
+    /// `__class` re-roots the style onto a different runtime widget class than its `< Base` chain
+    /// implies: the engine reads it as `widgetType = styleNode->valueAt("__class")` and instantiates
+    /// *that* class, styled from the base. `SpinBox < TextEdit` with `__class: UISpinBox` is a
+    /// `UISpinBox` (a Lua widget declaring `minimum` / `maximum` / `step`) wearing a `TextEdit`'s
+    /// look — so the style chain alone would miss every property `UISpinBox` adds.
+    pub lua_class: Option<String>,
     /// The span of the declared name identifier — the go-to-definition **target** for later nodes.
     pub name_span: ByteSpan,
     /// The span of the whole `style_header` node. For a bare declaration this is just the
@@ -87,9 +95,28 @@ fn build_def(node: Node<'_>, source: &str) -> StyleDef {
     StyleDef {
         name,
         base,
+        lua_class: lua_class_of(node, source),
         name_span,
         header_span: SyntaxTree::span_of(node),
     }
+}
+
+/// The value of a `__class:` property in the style's body, if present.
+///
+/// The grammar's `_block` is a hidden rule, so a style's body statements are direct children of the
+/// `style_header` node. Only a leaf `__class: <value>` counts; an empty or block form yields `None`.
+fn lua_class_of(node: Node<'_>, source: &str) -> Option<String> {
+    let mut cursor = node.walk();
+    let found = node
+        .named_children(&mut cursor)
+        .filter(|c| c.kind() == "property")
+        .find(|c| {
+            c.child_by_field_name("key")
+                .is_some_and(|k| slice(source, k) == "__class")
+        })?;
+    let value = found.child_by_field_name("value")?;
+    let text = slice(source, value).trim();
+    (!text.is_empty()).then(|| text.to_owned())
 }
 
 /// Slice `source` by `node`'s byte span.

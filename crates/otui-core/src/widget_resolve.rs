@@ -18,6 +18,7 @@
 //! owned `String`s, with no I/O and no `lsp-types`.
 
 use crate::lua_widgets::LuaWidgetIndex;
+use crate::schema;
 use crate::style_index::{is_native_base, StyleDef, StyleIndex};
 use std::collections::HashSet;
 
@@ -35,16 +36,25 @@ pub struct WidgetAncestry {
 }
 
 impl WidgetAncestry {
-    /// Whether any widget in the ancestry declares `prop` as a Lua custom style property (per
-    /// `lua`). This is the membership test [`diagnostics`](crate::diagnostics) consults before
-    /// emitting an `unknown-property` hint.
+    /// Whether any widget in the ancestry declares `prop` as a custom style property — either in
+    /// **Lua** (per `lua`, e.g. `UITable` reading `column-style`) or in a **native C++**
+    /// `onStyleApply` override (per [`schema::native_widget_declares`], e.g. `UITextEdit` reading
+    /// `placeholder`). This is the membership test [`diagnostics`](crate::diagnostics) consults
+    /// before emitting an `unknown-property` hint.
+    ///
+    /// Both sources are per-widget, so the property is accepted only when the widget *is-a* the
+    /// declarer: `placeholder` resolves on `TextEdit < UITextEdit` but not on a `Button`, where the
+    /// engine reads it nowhere.
     #[must_use]
     pub fn declares_custom_property(&self, lua: &LuaWidgetIndex, prop: &str) -> bool {
-        self.chain.iter().any(|name| lua.declares(name, prop))
+        self.chain
+            .iter()
+            .any(|name| lua.declares(name, prop) || schema::native_widget_declares(name, prop))
     }
 
-    /// Every Lua custom style property valid on this widget — the union of the `custom_props` of
-    /// each widget in the ancestry (per `lua`), sorted and de-duplicated. This is the enumeration
+    /// Every custom style property valid on this widget — the union, over the whole ancestry, of the
+    /// Lua-declared `custom_props` (per `lua`) and the native C++ `onStyleApply` tags (per
+    /// [`schema::native_widget_properties`]), sorted and de-duplicated. This is the enumeration
     /// [`completion`](crate::completion) offers, the counterpart to the
     /// [`declares_custom_property`](Self::declares_custom_property) membership test.
     #[must_use]
@@ -54,6 +64,11 @@ impl WidgetAncestry {
             for def in lua.lookup(name) {
                 props.extend(def.custom_props.iter().cloned());
             }
+            props.extend(
+                schema::native_widget_properties(name)
+                    .iter()
+                    .map(|p| (*p).to_owned()),
+            );
         }
         props
     }
@@ -71,48 +86,91 @@ pub fn resolve_ancestry(start: &str, styles: &StyleIndex, lua: &LuaWidgetIndex) 
     let mut chain = Vec::new();
     let mut seen = HashSet::new();
     let mut native = None;
+    // Widget classes named by a `__class:` on some style in the chain. Each re-roots the widget onto
+    // a class its `< Base` chain never mentions, so each seeds its own Lua-parent walk in phase 2.
+    let mut reroots: Vec<String> = Vec::new();
 
     // Phase 1: the cross-file `.otui` style chain. `seen.insert` is false on a repeat, so a cycle
     // exits the loop without re-pushing.
     let mut current = start.to_owned();
     while seen.insert(current.clone()) {
         chain.push(current.clone());
-        if is_native_base(&current) {
-            native = Some(current.clone());
-            break;
+        // A **defined** style wins over the native-name heuristic. [`is_native_base`] only asks
+        // whether a name *looks* like a built-in (`UI` + uppercase); it cannot know that the engine's
+        // own `data/styles/10-items.otui` declares `UIDragIcon < UIItem` — a user style wearing a
+        // native-looking name. Treating that as a built-in stops the walk dead, so `UIDragIcon` never
+        // reaches `UIItem` and loses every property `UIItem` declares (`virtual`, `item-id`, …).
+        //
+        // So: walk a definition whenever one exists, and fall back to the heuristic only for a name
+        // nothing defines — which is exactly what a genuine built-in is.
+        let Some(def) = pick_def(styles, &current) else {
+            if is_native_base(&current) {
+                native = Some(current.clone());
+            }
+            break; // a built-in, or an undefined base / malformed header — either way, the walk ends
+        };
+        // `__class:` names the class the engine actually instantiates for this style, regardless of
+        // what it inherits its look from. Record it; the base walk continues as normal.
+        if let Some(class) = &def.lua_class {
+            reroots.push(class.clone());
         }
-        match pick_base(styles, &current) {
-            Some(base) => current = base,
-            None => break, // undefined base or malformed header — dead end, no native class
+        match &def.base {
+            Some(base) => current = base.clone(),
+            None => break,
         }
     }
 
-    // Phase 2: the native class's Lua parent chain (only if the `.otui` chain reached a native class).
-    let Some(native_name) = native.clone() else {
-        return WidgetAncestry { chain, native };
-    };
-    let mut current = native_name;
-    while let Some(parent) = lua.parent_of(&current) {
-        let parent = parent.to_owned();
-        if !seen.insert(parent.clone()) {
-            break; // cycle guard
+    // Phase 2: the Lua parent chain of each class we landed on — the native `UI*` the style chain
+    // reached, plus every `__class:` re-root. A `__class` class (e.g. `UISpinBox`) is typically a Lua
+    // widget, so its own `extends` parents carry properties too.
+    // `seen` and the traversal guard are deliberately *separate* sets. `seen` de-duplicates entries
+    // in `chain`; `expanded` stops the walk from re-visiting a class. Using `seen` for both would cut
+    // the walk short at a class that is already in the chain but whose own Lua parents were never
+    // traversed — e.g. a `__class:` re-root extending a name that also appears in the `.otui` chain
+    // would silently lose every property inherited above it.
+    let mut expanded: HashSet<String> = HashSet::new();
+    for root in native.iter().cloned().chain(reroots) {
+        let mut current = root;
+        while expanded.insert(current.clone()) {
+            if seen.insert(current.clone()) {
+                chain.push(current.clone());
+            }
+            let Some(parent) = lua.parent_of(&current) else {
+                break;
+            };
+            current = parent.to_owned();
         }
-        chain.push(parent.clone());
-        current = parent;
+    }
+
+    // Phase 3: `UIWidget` is the implicit root of every widget — every native `UI*` widget class
+    // derives from it in the engine, whether or not a Lua `extends` line spells that out (the C++
+    // ones never do). It matters because a module can attach style properties to `UIWidget` itself
+    // via a `connect(UIWidget, {onStyleApply = …})` hook — that is how `tooltip:` becomes valid on
+    // *any* widget — and those would otherwise resolve on nothing.
+    //
+    // Only when the chain actually reached a native class: a chain that dead-ended at an undefined
+    // base tells us nothing about what it derives from, and assuming `UIWidget` there would start
+    // accepting properties on a typo'd widget name.
+    if native.is_some() && seen.insert(UI_WIDGET.to_owned()) {
+        chain.push(UI_WIDGET.to_owned());
     }
 
     WidgetAncestry { chain, native }
 }
 
-/// The base of the deterministically-chosen definition of the style `name`, or `None` when `name` is
-/// defined nowhere (or only by malformed headers with no base).
+/// The engine's root widget class, the implicit ancestor of every widget.
+const UI_WIDGET: &str = "UIWidget";
+
+/// The deterministically-chosen definition of the style `name`, or `None` when `name` is defined
+/// nowhere (or only by malformed headers with no base). Carries both the base to keep walking and
+/// any `__class:` re-root the style declares.
 ///
 /// Duplicate style names are legal (the engine's last registration wins at runtime, which a static
 /// index cannot know), so this picks a **stable** winner rather than guessing runtime order: among
 /// the defs that carry a base, the one ordered first by `(document id, name-span start)`. The choice
 /// is arbitrary but deterministic, so resolution never flickers between runs; a base that actually
 /// differs across duplicates is pathological.
-fn pick_base(styles: &StyleIndex, name: &str) -> Option<String> {
+fn pick_def<'a>(styles: &'a StyleIndex, name: &str) -> Option<&'a StyleDef> {
     let mut defs: Vec<(&str, &StyleDef)> = styles
         .lookup(name)
         .into_iter()
@@ -123,7 +181,7 @@ fn pick_base(styles: &StyleIndex, name: &str) -> Option<String> {
         a.0.cmp(b.0)
             .then(a.1.name_span.start.cmp(&b.1.name_span.start))
     });
-    defs.first().and_then(|(_, d)| d.base.clone())
+    defs.first().map(|(_, d)| *d)
 }
 
 #[cfg(test)]
@@ -237,8 +295,168 @@ mod tests {
 
         let a = resolve_ancestry("UIA", &styles, &lua);
         // UIA is native, so phase 2 follows UIA -> UIB, then UIB -> UIA is already seen and stops.
-        assert_eq!(a.chain, ["UIA", "UIB"]);
+        // `UIWidget` is then appended as the implicit root of every widget (phase 3).
+        assert_eq!(a.chain, ["UIA", "UIB", "UIWidget"]);
         assert_eq!(a.native.as_deref(), Some("UIA"));
+    }
+
+    #[test]
+    fn ui_widget_is_the_implicit_root_of_a_resolved_widget() {
+        // Every native widget derives from `UIWidget` in the engine, even though the C++ classes have
+        // no Lua `extends` line saying so. A module hooking style properties onto `UIWidget` (see
+        // `connect(UIWidget, {onStyleApply = …})`) must therefore reach every widget.
+        let styles = styles(&[("a.otui", "Button < UIButton\n")]);
+        let lua = lua(&[]);
+
+        let button = resolve_ancestry("Button", &styles, &lua);
+        assert_eq!(button.chain, ["Button", "UIButton", "UIWidget"]);
+    }
+
+    #[test]
+    fn a_dead_end_chain_does_not_get_the_implicit_root() {
+        // A chain that never reached a native class tells us nothing about what it derives from —
+        // assuming `UIWidget` there would start accepting properties on a typo'd widget name.
+        let styles = styles(&[("a.otui", "Thing < NoSuchBase\n")]);
+        let lua = lua(&[]);
+
+        let thing = resolve_ancestry("Thing", &styles, &lua);
+        assert!(!thing.chain.contains(&"UIWidget".to_owned()));
+        assert_eq!(thing.native, None);
+    }
+
+    #[test]
+    fn a_user_style_with_a_native_looking_name_is_still_walked() {
+        // The engine's own `data/styles/10-items.otui` declares `UIDragIcon < UIItem` — a *user*
+        // style whose name trips the `UI`-prefix heuristic. Treating it as a built-in stops the walk
+        // at `UIDragIcon`, so it never reaches `UIItem` and loses `virtual` / `item-id` / ….
+        let styles = styles(&[("a.otui", "UIDragIcon < UIItem\n")]);
+        let lua = lua(&[]);
+
+        let icon = resolve_ancestry("UIDragIcon", &styles, &lua);
+        assert_eq!(icon.chain, ["UIDragIcon", "UIItem", "UIWidget"]);
+        assert_eq!(icon.native.as_deref(), Some("UIItem"));
+        // `virtual` is one of `UIItem`'s native C++ `onStyleApply` tags.
+        assert!(icon.declares_custom_property(&lua, "virtual"));
+    }
+
+    #[test]
+    fn an_undefined_native_looking_name_is_still_treated_as_a_built_in() {
+        // Nothing defines `UIButton`, so the heuristic still applies — that is what a genuine
+        // built-in looks like, and the walk must land on it as the native class.
+        let styles = styles(&[("a.otui", "Button < UIButton\n")]);
+        let lua = lua(&[]);
+
+        let button = resolve_ancestry("Button", &styles, &lua);
+        assert_eq!(button.native.as_deref(), Some("UIButton"));
+        assert_eq!(button.chain, ["Button", "UIButton", "UIWidget"]);
+    }
+
+    #[test]
+    fn a_class_reroot_pulls_in_the_lua_widgets_properties() {
+        // `SpinBox < TextEdit` + `__class: UISpinBox` — the engine instantiates a `UISpinBox` (which
+        // declares `minimum`/`maximum`/`step` in Lua) styled from `TextEdit`. The `< Base` chain
+        // alone never mentions `UISpinBox`, so without the re-root those properties look unknown.
+        let styles = styles(&[(
+            "a.otui",
+            "TextEdit < UITextEdit\nSpinBox < TextEdit\n  __class: UISpinBox\n",
+        )]);
+        let lua = lua(&[(
+            "uispinbox.lua",
+            "UISpinBox = extends(UITextEdit, 'UISpinBox')\n\
+             function UISpinBox:onStyleApply(styleName, styleNode)\n\
+               for name, value in pairs(styleNode) do\n\
+                 if name == 'minimum' then self:setMinimum(value)\n\
+                 elseif name == 'maximum' then self:setMaximum(value)\n\
+                 end\n\
+               end\n\
+             end\n",
+        )]);
+
+        let spin = resolve_ancestry("SpinBox", &styles, &lua);
+        assert!(
+            spin.chain.contains(&"UISpinBox".to_owned()),
+            "{:?}",
+            spin.chain
+        );
+        assert!(spin.declares_custom_property(&lua, "minimum"));
+        assert!(spin.declares_custom_property(&lua, "maximum"));
+        // The style chain is still walked, so the base's native properties still resolve.
+        assert!(spin.declares_custom_property(&lua, "placeholder"));
+    }
+
+    #[test]
+    fn a_reroots_lua_ancestors_survive_a_name_shared_with_the_otui_chain() {
+        // The walk must not stop at a class merely because it is already in `chain`. Here the
+        // re-rooted `UIBar` extends `Base` — a name the `.otui` chain already carries — and `Base`
+        // in turn has a Lua parent (`UICore`) that declares a property. Guarding the traversal with
+        // the chain's de-dup set would break at `Base` and silently drop `core-prop`.
+        let styles = styles(&[("a.otui", "Base < UIFoo\nThing < Base\n  __class: UIBar\n")]);
+        let lua = lua(&[(
+            "w.lua",
+            "UIBar = extends(Base, 'UIBar')\n\
+             Base = extends(UICore, 'Base')\n\
+             function UICore:onStyleApply(styleName, styleNode)\n\
+               for name, value in pairs(styleNode) do\n\
+                 if name == 'core-prop' then self:setCore(value) end\n\
+               end\n\
+             end\n",
+        )]);
+
+        let thing = resolve_ancestry("Thing", &styles, &lua);
+        assert!(
+            thing.chain.contains(&"UICore".to_owned()),
+            "the re-root's grandparent was dropped: {:?}",
+            thing.chain
+        );
+        assert!(thing.declares_custom_property(&lua, "core-prop"));
+    }
+
+    #[test]
+    fn a_class_reroot_does_not_leak_to_the_base_style() {
+        // The re-root belongs to `SpinBox`, not to the `TextEdit` it inherits its look from.
+        let styles = styles(&[(
+            "a.otui",
+            "TextEdit < UITextEdit\nSpinBox < TextEdit\n  __class: UISpinBox\n",
+        )]);
+        let lua = lua(&[(
+            "uispinbox.lua",
+            "UISpinBox = extends(UITextEdit, 'UISpinBox')\n\
+             function UISpinBox:onStyleApply(s, n)\n\
+               for name, value in pairs(n) do\n\
+                 if name == 'minimum' then self:setMinimum(value) end\n\
+               end\n\
+             end\n",
+        )]);
+
+        assert!(
+            !resolve_ancestry("TextEdit", &styles, &lua).declares_custom_property(&lua, "minimum")
+        );
+    }
+
+    #[test]
+    fn declares_a_native_cpp_widget_property() {
+        // `UITextEdit::onStyleApply` (C++) dispatches `placeholder` — there is no Lua `extends` line
+        // for it, so only the native table can accept it. It must resolve down the `.otui` chain.
+        let styles = styles(&[("a.otui", "TextEdit < UITextEdit\nSearchBox < TextEdit\n")]);
+        let lua = LuaWidgetIndex::new();
+
+        let search = resolve_ancestry("SearchBox", &styles, &lua);
+        assert!(search.declares_custom_property(&lua, "placeholder"));
+        assert!(search.declares_custom_property(&lua, "max-length"));
+        assert!(search.custom_properties(&lua).contains("multiline"));
+    }
+
+    #[test]
+    fn a_native_widget_property_does_not_leak_to_unrelated_widgets() {
+        // `change-cursor-image` is `UITextEdit`'s. On a Button the engine reads it nowhere, so it
+        // must stay unknown — the per-widget table must not become a global one.
+        let styles = styles(&[("a.otui", "Button < UIButton\nTextEdit < UITextEdit\n")]);
+        let lua = LuaWidgetIndex::new();
+
+        assert!(resolve_ancestry("TextEdit", &styles, &lua)
+            .declares_custom_property(&lua, "change-cursor-image"));
+        assert!(!resolve_ancestry("Button", &styles, &lua)
+            .declares_custom_property(&lua, "change-cursor-image"));
     }
 
     #[test]

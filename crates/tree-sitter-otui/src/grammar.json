@@ -138,7 +138,16 @@
           "value": "$"
         },
         {
-          "type": "REPEAT1",
+          "type": "ALIAS",
+          "content": {
+            "type": "SYMBOL",
+            "name": "_head_state"
+          },
+          "named": true,
+          "value": "state"
+        },
+        {
+          "type": "REPEAT",
           "content": {
             "type": "SYMBOL",
             "name": "state"
@@ -163,7 +172,7 @@
         }
       ]
     },
-    "state": {
+    "_head_state": {
       "type": "SEQ",
       "members": [
         {
@@ -175,8 +184,11 @@
               "content": {
                 "type": "ALIAS",
                 "content": {
-                  "type": "STRING",
-                  "value": "!"
+                  "type": "IMMEDIATE_TOKEN",
+                  "content": {
+                    "type": "STRING",
+                    "value": "!"
+                  }
                 },
                 "named": true,
                 "value": "state_negation"
@@ -198,6 +210,58 @@
                 "type": "PATTERN",
                 "value": "[A-Za-z_][A-Za-z0-9_\\-]*"
               }
+            },
+            "named": true,
+            "value": "state_name"
+          }
+        }
+      ]
+    },
+    "state": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "FIELD",
+              "name": "negated",
+              "content": {
+                "type": "ALIAS",
+                "content": {
+                  "type": "STRING",
+                  "value": "!"
+                },
+                "named": true,
+                "value": "state_negation"
+              }
+            },
+            {
+              "type": "FIELD",
+              "name": "name",
+              "content": {
+                "type": "ALIAS",
+                "content": {
+                  "type": "IMMEDIATE_TOKEN",
+                  "content": {
+                    "type": "PATTERN",
+                    "value": "[A-Za-z_][A-Za-z0-9_\\-]*"
+                  }
+                },
+                "named": true,
+                "value": "state_name"
+              }
+            }
+          ]
+        },
+        {
+          "type": "FIELD",
+          "name": "name",
+          "content": {
+            "type": "ALIAS",
+            "content": {
+              "type": "PATTERN",
+              "value": "[A-Za-z_][A-Za-z0-9_\\-]*"
             },
             "named": true,
             "value": "state_name"

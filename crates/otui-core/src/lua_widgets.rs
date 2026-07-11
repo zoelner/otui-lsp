@@ -49,16 +49,34 @@
 //!   access (which may be hyphenated, e.g. `styleNode['tab-spacing']` on `UIMoveableTabBar`). The
 //!   style-node parameter name is read from the `onStyleApply` signature, defaulting to `styleNode`.
 //!
+//! A module may also attach a style handler as a **signal** rather than overriding the method, which
+//! is how a property becomes valid on a class the module does not own:
+//!
+//! ```lua
+//! local function onWidgetStyleApply(widget, styleName, styleNode)
+//!   if styleNode.tooltip then widget.tooltip = styleNode.tooltip end
+//! end
+//! connect(UIWidget, { onStyleApply = onWidgetStyleApply })
+//! ```
+//!
+//! The handler is a plain function, so the method pass never sees it. `connect(<Class>, {onStyleApply
+//! = <fn>})` is therefore resolved to its handler, whose body is scanned with the same two read forms
+//! — noting that a signal handler takes the widget as its first argument, so its style node is the
+//! **third** parameter where a method's is the second. Connecting to `UIWidget` (as the tooltip module
+//! does) makes the properties valid on every widget, since `UIWidget` is every widget's implicit root
+//! in [`widget_resolve`](crate::widget_resolve).
+//!
 //! ## Deliberately not (yet) covered — the fidelity gap
 //!
 //! `onStyleApply` is the dominant but not the only place a widget reads custom attributes. These are
-//! **not** recognized here, and are left for later widening as real false positives surface (see the
-//! module TODO):
+//! **not** recognized here, and are left for later widening as real false positives surface:
 //!
 //! * custom attributes applied via `mergeStyle`/`applyStyle` elsewhere in the class;
-//! * a style-node read routed through another local (the table aliased to a different variable);
-//! * the `onWidgetStyleApply` signal handler (a global `rootWidget` hook, not a widget method) and
-//!   C++-side `onStyleApply` overrides.
+//! * a style-node read routed through another local (the table aliased to a different variable).
+//!
+//! C++-side `onStyleApply` overrides are covered, but not here: they are machine-extracted from the
+//! engine source into `catalog::NATIVE_WIDGET_PROPERTIES` (see `schema::native_widget_declares`),
+//! since this module only ever sees Lua.
 //!
 //! Keeping the covered set explicit means the gap is visible rather than silently assumed complete.
 //!
@@ -133,6 +151,21 @@ pub fn scan_widgets(source: &str) -> Vec<LuaWidgetDef> {
         }
     }
 
+    // Pass 3: `connect(<Class>, { onStyleApply = <fn> })` signal hooks. The handler is a plain
+    // function, not a method, so pass 2 never sees it — yet it reads style attributes just the same,
+    // and connecting it to `UIWidget` makes them valid on *every* widget (that is how `tooltip:`
+    // works). Resolve each hook's handler by name and scan its body.
+    for (class, handler) in parse_connect_style_hooks(&lines) {
+        let Some(body) = handler_body(&lines, &handler) else {
+            continue;
+        };
+        let props = collect_handler_props(body);
+        if props.is_empty() {
+            continue;
+        }
+        widgets.entry(class).or_default().1.extend(props);
+    }
+
     widgets
         .into_iter()
         .map(|(name, (lua_parent, custom_props))| LuaWidgetDef {
@@ -141,6 +174,185 @@ pub fn scan_widgets(source: &str) -> Vec<LuaWidgetDef> {
             custom_props,
         })
         .collect()
+}
+
+/// Find every `connect(<Class>, { … onStyleApply = <handler> … })` in `lines`, returning
+/// `(class, handler-name)` pairs.
+///
+/// A module can hook a *signal* handler onto a widget class instead of overriding the method — the
+/// engine's tooltip module does exactly this:
+///
+/// ```lua
+/// connect(UIWidget, { onStyleApply = onWidgetStyleApply, onHoverChange = … })
+/// ```
+///
+/// The handler then reads `styleNode.tooltip`, which makes `tooltip:` a valid style property on the
+/// connected class and everything descending from it.
+///
+/// The table literal may span lines, so the scan continues past the `connect(` — but it stops at the
+/// **end of that table** (a line closing it with `}`) or at the next `connect(`, whichever comes
+/// first. Scanning blindly ahead would let a *later* `connect(OtherClass, {onStyleApply = …})` donate
+/// its handler to a preceding `connect(` that declared no style hook of its own, attributing the
+/// properties to the wrong class.
+fn parse_connect_style_hooks(lines: &[&str]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(rest) = find_call_arg(line, "connect") else {
+            continue;
+        };
+        // The connected class is the first argument. Lua permits `connect(\n  UIWidget, {…})`, so
+        // when nothing follows the `(` on this line, look to the next non-blank one.
+        let head = rest.split(',').next().unwrap_or("").trim();
+        let class = if head.is_empty() {
+            lines[i + 1..]
+                .iter()
+                .find(|l| !l.trim().is_empty())
+                .and_then(|l| l.trim().split(',').next())
+                .and_then(|a| last_identifier(a.trim()))
+        } else {
+            last_identifier(head)
+        };
+        let Some(class) = class else {
+            continue;
+        };
+        for (offset, hook_line) in lines[i..].iter().enumerate() {
+            // Stop at the next `connect(` — its table is not ours.
+            if offset > 0 && find_call_arg(hook_line, "connect").is_some() {
+                break;
+            }
+            if let Some(handler) = table_entry_value(hook_line, "onStyleApply") {
+                out.push((class.clone(), handler));
+                break;
+            }
+            // Stop at the end of this table — a `}` anywhere on the line closes it. Checked *after*
+            // the entry test, so a single-line `connect(C, {onStyleApply = h})` still resolves; and
+            // applied on the `connect(` line itself, so a hookless single-line
+            // `connect(C, {onHoverChange = f})` stops here rather than running on and adopting some
+            // later table's `onStyleApply`.
+            if hook_line.contains('}') {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// The text after `<name>(` on `line`, or `None` when the call does not appear as a whole word.
+///
+/// Lua allows whitespace between the callee and its `(` — `connect (UIWidget, …)` — so the gap is
+/// tolerated. Matched as a whole word, so a `disconnect(` is not a `connect(`.
+fn find_call_arg<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let mut search = 0;
+    while let Some(rel) = line[search..].find(name) {
+        let idx = search + rel;
+        search = idx + name.len();
+
+        // `map_or(true, …)` rather than `Option::is_none_or` — the latter is only stable since Rust
+        // 1.82, but the workspace MSRV is 1.75.
+        let word_start = line[..idx]
+            .chars()
+            .last()
+            .map_or(true, |c| !c.is_alphanumeric() && c != '_');
+        if !word_start {
+            continue;
+        }
+        let after = &line[search..];
+        let trimmed = after.trim_start();
+        if let Some(args) = trimmed.strip_prefix('(') {
+            return Some(args);
+        }
+    }
+    None
+}
+
+/// The value of a `<key> = <value>` entry in a Lua table literal, e.g. the `onWidgetStyleApply` in
+/// `onStyleApply = onWidgetStyleApply,`. `None` when the line carries no such entry.
+///
+/// Found anywhere on the line, not just at its start, so a single-line table
+/// (`connect(C, { onStyleApply = h })`) resolves as well as the multi-line form. Matched as a whole
+/// word (a `myOnStyleApply = f` is not it) and `==` is rejected — that is a comparison, not an entry.
+fn table_entry_value(line: &str, key: &str) -> Option<String> {
+    let mut search = 0;
+    while let Some(rel) = line[search..].find(key) {
+        let idx = search + rel;
+        search = idx + key.len();
+
+        // Whole-word: `myOnStyleApply = f` is not the `onStyleApply` entry.
+        // `map_or(true, …)` rather than `Option::is_none_or` — the latter is only stable since Rust
+        // 1.82, but the workspace MSRV is 1.75.
+        let word_start = line[..idx]
+            .chars()
+            .last()
+            .map_or(true, |c| !c.is_alphanumeric() && c != '_');
+        if !word_start {
+            continue;
+        }
+        let Some(rest) = line[search..].trim_start().strip_prefix('=') else {
+            continue;
+        };
+        // Reject `==` (a comparison, not a table entry).
+        if rest.starts_with('=') {
+            continue;
+        }
+        // The value runs to the entry's end: the next `,`, or the table's `}`.
+        let value = rest.trim_start();
+        let end = value.find([',', '}', ')']).unwrap_or(value.len());
+        if let Some(id) = last_identifier(value[..end].trim()) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// The body of the top-level function named `name` — `[local ]function <name>(` up to (but not
+/// including) the next column-0 `end`. Returns the body **including** its header line, so the
+/// argument list can be read from it. `None` when no such function is defined in `lines`.
+fn handler_body<'a>(lines: &'a [&'a str], name: &str) -> Option<&'a [&'a str]> {
+    let start = lines.iter().position(|line| {
+        let t = line.trim_start();
+        let t = t.strip_prefix("local ").unwrap_or(t);
+        t.strip_prefix("function ")
+            .and_then(|r| find_call_arg(r, name).map(|_| ()))
+            .is_some()
+            || t.strip_prefix("function ")
+                .is_some_and(|r| r.trim_start().starts_with(&format!("{name}(")))
+    })?;
+    let mut end = start + 1;
+    while end < lines.len() && !starts_with_end_keyword(lines[end]) {
+        end += 1;
+    }
+    Some(&lines[start..end])
+}
+
+/// The custom style properties a **connected signal handler** reads, like [`collect_props`] but for a
+/// handler signature rather than a method's.
+///
+/// A signal handler receives the widget as its first argument — `function h(widget, styleName,
+/// styleNode)` — so the style node is the **third** parameter, where a method's `onStyleApply` (whose
+/// `self` is implicit) has it second. Both read forms are otherwise identical, so the same
+/// `styleNode.<field>` / `styleNode['<key>']` / `<key> == '<prop>'` scanners apply.
+fn collect_handler_props(body: &[&str]) -> BTreeSet<String> {
+    let node_var = body
+        .first()
+        .and_then(|header| {
+            let open = header.find('(')?;
+            let close_rel = header[open..].find(')')?;
+            header[open + 1..open + close_rel]
+                .split(',')
+                .nth(2)
+                .and_then(|a| last_identifier(a.trim()))
+        })
+        .unwrap_or_else(|| "styleNode".to_owned());
+
+    let key_var = style_key_variable(body, &node_var);
+    let mut props = BTreeSet::new();
+    for line in body {
+        if let Some(prop) = comparison_literal(line, &key_var) {
+            props.insert(prop);
+        }
+        collect_style_node_reads(line, &node_var, &mut props);
+    }
+    props
 }
 
 /// Parse a `<name> = extends(<parent>, …)` line, returning `(name, parent)`.
@@ -526,6 +738,165 @@ impl LuaWidgetIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_connected_style_hook_declares_properties_on_the_connected_class() {
+        // The engine's tooltip module attaches a *signal handler* to `UIWidget` rather than
+        // overriding a method; the handler reads `styleNode.tooltip`, which is what makes `tooltip:`
+        // a valid style property on every widget. Pass 2 (methods) never sees this shape.
+        let src = "\
+local function onWidgetStyleApply(widget, styleName, styleNode)
+    if styleNode.tooltip then
+        widget.tooltip = styleNode.tooltip
+    end
+    if styleNode.specialtooltip then
+        widget.specialtooltip = styleNode.specialtooltip
+    end
+end
+
+function g_tooltip.init()
+    connect(UIWidget, {
+        onStyleApply = onWidgetStyleApply,
+        onHoverChange = onWidgetHoverChange
+    })
+end
+";
+        let defs = scan_widgets(src);
+        let w = defs
+            .iter()
+            .find(|d| d.name == "UIWidget")
+            .expect("the connected class is recorded");
+        assert!(w.custom_props.contains("tooltip"));
+        assert!(w.custom_props.contains("specialtooltip"));
+    }
+
+    #[test]
+    fn a_style_hook_is_not_donated_to_a_preceding_connect() {
+        // A `connect(A, {...})` with no style hook must NOT pick up the `onStyleApply` of a *later*
+        // `connect(B, {...})`. Scanning blindly ahead would attribute B's properties to A.
+        let src = "\
+local function handler(widget, styleName, styleNode)
+    if styleNode.tooltip then widget.tooltip = styleNode.tooltip end
+end
+
+function m.init()
+    connect(UIButton, {
+        onHoverChange = f,
+        onDestroy = g
+    })
+    connect(UIWidget, {
+        onStyleApply = handler
+    })
+end
+";
+        let defs = scan_widgets(src);
+        let w = defs
+            .iter()
+            .find(|d| d.name == "UIWidget")
+            .expect("the hook's own class");
+        assert!(w.custom_props.contains("tooltip"));
+        // UIButton declared no style hook, so it must declare no properties.
+        assert!(
+            defs.iter()
+                .all(|d| d.name != "UIButton" || d.custom_props.is_empty()),
+            "the later hook leaked onto UIButton: {defs:?}"
+        );
+    }
+
+    #[test]
+    fn a_hookless_inline_connect_does_not_adopt_a_later_handler() {
+        // A single-line `connect(A, {...})` with no style hook closes its table on that same line.
+        // Scanning past it would let an unrelated later `onStyleApply = ...` be attributed to A.
+        let src = "\
+local function h(widget, styleName, styleNode)
+    if styleNode.tooltip then widget.tooltip = styleNode.tooltip end
+end
+
+function m.init()
+    connect(UIButton, { onHoverChange = f, onDestroy = g })
+    local handlers = { onStyleApply = h }
+end
+";
+        let defs = scan_widgets(src);
+        assert!(
+            defs.iter()
+                .all(|d| d.name != "UIButton" || d.custom_props.is_empty()),
+            "the later table's handler leaked onto UIButton: {defs:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_line_connect_style_hook_still_resolves() {
+        // The table-end guard must not cut the scan before the entry on the very same line.
+        let src = "\
+local function h(widget, styleName, styleNode)
+    if styleNode.tooltip then widget.tooltip = styleNode.tooltip end
+end
+connect(UIWidget, { onStyleApply = h })
+";
+        let defs = scan_widgets(src);
+        let w = defs
+            .iter()
+            .find(|d| d.name == "UIWidget")
+            .expect("class recorded");
+        assert!(w.custom_props.contains("tooltip"));
+    }
+
+    #[test]
+    fn a_connect_with_a_space_or_a_wrapped_class_still_resolves() {
+        // Lua allows `connect (` and a class argument on the next line. Missing either form would
+        // drop the hook's properties and turn them back into false `unknown-property` hints.
+        for src in [
+            "\
+local function h(widget, styleName, styleNode)
+    if styleNode.tooltip then widget.tooltip = styleNode.tooltip end
+end
+connect (UIWidget, {
+    onStyleApply = h
+})
+",
+            "\
+local function h(widget, styleName, styleNode)
+    if styleNode.tooltip then widget.tooltip = styleNode.tooltip end
+end
+connect(
+    UIWidget,
+    { onStyleApply = h }
+)
+",
+        ] {
+            let defs = scan_widgets(src);
+            let w = defs
+                .iter()
+                .find(|d| d.name == "UIWidget")
+                .unwrap_or_else(|| panic!("no UIWidget in {defs:?} for {src:?}"));
+            assert!(w.custom_props.contains("tooltip"), "{defs:?}");
+        }
+    }
+
+    #[test]
+    fn disconnect_is_not_mistaken_for_connect() {
+        let src = "\
+local function h(widget, styleName, styleNode)
+    if styleNode.tooltip then widget.tooltip = styleNode.tooltip end
+end
+disconnect(UIWidget, { onStyleApply = h })
+";
+        assert!(
+            scan_widgets(src).iter().all(|d| d.custom_props.is_empty()),
+            "a disconnect must not register the hook"
+        );
+    }
+
+    #[test]
+    fn a_connect_without_a_style_hook_declares_nothing() {
+        let src = "\
+function m.init()
+    connect(UIWidget, { onHoverChange = f, onDestroy = g })
+end
+";
+        assert!(scan_widgets(src).is_empty());
+    }
 
     fn props(def: &LuaWidgetDef) -> Vec<&str> {
         def.custom_props.iter().map(String::as_str).collect()

@@ -338,11 +338,28 @@ pub fn is_known_event(name: &str) -> bool {
 #[must_use]
 pub fn is_named_color(name: &str) -> bool {
     let needle = name.trim();
-    crate::catalog::NAMED_COLORS
-        .iter()
-        .chain(crate::catalog::LEGACY_COLORS)
-        .any(|(n, _)| n.eq_ignore_ascii_case(needle))
+    legacy_color_value(needle).is_some()
+        || crate::catalog::NAMED_COLORS
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case(needle))
         || contains_ascii_ci(crate::catalog::LEGACY_COLOR_NAMES, needle)
+}
+
+/// The packed `0xRRGGBBAA` of a legacy engine color static ([`crate::catalog::LEGACY_COLORS`]), or
+/// `None` when `name` is not one.
+///
+/// Matched **case-sensitively**, exactly as the engine does: `Color::operator>>` tests the statics
+/// with `tmp == "darkRed"` — a literal compare against the C++ spelling — and only *then* falls back
+/// to the case-insensitive CSS table. The distinction is not academic: for eight of these names the
+/// CSS table holds a different RGB, so `darkRed` (the engine static, `0x8B0000`-ish legacy value) and
+/// `darkred` (which falls through to CSS) are genuinely two different colors. Matching the legacy
+/// table case-insensitively would resolve both to the legacy value and show the wrong swatch.
+#[must_use]
+fn legacy_color_value(name: &str) -> Option<u32> {
+    crate::catalog::LEGACY_COLORS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, rgba)| *rgba)
 }
 
 /// The packed `0xRRGGBB` value of a CSS named color ([`crate::catalog::NAMED_COLORS`]), or `None`
@@ -374,6 +391,72 @@ pub fn named_color_value(name: &str) -> Option<u32> {
 #[must_use]
 pub fn is_known_property(name: &str) -> bool {
     crate::catalog::PROPERTIES.contains(&name)
+        || crate::catalog::STYLE_META_PROPERTIES.contains(&name)
+}
+
+/// True if `name` is one of the engine's `__`-prefixed style **meta keys**
+/// ([`crate::catalog::STYLE_META_PROPERTIES`]): `__class`, which names the widget class the engine
+/// instantiates for a style (see `widget_resolve`'s re-root), and `__unique`.
+///
+/// The style *manager* reads these straight off the style node (`styleNode->valueAt("__class")`);
+/// they never pass through the widget style parser, so they are absent from
+/// [`crate::catalog::PROPERTIES`] — which is why [`is_known_property`] folds them in.
+#[must_use]
+pub fn is_style_meta_property(name: &str) -> bool {
+    crate::catalog::STYLE_META_PROPERTIES.contains(&name)
+}
+
+/// True if `name` is a key the engine reads **inside a `layout:` block**
+/// ([`crate::catalog::LAYOUT_PROPERTIES`]).
+///
+/// These keys (`type`, `spacing`, `fit-children`, `cell-size`, `num-columns`, `flow`, …) are
+/// dispatched by the *layout object* (`UIBoxLayout` / `UIGridLayout` / … `::applyStyle`), not by the
+/// widget style parser, so they are absent from [`crate::catalog::PROPERTIES`] and are **only** valid
+/// nested under a `layout:` block — at widget level they are genuinely unknown. Callers must
+/// therefore gate on the block context; see `diagnostics::check_property`.
+///
+/// **Exact match**, like [`is_known_property`]: the engine dispatches on `node->tag() == "..."`.
+///
+/// The catalog holds the **union** across the layout classes. The engine instantiates one layout per
+/// widget and each class ignores the keys it does not read, so a key belonging to a different layout
+/// type (`spacing:` under `type: grid`, say) is silently ignored rather than an error — accepting the
+/// union therefore prefers a false negative over a false positive, as the diagnostics rule requires.
+#[must_use]
+pub fn is_layout_block_property(name: &str) -> bool {
+    crate::catalog::LAYOUT_PROPERTIES.contains(&name)
+}
+
+/// True if the **native** widget class `widget` dispatches `prop` in its own `onStyleApply` override
+/// ([`crate::catalog::NATIVE_WIDGET_PROPERTIES`]).
+///
+/// A C++ widget subclass can read style tags the base parser knows nothing about — `UITextEdit` reads
+/// `placeholder` / `max-length` / `multiline`, `UIItem` reads `item-id` / `virtual`, `UIGraph` reads
+/// `capacity`. These reach neither [`is_known_property`] (they are not in the base style parser) nor
+/// the Lua scanner (the class is C++, so it has no `extends` line), so without this they look unknown.
+///
+/// Unlike [`is_known_property`] this is **per widget**, not global: the tag is valid only on that
+/// class and its descendants. Callers must therefore resolve the widget's ancestry and test each
+/// native class on it — see `widget_resolve::WidgetAncestry::declares_custom_property`. That keeps a
+/// `change-cursor-image:` on a `Button` correctly unknown (it is `UITextEdit`'s, and the engine reads
+/// it nowhere on a button), while accepting it on a `TextEdit`.
+///
+/// Both names are matched exactly, as the engine dispatches them.
+#[must_use]
+pub fn native_widget_declares(widget: &str, prop: &str) -> bool {
+    crate::catalog::NATIVE_WIDGET_PROPERTIES
+        .iter()
+        .any(|(class, props)| *class == widget && props.contains(&prop))
+}
+
+/// Every style property the native widget class `widget` adds in its own `onStyleApply`
+/// ([`crate::catalog::NATIVE_WIDGET_PROPERTIES`]), or an empty slice when it adds none. The
+/// enumeration counterpart to [`native_widget_declares`], for completion.
+#[must_use]
+pub fn native_widget_properties(widget: &str) -> &'static [&'static str] {
+    crate::catalog::NATIVE_WIDGET_PROPERTIES
+        .iter()
+        .find(|(class, _)| *class == widget)
+        .map_or(&[], |(_, props)| *props)
 }
 
 /// Classify a color value by its parseable form, faithful to `Color::operator>>` in the engine.
@@ -427,12 +510,12 @@ pub fn color_value(value: &str) -> Option<Rgba> {
     if v.eq_ignore_ascii_case("transparent") {
         return Some(Rgba::from_u8(0, 0, 0, 0));
     }
-    // Legacy engine statics first (engine precedence), unpacking the alpha-carrying 0xRRGGBBAA.
-    if let Some((_, rgba)) = crate::catalog::LEGACY_COLORS
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case(v))
-    {
-        let [r, g, b, a] = unpack_rgba(*rgba);
+    // Legacy engine statics first (engine precedence), matched case-sensitively as the engine does,
+    // unpacking the alpha-carrying 0xRRGGBBAA. A near-miss spelling (`darkred` for `darkRed`) falls
+    // through to the CSS table below — which is exactly what the engine does, and yields a different
+    // color.
+    if let Some(rgba) = legacy_color_value(v) {
+        let [r, g, b, a] = unpack_rgba(rgba);
         return Some(Rgba::from_u8(r, g, b, a));
     }
     named_color_value(v).map(|rgb| {
@@ -757,6 +840,47 @@ fn hsl_to_rgb(mut h: f64, s: f64, l: f64) -> (u8, u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_legacy_color_static_matches_only_its_exact_engine_spelling() {
+        // `Color::operator>>` tests the statics with a literal `tmp == "darkRed"` compare, then falls
+        // back to the case-insensitive CSS table. So `darkRed` is the engine static and `darkred`
+        // falls through to CSS — and those are *different colors*. Matching the legacy table
+        // case-insensitively would resolve both to the static and paint the wrong swatch.
+        let exact = color_value("darkGreen").expect("engine static");
+        let miscased = color_value("darkgreen").expect("falls back to the CSS table");
+        assert_ne!(
+            exact, miscased,
+            "the engine static and the CSS entry must not collapse to one color"
+        );
+
+        // Both spellings are still *recognized* — they just resolve differently.
+        assert!(is_named_color("darkGreen"));
+        assert!(is_named_color("darkgreen"));
+    }
+
+    #[test]
+    fn a_lowercase_legacy_name_still_resolves_to_the_static() {
+        // Names the engine spells in lowercase (`green`, `teal`, `gray`) match the static chain
+        // exactly as written, so they keep the legacy value — and these are the ones real `.otui`
+        // files actually use.
+        //
+        // Pinned to the concrete value: the engine's `green` is the bright `0x00ff00`, *not* the
+        // darker CSS `green` (`0x008000`). A regression that routes it to the CSS table must fail
+        // here — asserting `color_value("green") == color_value("green")` would not catch that.
+        assert_eq!(color_value("green"), Some(Rgba::from_u8(0, 255, 0, 255)));
+        assert!(is_named_color("green"));
+        assert!(is_named_color("alpha"));
+    }
+
+    #[test]
+    fn a_legacy_only_name_is_unknown_when_miscased() {
+        // `darkPink` has no CSS counterpart, so any other spelling matches nothing in the engine:
+        // the istream rewinds and the color is left unset.
+        assert!(is_named_color("darkPink"));
+        assert!(!is_named_color("darkpink"));
+        assert!(!is_named_color("DARKPINK"));
+    }
 
     #[test]
     fn states_set_has_exactly_fourteen_names() {

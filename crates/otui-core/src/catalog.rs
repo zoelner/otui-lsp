@@ -11,10 +11,17 @@
 //! * [`COLOR_PROPERTIES`] — the subset of property tags whose value the engine parses as a
 //!   color (`node->value<Color>()` / `Color(node->value())`), used to gate named-color
 //!   swatches to genuine color-value positions.
+//! * [`LAYOUT_PROPERTIES`] — the keys read inside a `layout:` block (the union of the
+//!   layout classes' `applyStyle` tags, plus the block's `type`). Disjoint from
+//!   [`PROPERTIES`] — valid only *inside* a `layout:` block.
+//! * [`NATIVE_WIDGET_PROPERTIES`] — the tags each native widget subclass dispatches in its
+//!   own `onStyleApply` override, keyed by `UI` class. Valid only on that class and its
+//!   descendants, so they are resolved through the widget ancestry, not globally.
 //! * [`NAMED_COLORS`] — the CSS named-color table as `(name, 0xRRGGBB)` pairs, lowercased
 //!   to match the engine's case-insensitive lookup. The packed value is the color's RGB.
 //! * [`LEGACY_COLORS`] — the legacy engine color statics as `(name, 0xRRGGBBAA)` pairs
-//!   (alpha preserved), lowercased.
+//!   (alpha preserved), in the engine's **exact** spelling: it matches them
+//!   case-sensitively before falling back to the case-insensitive CSS table.
 //! * [`LEGACY_COLOR_NAMES`] — recognized color names with no extractable RGB value (the
 //!   `transparent` alias); membership only.
 //!
@@ -192,6 +199,116 @@ pub static COLOR_PROPERTIES: &[&str] = &[
     "ttf-stroke-color",
 ];
 
+/// Keys the engine reads inside a `layout:` block — the union of the layout classes' `applyStyle`
+/// tags plus the block's own `type` key. Disjoint from [`PROPERTIES`]: these are dispatched by the
+/// layout object, not the widget style parser, so they are only valid *inside* a `layout:` block.
+pub static LAYOUT_PROPERTIES: &[&str] = &[
+    "align-bottom",
+    "align-right",
+    "auto-spacing",
+    "cell-height",
+    "cell-size",
+    "cell-spacing",
+    "cell-width",
+    "fit-children",
+    "flow",
+    "num-columns",
+    "num-lines",
+    "spacing",
+    "type",
+];
+
+/// OTML tags each native widget subclass dispatches in its own `onStyleApply` override: `(UI class,
+/// sorted tags)`. Valid **only** on that class and its descendants — unlike [`PROPERTIES`], which is
+/// global. Resolved through the widget's ancestry; see `widget_resolve`.
+pub static NATIVE_WIDGET_PROPERTIES: &[(&str, &[&str])] = &[
+    (
+        "UICreature",
+        &[
+            "creature-center",
+            "creature-size",
+            "outfit-body",
+            "outfit-direction",
+            "outfit-feet",
+            "outfit-head",
+            "outfit-id",
+            "outfit-legs",
+        ],
+    ),
+    (
+        "UIEffect",
+        &["effect-id", "effect-visible", "show-id", "virtual"],
+    ),
+    (
+        "UIGraph",
+        &["capacity", "show-info", "show-labels", "title"],
+    ),
+    (
+        "UIItem",
+        &[
+            "always-show-count",
+            "flip-direction",
+            "item-count",
+            "item-id",
+            "item-visible",
+            "show-id",
+            "virtual",
+        ],
+    ),
+    ("UIMap", &["draw-lights"]),
+    ("UIMinimap", &["max-zoom", "min-zoom", "zoom"]),
+    (
+        "UIMissile",
+        &[
+            "direction",
+            "missile-id",
+            "missile-visible",
+            "show-id",
+            "virtual",
+        ],
+    ),
+    ("UIParticles", &["effect", "reference-pos"]),
+    (
+        "UIProgressRect",
+        &["duration", "percent", "show-progress", "show-time"],
+    ),
+    ("UISprite", &["sprite-color", "sprite-id", "sprite-visible"]),
+    (
+        "UITextEdit",
+        &[
+            "auto-scroll",
+            "change-cursor-image",
+            "cursor-visible",
+            "editable",
+            "font",
+            "font-scale",
+            "max-length",
+            "multiline",
+            "placeholder",
+            "placeholder-align",
+            "placeholder-color",
+            "placeholder-font",
+            "selectable",
+            "selection",
+            "selection-background-color",
+            "selection-color",
+            "shift-navigation",
+            "stroke",
+            "text",
+            "text-hidden",
+            "ttf-font",
+            "ttf-font-size",
+            "ttf-stroke-color",
+            "ttf-stroke-width",
+        ],
+    ),
+];
+
+/// The `__`-prefixed style meta keys the style manager reads off a style node (`__class`, which
+/// re-roots the widget class, and `__unique`). Valid on any style; not dispatched by the widget
+/// style parser, so disjoint from [`PROPERTIES`].
+pub static STYLE_META_PROPERTIES: &[&str] = &["__class", "__unique"];
+
 /// CSS named colors recognized by the engine's color parser: `(lowercased name, packed 0xRRGGBB)`.
 pub static NAMED_COLORS: &[(&str, u32)] = &[
     ("aliceblue", 0xF0F8FF),
@@ -344,21 +461,23 @@ pub static NAMED_COLORS: &[(&str, u32)] = &[
     ("yellowgreen", 0x9ACD32),
 ];
 
-/// Legacy engine color statics: `(lowercased name, packed 0xRRGGBBAA)` (alpha preserved).
+/// Legacy engine color statics: `(exact engine spelling, packed 0xRRGGBBAA)` (alpha preserved).
+/// Matched **case-sensitively** — the engine compares `tmp == "darkRed"` before its case-insensitive
+/// CSS fallback, and for eight of these names the CSS table holds a different RGB.
 pub static LEGACY_COLORS: &[(&str, u32)] = &[
     ("alpha", 0x00000000),
     ("black", 0x000000FF),
     ("blue", 0x0000FFFF),
-    ("darkblue", 0x000080FF),
-    ("darkgray", 0x808080FF),
-    ("darkgreen", 0x008000FF),
-    ("darkpink", 0x800080FF),
-    ("darkred", 0x800000FF),
-    ("darkteal", 0x008080FF),
-    ("darkyellow", 0x808000FF),
+    ("darkBlue", 0x000080FF),
+    ("darkGray", 0x808080FF),
+    ("darkGreen", 0x008000FF),
+    ("darkPink", 0x800080FF),
+    ("darkRed", 0x800000FF),
+    ("darkTeal", 0x008080FF),
+    ("darkYellow", 0x808000FF),
     ("gray", 0xA0A0A0FF),
     ("green", 0x00FF00FF),
-    ("lightgray", 0xC0C0C0FF),
+    ("lightGray", 0xC0C0C0FF),
     ("orange", 0xFF8C00FF),
     ("pink", 0xFF00FFFF),
     ("red", 0xFF0000FF),

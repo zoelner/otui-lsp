@@ -56,3 +56,38 @@ Button
       (property
         key: (property_key)
         value: (plain_value)))))
+
+================================================================================
+compound state selector (space-separated conjunction)
+================================================================================
+
+Button
+  $pressed disabled:
+    color: #111111
+  $checked hover !disabled:
+    color: #222222
+
+--------------------------------------------------------------------------------
+
+(document
+  (container
+    tag: (tag)
+    (state_selector
+      (state
+        name: (state_name))
+      (state
+        name: (state_name))
+      (property
+        key: (property_key)
+        value: (color)))
+    (state_selector
+      (state
+        name: (state_name))
+      (state
+        name: (state_name))
+      (state
+        negated: (state_negation)
+        name: (state_name))
+      (property
+        key: (property_key)
+        value: (color)))))

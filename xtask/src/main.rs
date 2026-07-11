@@ -26,6 +26,8 @@
 //! idea in the plan) can reuse [`Catalog`] by writing multiple named tables; the extraction and the
 //! `--src` plumbing already isolate "which engine tree" from "what we emit".
 
+mod corpus;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -37,10 +39,55 @@ use regex::Regex;
 /// translation units. The image/text files are treated as **optional** so the extractor still works
 /// against forks that inline them into the base file.
 const PROPERTY_FILES: &[(&str, bool)] = &[
-    ("src/framework/ui/uiwidgetbasestyle.cpp", true),
+    (BASE_STYLE_FILE, true),
     ("src/framework/ui/uiwidgetimage.cpp", false),
     ("src/framework/ui/uiwidgettext.cpp", false),
 ];
+
+/// The widget style parser itself (`UIWidget::parseBaseStyle`). Required: it carries both the bulk
+/// of the property tags and the `layout:` block handler that names the block's `type` key.
+const BASE_STYLE_FILE: &str = "src/framework/ui/uiwidgetbasestyle.cpp";
+
+/// Engine-source files (relative to the engine-source root) whose `applyStyle` reads the keys of a
+/// `layout:` **block**. These keys are dispatched by the *layout* object, not by the widget style
+/// parser, so they never appear in [`PROPERTY_FILES`] — without them every `cell-size:` /
+/// `spacing:` / `flow:` under a `layout:` block looks like an unknown property.
+///
+/// The set is the **union** across the layout classes: the engine picks one layout per widget and
+/// each class silently ignores the keys it does not read, so a key that belongs to a *different*
+/// layout type is ignored rather than an error. Accepting the union therefore prefers a false
+/// negative (never flagging `spacing:` under `type: grid`) over a false positive, matching the
+/// diagnostics rule in `otui-core`.
+///
+/// All are optional: a fork may inline or drop a layout class, and the union just shrinks.
+const LAYOUT_FILES: &[&str] = &[
+    "src/framework/ui/uilayout.cpp",
+    "src/framework/ui/uiboxlayout.cpp",
+    "src/framework/ui/uiverticallayout.cpp",
+    "src/framework/ui/uihorizontallayout.cpp",
+    "src/framework/ui/uigridlayout.cpp",
+    "src/framework/ui/uianchorlayout.cpp",
+];
+
+/// Engine-source directories (relative to the engine-source root) holding the **native widget**
+/// classes. A widget subclass may override `onStyleApply` and dispatch OTML tags of its own — e.g.
+/// `UITextEdit` reads `placeholder`, `max-length`, `multiline`; `UIItem` reads `item-id`, `virtual`.
+///
+/// These tags reach neither [`PROPERTY_FILES`] (they are not in the base style parser) nor the Lua
+/// scanner (the class is C++, so there is no `extends` line), so without them a perfectly valid
+/// `placeholder:` on a `TextEdit` looks unknown. Unlike the base catalog they are keyed **per
+/// widget**: they are valid only on that class and its descendants, so `change-cursor-image` on a
+/// `Button` stays unknown — as it is, the engine reads it nowhere there.
+const NATIVE_WIDGET_DIRS: &[&str] = &["src/framework/ui", "src/client"];
+
+/// The style manager, which reads the `__`-prefixed **meta keys** a style may carry — `__class` (the
+/// widget class to instantiate, see `widget_resolve`'s re-root) and `__unique`. These are read off the
+/// style node directly (`styleNode->valueAt("__class")`), never dispatched through the widget style
+/// parser, so they are absent from [`PROPERTY_FILES`] and were hinted as unknown properties.
+///
+/// Scoped to this one file on purpose: `__`-prefixed literals elsewhere in the engine are Lua
+/// metamethods (`__index`, `__gc`, …), not OTUI keys.
+const STYLE_META_FILE: &str = "src/framework/ui/uimanager.cpp";
 
 /// Relative path (under the engine-source root) of the CSS named-color table + legacy color names.
 const COLOR_FILE: &str = "src/framework/util/color.cpp";
@@ -56,12 +103,26 @@ struct Catalog {
     /// `border-color*`, `icon-color`, `image-color`, `ttf-stroke-color`). Sorted. Used to gate
     /// named-color swatches to genuine color-value positions.
     color_properties: Vec<String>,
+    /// The keys the engine reads inside a `layout:` **block** — the union of every layout class's
+    /// `applyStyle` tags (`spacing`, `fit-children`, `cell-size`, `num-columns`, `flow`, …) plus the
+    /// `type` key the widget style parser itself reads via `valueAt<std::string>("type", "")`.
+    /// Sorted. Dispatched by the layout object, not the widget style parser, so these are disjoint
+    /// from [`Catalog::properties`] and must be checked in the `layout:` block context.
+    layout_properties: Vec<String>,
+    /// The OTML tags each **native widget subclass** dispatches in its own `onStyleApply` override,
+    /// as `(UI class name, sorted tags)`, sorted by class. Keyed per widget — unlike
+    /// [`Catalog::properties`] these are valid only on that class and its descendants.
+    native_widget_properties: Vec<(String, Vec<String>)>,
+    /// The `__`-prefixed style **meta keys** the style manager reads off a style node (`__class`,
+    /// `__unique`). Sorted. Not dispatched by the widget style parser, so disjoint from
+    /// [`Catalog::properties`], but valid on any style.
+    style_meta_properties: Vec<String>,
     /// The CSS named-color table: `(lowercased name, packed 0xRRGGBB)`, sorted by name. The value is
     /// captured from the `rgb_to_abgr(0xRRGGBB)` literal in the engine's `kCss` table.
     named_colors: Vec<(String, u32)>,
     /// The legacy engine color statics (`const Color Color::NAME = 0xAABBGGRR;`, e.g. `red`, `teal`,
-    /// `darkPink`) as `(lowercased name, packed 0xRRGGBBAA)`, converted from the source's AABBGGRR
-    /// literal so alpha is preserved. Sorted by name.
+    /// `darkPink`) as `(exact engine spelling, packed 0xRRGGBBAA)`, converted from the source's
+    /// AABBGGRR literal so alpha is preserved. Sorted by name.
     legacy_colors: Vec<(String, u32)>,
     /// Legacy color names recognized by the engine but with no extractable RGB value (the
     /// `transparent` alias, matched as `key == "transparent"` in `css_lookup`) — kept names-only for
@@ -79,22 +140,43 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("corpus") => match corpus_task(args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(msg) => {
+                eprintln!("xtask corpus: {msg}");
+                ExitCode::FAILURE
+            }
+        },
         Some(other) => {
-            eprintln!("xtask: unknown task '{other}'. Available: gen-catalog");
+            eprintln!("xtask: unknown task '{other}'. Available: gen-catalog, corpus");
             ExitCode::FAILURE
         }
         None => {
             eprintln!(
                 "usage: cargo xtask <task>\n  tasks:\n    gen-catalog --src <engine-source-root>   \
-                 generate the OTUI property/color catalog"
+                 generate the OTUI property/color catalog\n    corpus --src <engine-source-root>        \
+                 report diagnostics over a real engine .otui corpus"
             );
             ExitCode::FAILURE
         }
     }
 }
 
-fn gen_catalog(mut args: impl Iterator<Item = String>) -> Result<(), String> {
-    // --- resolve the engine-source root (never hard-coded; leak-safety requirement) -------------
+/// `corpus --src <engine-source-root>` — run the fidelity harness over a real engine tree.
+///
+/// Lives here rather than as an `otui-core` example because it does I/O (argument parsing, directory
+/// traversal, file reads) and `otui-core` must stay pure.
+fn corpus_task(args: impl Iterator<Item = String>) -> Result<(), String> {
+    let src = resolve_engine_src(args)?;
+    corpus::run(&src);
+    Ok(())
+}
+
+/// Resolve the engine-source root from `--src <path>` / `--src=<path>` or `OTUI_ENGINE_SRC`.
+///
+/// **Never hard-coded** (leak-safety requirement): with neither given, this errors rather than
+/// guessing a path, so no absolute path or fork identity can be baked into the tool or its output.
+fn resolve_engine_src(mut args: impl Iterator<Item = String>) -> Result<PathBuf, String> {
     let mut src: Option<String> = std::env::var("OTUI_ENGINE_SRC")
         .ok()
         .filter(|s| !s.is_empty());
@@ -120,6 +202,11 @@ fn gen_catalog(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             src.display()
         ));
     }
+    Ok(src)
+}
+
+fn gen_catalog(args: impl Iterator<Item = String>) -> Result<(), String> {
+    let src = resolve_engine_src(args)?;
 
     // --- extract ---------------------------------------------------------------------------------
     let catalog = extract(&src)?;
@@ -132,10 +219,12 @@ fn gen_catalog(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         .map_err(|e| format!("failed to write '{}': {e}", out_path.display()))?;
 
     println!(
-        "gen-catalog: wrote {} properties ({} color-typed), {} named colors, {} legacy colors and \
-         {} legacy names to {}",
+        "gen-catalog: wrote {} properties ({} color-typed), {} layout-block keys, {} native \
+         widgets, {} named colors, {} legacy colors and {} legacy names to {}",
         catalog.properties.len(),
         catalog.color_properties.len(),
+        catalog.layout_properties.len(),
+        catalog.native_widget_properties.len(),
         catalog.named_colors.len(),
         catalog.legacy_colors.len(),
         catalog.legacy_color_names.len(),
@@ -188,6 +277,31 @@ fn extract(src: &Path) -> Result<Catalog, String> {
         );
     }
 
+    // Layout-block keys: the same `node->tag() == "..."` dispatch, but in the layout classes'
+    // `applyStyle` rather than the widget style parser, plus the `type` key the widget style parser
+    // reads out of the block itself.
+    let mut layout_properties: Vec<String> = Vec::new();
+    for rel in LAYOUT_FILES {
+        let path = src.join(rel);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            eprintln!(
+                "gen-catalog: note: optional layout file '{rel}' not found; skipping its keys."
+            );
+            continue;
+        };
+        let stripped = strip_comments(&text);
+        for caps in prop_re.captures_iter(&stripped) {
+            layout_properties.push(caps[1].to_string());
+        }
+    }
+    layout_properties.extend(extract_layout_type_keys(src)?);
+    if layout_properties.is_empty() {
+        return Err(
+            "extracted zero layout-block keys — is the layout `applyStyle` layout as expected?"
+                .into(),
+        );
+    }
+
     // Colors: the CSS table entries `{"name", rgb_to_abgr(0xRRGGBB)}` (name + RGB value), the legacy
     // engine color statics `const Color Color::NAME = 0xAABBGGRR` (name + RGBA value, alpha
     // preserved), and any remaining recognized names (the `transparent` alias). Names are lowercased
@@ -204,15 +318,18 @@ fn extract(src: &Path) -> Result<Catalog, String> {
     // the CSS table or the legacy statics — those extras are recognized but have no extractable RGB,
     // so they are membership-only (e.g. `transparent`).
     let name_re = Regex::new(r#"\b(?:tmp|key)\s*==\s*"([^"]+)""#).expect("valid color-name regex");
-    let valued: std::collections::HashSet<&str> = named_colors
+    // Compared case-insensitively purely as a *dedup* key: the legacy names now carry the engine's
+    // exact camelCase, so a case-sensitive membership test would let `darkPink` through as a
+    // "valueless" name and re-introduce the case-insensitive match this table exists to avoid.
+    let valued: std::collections::HashSet<String> = named_colors
         .iter()
         .chain(legacy_colors.iter())
-        .map(|(n, _)| n.as_str())
+        .map(|(n, _)| n.to_ascii_lowercase())
         .collect();
     let mut legacy_color_names: Vec<String> = Vec::new();
     for caps in name_re.captures_iter(&color_text) {
         let lower = caps[1].to_ascii_lowercase();
-        if !valued.contains(lower.as_str()) {
+        if !valued.contains(&lower) {
             legacy_color_names.push(lower);
         }
     }
@@ -220,10 +337,154 @@ fn extract(src: &Path) -> Result<Catalog, String> {
     Ok(Catalog {
         properties: sorted_dedup(properties),
         color_properties: sorted_dedup(color_properties),
+        layout_properties: sorted_dedup(layout_properties),
+        native_widget_properties: extract_native_widget_properties(src)?,
+        style_meta_properties: extract_style_meta_properties(src)?,
         named_colors,
         legacy_colors,
         legacy_color_names: sorted_dedup(legacy_color_names),
     })
+}
+
+/// Extract, per native widget class, the OTML tags it dispatches in its **own** `onStyleApply`
+/// override — the mechanism by which a C++ subclass adds style properties the base parser knows
+/// nothing about (`UITextEdit` → `placeholder`, `UIItem` → `item-id`, `UIGraph` → `capacity`, …).
+///
+/// Scans every `.cpp` under [`NATIVE_WIDGET_DIRS`] for a `void <Class>::onStyleApply(` definition,
+/// takes its body up to the next column-0 `}` (engine style puts every method body at column 0, so
+/// this bounds it reliably), and pulls the `node->tag() == "..."` tags out of it — the same dispatch
+/// shape the base catalog uses.
+///
+/// `UIWidget` is skipped: its `onStyleApply` delegates to `parseBaseStyle`, whose tags are already
+/// the global catalog, and re-listing them per-widget would say they are *only* valid on `UIWidget`.
+///
+/// Classes with no dispatched tag are dropped, so the table holds only widgets that genuinely add
+/// properties. Missing directories are tolerated (a fork may not ship `src/client`).
+fn extract_native_widget_properties(src: &Path) -> Result<Vec<(String, Vec<String>)>, String> {
+    let def_re =
+        Regex::new(r"\bvoid\s+(UI\w+)::onStyleApply\s*\(").expect("valid onStyleApply regex");
+    let tag_re = Regex::new(r#"\btag\s*(?:\(\))?\s*==\s*"([^"]+)""#).expect("valid property regex");
+
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for dir in NATIVE_WIDGET_DIRS {
+        let dir = src.join(dir);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            eprintln!(
+                "gen-catalog: note: optional widget dir '{}' not found; skipping.",
+                dir.display()
+            );
+            continue;
+        };
+        let mut files: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "cpp"))
+            .collect();
+        files.sort();
+
+        for path in files {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let stripped = strip_comments(&text);
+            for caps in def_re.captures_iter(&stripped) {
+                let class = caps[1].to_string();
+                if class == "UIWidget" {
+                    continue; // its tags are the base catalog, not a per-widget addition
+                }
+                // Body: from the end of the signature to the next column-0 `}`.
+                let start = caps.get(0).expect("match 0").end();
+                let rest = &stripped[start..];
+                let end = rest.find("\n}").map_or(rest.len(), |i| i + 1);
+                let tags: Vec<String> = tag_re
+                    .captures_iter(&rest[..end])
+                    .map(|c| c[1].to_string())
+                    .collect();
+                if tags.is_empty() {
+                    continue;
+                }
+                out.push((class, sorted_dedup(tags)));
+            }
+        }
+    }
+
+    // Merge duplicate class entries (a class split across translation units) and sort by class.
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut merged: Vec<(String, Vec<String>)> = Vec::new();
+    for (class, tags) in out {
+        match merged.last_mut() {
+            Some((prev, prev_tags)) if *prev == class => {
+                prev_tags.extend(tags);
+                let taken = std::mem::take(prev_tags);
+                *prev_tags = sorted_dedup(taken);
+            }
+            _ => merged.push((class, tags)),
+        }
+    }
+    if merged.is_empty() {
+        return Err(
+            "extracted zero native-widget properties — is the widget-source layout as expected?"
+                .into(),
+        );
+    }
+    Ok(merged)
+}
+
+/// The `__`-prefixed style meta keys the style manager reads off a style node — `__class` and
+/// `__unique` — from `(?:valueAt|writeAt|get)("__key")` in [`STYLE_META_FILE`].
+fn extract_style_meta_properties(src: &Path) -> Result<Vec<String>, String> {
+    let path = src.join(STYLE_META_FILE);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read '{}': {e}", path.display()))?;
+    let stripped = strip_comments(&text);
+
+    let re = Regex::new(r#"\b(?:valueAt|writeAt|get)\s*\(\s*"(__\w+)""#)
+        .expect("valid style-meta regex");
+    let keys: Vec<String> = re
+        .captures_iter(&stripped)
+        .map(|c| c[1].to_string())
+        .collect();
+    if keys.is_empty() {
+        return Err("extracted zero style meta keys — is the style manager as expected?".into());
+    }
+    Ok(sorted_dedup(keys))
+}
+
+/// The keys the widget style parser reads directly out of a `layout:` block — the `type` in
+/// `layoutType = node->valueAt<std::string>("type", "")`, inside the `node->tag() == "layout"`
+/// handler of `uiwidgetbasestyle.cpp`.
+///
+/// Scoped to that handler (a window from the `"layout"` tag compare to the next tag compare) so an
+/// unrelated `valueAt` elsewhere in the style parser is never captured. Extracted rather than
+/// hard-coded so a fork that renames the key is picked up by a regenerate.
+fn extract_layout_type_keys(src: &Path) -> Result<Vec<String>, String> {
+    let path = src.join(BASE_STYLE_FILE);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read '{}': {e}", path.display()))?;
+    let stripped = strip_comments(&text);
+
+    // Narrow to the `layout` handler: from its tag compare up to the next one.
+    let handler_re =
+        Regex::new(r#"\btag\s*(?:\(\))?\s*==\s*"layout"([\s\S]*?)\btag\s*(?:\(\))?\s*==\s*""#)
+            .expect("valid layout-handler regex");
+    let Some(handler) = handler_re.captures(&stripped) else {
+        return Err(
+            "could not locate the `tag() == \"layout\"` handler — is the style-dispatch layout as \
+             expected?"
+                .into(),
+        );
+    };
+
+    let key_re =
+        Regex::new(r#"\bvalueAt\s*<[^>]*>\s*\(\s*"([^"]+)""#).expect("valid valueAt regex");
+    let keys: Vec<String> = key_re
+        .captures_iter(&handler[1])
+        .map(|caps| caps[1].to_string())
+        .collect();
+    if keys.is_empty() {
+        return Err("the `layout` handler yielded no `valueAt` key (expected `type`)".into());
+    }
+    Ok(keys)
 }
 
 /// Extract the OTML property tags whose value the engine parses as a color: a `tag == "..."` compare
@@ -243,14 +504,21 @@ fn extract_color_properties(stripped: &str) -> Vec<String> {
 }
 
 /// Extract the legacy engine color statics (`const Color Color::NAME = 0xAABBGGRR;`) as
-/// `(lowercased name, packed 0xRRGGBBAA)`, converting the source's AABBGGRR (little-endian channel)
-/// literal into RGBA so alpha survives. Sorted by name, de-duped (first wins).
+/// `(name, packed 0xRRGGBBAA)`, converting the source's AABBGGRR (little-endian channel) literal into
+/// RGBA so alpha survives. Sorted by name, de-duped (first wins).
+///
+/// The name keeps the engine's **exact** spelling (`darkRed`, `lightGray`, …), because the engine
+/// matches these statics case-**sensitively**: `Color::operator>>` compares `tmp == "darkRed"` before
+/// falling back to the case-insensitive CSS table. Lowercasing them here would erase that
+/// distinction — and it matters, because for eight of these names the CSS table holds a *different*
+/// RGB (legacy `green` is `0x00FF00`, CSS `green` is `0x008000`), so `darkred` and `darkRed` are two
+/// different colors in the engine.
 fn extract_legacy_colors(color_text: &str) -> Vec<(String, u32)> {
     let re = Regex::new(r#"const\s+Color\s+Color::(\w+)\s*=\s*0x([0-9A-Fa-f]+)U?\s*;"#)
         .expect("valid legacy-color regex");
     let mut out: Vec<(String, u32)> = Vec::new();
     for caps in re.captures_iter(color_text) {
-        let name = caps[1].to_ascii_lowercase();
+        let name = caps[1].to_string();
         // Parse the AABBGGRR literal, then repack as 0xRRGGBBAA.
         if let Ok(abgr) = u32::from_str_radix(&caps[2], 16) {
             let a = (abgr >> 24) & 0xFF;
@@ -366,10 +634,17 @@ fn render(catalog: &Catalog) -> String {
          //! * [`COLOR_PROPERTIES`] — the subset of property tags whose value the engine parses as a\n\
          //!   color (`node->value<Color>()` / `Color(node->value())`), used to gate named-color\n\
          //!   swatches to genuine color-value positions.\n\
+         //! * [`LAYOUT_PROPERTIES`] — the keys read inside a `layout:` block (the union of the\n\
+         //!   layout classes' `applyStyle` tags, plus the block's `type`). Disjoint from\n\
+         //!   [`PROPERTIES`] — valid only *inside* a `layout:` block.\n\
+         //! * [`NATIVE_WIDGET_PROPERTIES`] — the tags each native widget subclass dispatches in its\n\
+         //!   own `onStyleApply` override, keyed by `UI` class. Valid only on that class and its\n\
+         //!   descendants, so they are resolved through the widget ancestry, not globally.\n\
          //! * [`NAMED_COLORS`] — the CSS named-color table as `(name, 0xRRGGBB)` pairs, lowercased\n\
          //!   to match the engine's case-insensitive lookup. The packed value is the color's RGB.\n\
          //! * [`LEGACY_COLORS`] — the legacy engine color statics as `(name, 0xRRGGBBAA)` pairs\n\
-         //!   (alpha preserved), lowercased.\n\
+         //!   (alpha preserved), in the engine's **exact** spelling: it matches them\n\
+         //!   case-sensitively before falling back to the case-insensitive CSS table.\n\
          //! * [`LEGACY_COLOR_NAMES`] — recognized color names with no extractable RGB value (the\n\
          //!   `transparent` alias); membership only.\n\
          //!\n\
@@ -387,14 +662,51 @@ fn render(catalog: &Catalog) -> String {
     s.push_str(&render_slice("COLOR_PROPERTIES", &catalog.color_properties));
     s.push('\n');
     s.push_str(
+        "/// Keys the engine reads inside a `layout:` block — the union of the layout classes' \
+         `applyStyle`\n\
+         /// tags plus the block's own `type` key. Disjoint from [`PROPERTIES`]: these are \
+         dispatched by the\n\
+         /// layout object, not the widget style parser, so they are only valid *inside* a \
+         `layout:` block.\n",
+    );
+    s.push_str(&render_slice(
+        "LAYOUT_PROPERTIES",
+        &catalog.layout_properties,
+    ));
+    s.push('\n');
+    s.push_str(
+        "/// OTML tags each native widget subclass dispatches in its own `onStyleApply` override: \
+         `(UI class,\n\
+         /// sorted tags)`. Valid **only** on that class and its descendants — unlike \
+         [`PROPERTIES`], which is\n\
+         /// global. Resolved through the widget's ancestry; see `widget_resolve`.\n",
+    );
+    s.push_str(&render_native_widgets(
+        "NATIVE_WIDGET_PROPERTIES",
+        &catalog.native_widget_properties,
+    ));
+    s.push('\n');
+    s.push_str(
+        "/// The `__`-prefixed style meta keys the style manager reads off a style node \
+         (`__class`, which\n/// re-roots the widget class, and `__unique`). Valid on any style; not \
+         dispatched by the widget\n/// style parser, so disjoint from [`PROPERTIES`].\n",
+    );
+    s.push_str(&render_slice(
+        "STYLE_META_PROPERTIES",
+        &catalog.style_meta_properties,
+    ));
+    s.push('\n');
+    s.push_str(
         "/// CSS named colors recognized by the engine's color parser: `(lowercased name, packed \
          0xRRGGBB)`.\n",
     );
     s.push_str(&render_pairs("NAMED_COLORS", &catalog.named_colors, 6));
     s.push('\n');
     s.push_str(
-        "/// Legacy engine color statics: `(lowercased name, packed 0xRRGGBBAA)` (alpha \
-         preserved).\n",
+        "/// Legacy engine color statics: `(exact engine spelling, packed 0xRRGGBBAA)` (alpha \
+         preserved).\n/// Matched **case-sensitively** — the engine compares `tmp == \"darkRed\"` \
+         before its case-insensitive\n/// CSS fallback, and for eight of these names the CSS table \
+         holds a different RGB.\n",
     );
     s.push_str(&render_pairs("LEGACY_COLORS", &catalog.legacy_colors, 8));
     s.push('\n');
@@ -407,6 +719,28 @@ fn render(catalog: &Catalog) -> String {
         &catalog.legacy_color_names,
     ));
 
+    s
+}
+
+/// Render the per-widget native property table as a `&[(&str, &[&str])]`: one row per widget class,
+/// each holding that class's own `onStyleApply` tags.
+fn render_native_widgets(name: &str, rows: &[(String, Vec<String>)]) -> String {
+    let mut s = format!("pub static {name}: &[(&str, &[&str])] = &[\n");
+    for (class, tags) in rows {
+        s.push_str("    (\"");
+        s.push_str(class);
+        s.push_str("\", &[");
+        for (i, tag) in tags.iter().enumerate() {
+            if i > 0 {
+                s.push_str(", ");
+            }
+            s.push('"');
+            s.push_str(tag);
+            s.push('"');
+        }
+        s.push_str("]),\n");
+    }
+    s.push_str("];\n");
     s
 }
 

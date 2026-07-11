@@ -46,6 +46,15 @@ pub const UNKNOWN_STATE: &str = "unknown-state";
 /// of the six anchor edges (spec §2.4). Severity [`Severity::Error`]: `anchors.*` is one of the
 /// four *value-validating* properties (spec §2.10), so the engine throws on a bad edge.
 pub const INVALID_ANCHOR_EDGE: &str = "invalid-anchor-edge";
+
+/// An `anchors.*` on a widget whose parent explicitly uses a non-anchor layout
+/// (`layout: horizontalBox` / `verticalBox` / `grid`).
+///
+/// An **error**: the engine throws `"cannot create anchor, the parent widget doesn't use anchor
+/// layout!"` while applying the style, so the file fails to load. Every widget defaults to
+/// `UIAnchorLayout`, so this only fires when the parent *switched* layout and a child under it still
+/// anchors.
+pub const ANCHOR_PARENT_NO_ANCHOR_LAYOUT: &str = "anchor-parent-no-anchor-layout";
 /// Diagnostic code: an ordinary property key that is not a known OTML property name (spec §2.10,
 /// §4). Severity [`Severity::Hint`]: the engine silently *ignores* an unrecognized tag
 /// (`node->tag()` matches nothing), so a misspelled/unknown property is never an error or warning —
@@ -381,7 +390,15 @@ fn collect_semantic_diagnostics<'a>(
         "anchor_property" => check_anchor_property(node, source, out),
         "property" => {
             check_property(node, source, enclosing, ctx, out);
-            check_property_value(node, source, out);
+            // Inside a `layout:` block the keys are consumed by the layout object, never by the
+            // widget style parser, so none of the value-validating families apply there — a
+            // `display:` nested under `layout:` is not a display value the engine would parse (and
+            // throw on), it is just a key the layout ignores. Validating it would be a false-positive
+            // error. The `layout` node itself is not inside a block, so its own value (including the
+            // block's `type:`) is still validated.
+            if enclosing_block_key(node, source) != Some("layout") {
+                check_property_value(node, source, out);
+            }
         }
         _ => {}
     }
@@ -390,7 +407,24 @@ fn collect_semantic_diagnostics<'a>(
     // an instance that is-a its `base`, so `base` (not the declared name, a user style with no Lua
     // props) is the type to resolve; a `container`'s children belong to its `tag`.
     let child_enclosing = match node.kind() {
-        "style_header" => node.child_by_field_name("base").map(|b| slice(source, b)),
+        // Prefer the **declared name** over the base. Resolving from the name walks the same
+        // `< Base` chain, but it also picks up a `__class:` re-root declared in this very header's
+        // body — which resolving from the base cannot see, since the re-root lives on the name's own
+        // `StyleDef`. Without this, a `minimum:` written inside `SpinBox < TextEdit` /
+        // `__class: UISpinBox` resolves against `TextEdit` and is wrongly hinted, even though the
+        // same property on a `SpinBox` *instance* elsewhere resolves fine.
+        //
+        // Fall back to the base when the name is not in the style index (an un-indexed buffer):
+        // that is exactly what resolving from the base always did, so the degenerate case cannot
+        // regress into *more* hints.
+        "style_header" => {
+            let name = node.child_by_field_name("name").map(|n| slice(source, n));
+            let base = node.child_by_field_name("base").map(|b| slice(source, b));
+            match (ctx, name) {
+                (Some(ctx), Some(name)) if !ctx.styles.lookup(name).is_empty() => Some(name),
+                _ => base,
+            }
+        }
         "container" => node.child_by_field_name("tag").map(|t| slice(source, t)),
         _ => enclosing,
     };
@@ -398,6 +432,23 @@ fn collect_semantic_diagnostics<'a>(
     for child in node.children(&mut cursor) {
         collect_semantic_diagnostics(child, source, child_enclosing, ctx, out);
     }
+}
+
+/// The key of the `property` **block** this node sits directly inside, or `None` when the node is not
+/// nested in one (a top-level widget property, a list item, a `$state` block's child, …).
+///
+/// The grammar's `_block` is a hidden rule, so a block's statements are inlined as direct children of
+/// the owning `property` node: a `type:` inside `layout:` has the `layout` property node as its
+/// parent. A parent of any other kind (`container`, `state_selector`, `document`, …) is not a
+/// property block and yields `None`.
+fn enclosing_block_key<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    let parent = node.parent()?;
+    if parent.kind() != "property" {
+        return None;
+    }
+    parent
+        .child_by_field_name("key")
+        .map(|key| slice(source, key))
 }
 
 /// Slice `source` by a node's byte span.
@@ -433,11 +484,98 @@ fn check_state_selector(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>)
     }
 }
 
+/// An anchor is only creatable when the **containing** widget uses an anchor layout: the engine
+/// throws `"cannot create anchor, the parent widget doesn't use anchor layout!"` otherwise
+/// (`uiwidgetbasestyle.cpp`, the `anchors.` dispatch).
+///
+/// Every widget defaults to `UIAnchorLayout`, so this only bites when the parent *explicitly* switches
+/// layout — `layout: horizontalBox` (or `verticalBox` / `grid`) — and a child underneath it still
+/// anchors. That is a plausible authoring mistake and, unlike a runtime id lookup, it is fully
+/// decidable from the tree: the parent widget and its `layout:` are right there.
+///
+/// Deliberately conservative — the hint is only raised when the parent's layout type is a **literal**
+/// non-anchor type. A `$variable` type, a missing type, an absent `layout:`, or a parent we cannot
+/// resolve all mean "assume anchor layout" and stay silent, per the prefer-false-negatives rule.
+fn check_anchor_parent_layout(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+    let Some(widget) = enclosing_widget_node(node) else {
+        return;
+    };
+    let Some(parent) = enclosing_widget_node(widget) else {
+        return; // top-level widget: its runtime parent is unknown, so we cannot judge
+    };
+    let Some(layout_type) = declared_layout_type(parent, source) else {
+        return; // no explicit layout: the default is UIAnchorLayout, which anchors fine
+    };
+    // `anchor` is the anchor layout; anything else replaces it. An unrecognized type is already an
+    // INVALID_PROPERTY_VALUE error from `check_property_value`, so do not pile on here.
+    if layout_type == "anchor" || !schema::is_layout_type(&layout_type) {
+        return;
+    }
+    let span = node
+        .child_by_field_name("edge")
+        .map_or_else(|| SyntaxTree::span_of(node), SyntaxTree::span_of);
+    out.push(Diagnostic {
+        severity: Severity::Error,
+        code: ANCHOR_PARENT_NO_ANCHOR_LAYOUT,
+        message: format!(
+            "cannot anchor: the parent widget uses `{layout_type}` layout, not an anchor layout"
+        ),
+        span,
+    });
+}
+
+/// The nearest **ancestor** widget node of `node` — a `container` or a `style_header` — skipping
+/// `node` itself. `None` at the document root.
+fn enclosing_widget_node<'t>(node: Node<'t>) -> Option<Node<'t>> {
+    let mut current = node.parent()?;
+    loop {
+        if matches!(current.kind(), "container" | "style_header") {
+            return Some(current);
+        }
+        current = current.parent()?;
+    }
+}
+
+/// The layout **type** a widget node explicitly declares, as a literal: the value of a leaf
+/// `layout: <type>` or of the `type:` key inside a `layout:` block. `None` when the widget declares no
+/// `layout:`, or declares one whose type is absent or is a `$variable` (unresolvable statically).
+fn declared_layout_type(widget: Node<'_>, source: &str) -> Option<String> {
+    let mut cursor = widget.walk();
+    let layout = widget
+        .named_children(&mut cursor)
+        .filter(|c| c.kind() == "property")
+        .find(|c| {
+            c.child_by_field_name("key")
+                .is_some_and(|k| slice(source, k) == "layout")
+        })?;
+
+    // Leaf form: `layout: verticalBox`.
+    if let Some(value) = layout.child_by_field_name("value") {
+        let text = slice(source, value).trim();
+        return (!text.is_empty() && !text.starts_with('$')).then(|| text.to_owned());
+    }
+
+    // Block form: `layout:` with a nested `type:`. `_block` is hidden, so it is a direct child.
+    let mut inner = layout.walk();
+    let type_node = layout
+        .named_children(&mut inner)
+        .filter(|c| c.kind() == "property")
+        .find(|c| {
+            c.child_by_field_name("key")
+                .is_some_and(|k| slice(source, k) == "type")
+        })?;
+    let value = type_node.child_by_field_name("value")?;
+    let text = slice(source, value).trim();
+    (!text.is_empty() && !text.starts_with('$')).then(|| text.to_owned())
+}
+
 /// Validate an `anchors.<edge>: <target>` node (grammar: `anchor_property` with an `edge` field
 /// aliased to `anchor_edge` and an optional `value` field of kind `anchor_target` whose `target`
 /// field is a dotted `identifier`). Two edge tokens are checked; the target *id* is intentionally
 /// not resolved here (cross-file id existence is a later node).
 fn check_anchor_property(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+    check_anchor_parent_layout(node, source, out);
+
     // Property-side edge: must be one of the six edges OR a shorthand key (`fill`/`centerIn`, which
     // the grammar spells as the edge of `anchors.fill:` / `anchors.centerIn:`).
     if let Some(edge) = node.child_by_field_name("edge") {
@@ -545,10 +683,39 @@ fn check_property(
         // `map_or(true, …)` rather than `Option::is_none_or` — the latter is only stable since Rust
         // 1.82, but the workspace MSRV is 1.75.
         .any(|child| child.id() != key.id() && value.map_or(true, |v| child.id() != v.id()));
+    let name = slice(source, key);
+    // A key nested directly under a `layout:` block is read by the *layout object*
+    // (`UIBoxLayout`/`UIGridLayout`/…`::applyStyle`), not the widget style parser, so it lives in its
+    // own catalog. The grammar's `_block` is a hidden rule, so a block's statements are direct
+    // children of the `property` node — the enclosing block is simply this node's parent.
+    //
+    // Checked *before* the widget catalog and deliberately exclusive: these keys are valid only here
+    // (a bare `cell-size:` on a widget really is unknown), and conversely a widget property is not
+    // valid inside a `layout:` block, so the block context replaces the widget check rather than
+    // adding to it.
+    //
+    // Checked **before** the `has_block` skip, too. That skip exists because a container-form
+    // property is a child-widget group or a list parent, never a leaf style property — but *inside* a
+    // `layout:` block there is no such shape: every key a layout reads is a leaf. A block-shaped key
+    // there is read by nobody, so it is unknown like any other, and letting `has_block` swallow it
+    // would leave a hole in an otherwise exclusive check.
+    if enclosing_block_key(node, source) == Some("layout") {
+        if schema::is_layout_block_property(name) {
+            return;
+        }
+        out.push(Diagnostic {
+            severity: Severity::Hint,
+            code: UNKNOWN_PROPERTY,
+            message: format!(
+                "unknown layout property `{name}`: ignored by the engine, has no effect"
+            ),
+            span: SyntaxTree::span_of(key),
+        });
+        return;
+    }
     if has_block {
         return;
     }
-    let name = slice(source, key);
     if schema::is_known_property(name) {
         return;
     }
@@ -1152,6 +1319,235 @@ Panel
         assert_eq!(d.severity, Severity::Hint);
     }
 
+    #[test]
+    fn a_compound_state_selector_is_valid() {
+        // The engine splits the tag after `$` on SPACES and requires every state to match
+        // (`uiwidget.cpp`: `stdext::split(statesStr, " ")`), so `$pressed disabled:` is a
+        // conjunction — pressed AND disabled — and each token may carry its own `!`. This shape is
+        // all over the engine's own `data/styles/`; the grammar used to reject it as a syntax error.
+        for src in [
+            "Button\n  $pressed disabled:\n    color: #111111\n",
+            "Button\n  $checked hover !disabled:\n    color: #222222\n",
+            "Button\n  $first on:\n    color: #333333\n",
+        ] {
+            assert!(analyze(src).is_empty(), "{src:?} -> {:?}", analyze(src));
+        }
+    }
+
+    #[test]
+    fn the_states_of_a_compound_selector_are_still_validated() {
+        // Accepting the shape must not stop us checking the names in it.
+        let src = "Button\n  $bogus disabled:\n    color: #111111\n";
+        let diags = analyze(src);
+        let d = only(&diags, UNKNOWN_STATE);
+        assert_eq!(&src[d.span.start..d.span.end], "bogus");
+    }
+
+    #[test]
+    fn a_style_meta_key_is_not_an_unknown_property() {
+        // `__class:` re-roots the widget class and is read by the engine's style manager
+        // (`styleNode->valueAt("__class")`); `__unique` likewise. Neither goes through the widget
+        // style parser, so neither is in the base catalog — but both are perfectly valid.
+        assert!(analyze("SpinBox < TextEdit\n  __class: UISpinBox\n").is_empty());
+        assert!(analyze("Win < UIWindow\n  __unique: true\n").is_empty());
+    }
+
+    // --- semantic pass: anchor vs the parent's layout ------------------------------------------
+
+    #[test]
+    fn anchoring_under_a_non_anchor_layout_parent_is_an_error() {
+        // The engine throws "cannot create anchor, the parent widget doesn't use anchor layout!"
+        // while applying the style, so the file fails to load outright.
+        let src = "\
+Panel
+  layout:
+    type: horizontalBox
+
+  Button
+    anchors.left: parent.left
+";
+        let diags = analyze(src);
+        let d = only(&diags, ANCHOR_PARENT_NO_ANCHOR_LAYOUT);
+        assert_eq!(d.severity, Severity::Error);
+        assert_eq!(&src[d.span.start..d.span.end], "left");
+    }
+
+    #[test]
+    fn anchoring_under_the_leaf_layout_form_is_also_an_error() {
+        let src = "Panel\n  layout: verticalBox\n  Button\n    anchors.top: parent.top\n";
+        assert_eq!(
+            only(&analyze(src), ANCHOR_PARENT_NO_ANCHOR_LAYOUT).severity,
+            Severity::Error
+        );
+    }
+
+    #[test]
+    fn anchoring_under_a_default_layout_parent_is_silent() {
+        // Every widget defaults to UIAnchorLayout, so a parent with no `layout:` anchors fine.
+        let src = "Panel\n  Button\n    anchors.left: parent.left\n";
+        assert!(analyze(src).is_empty(), "{:?}", analyze(src));
+    }
+
+    #[test]
+    fn anchoring_under_an_explicit_anchor_layout_parent_is_silent() {
+        let src = "Panel\n  layout:\n    type: anchor\n  Button\n    anchors.left: parent.left\n";
+        assert!(analyze(src).is_empty(), "{:?}", analyze(src));
+    }
+
+    #[test]
+    fn a_top_level_widgets_anchors_are_not_judged() {
+        // Its runtime parent is unknown (it depends on where the style is instantiated), so we
+        // cannot know the parent's layout — stay silent rather than guess.
+        let src = "Panel\n  anchors.fill: parent\n";
+        assert!(analyze(src).is_empty(), "{:?}", analyze(src));
+    }
+
+    #[test]
+    fn a_variable_layout_type_does_not_trigger_the_anchor_check() {
+        // `$var` resolves at runtime; we cannot know it is non-anchor, so we must not flag.
+        let src =
+            "Panel\n  layout:\n    type: $myLayout\n  Button\n    anchors.left: parent.left\n";
+        assert!(
+            analyze(src)
+                .iter()
+                .all(|d| d.code != ANCHOR_PARENT_NO_ANCHOR_LAYOUT),
+            "{:?}",
+            analyze(src)
+        );
+    }
+
+    #[test]
+    fn the_anchoring_widgets_own_layout_does_not_matter() {
+        // The engine checks the *parent's* layout, not the anchoring widget's own.
+        let src = "\
+Panel
+  Button
+    layout:
+      type: grid
+    anchors.left: parent.left
+";
+        assert!(
+            analyze(src)
+                .iter()
+                .all(|d| d.code != ANCHOR_PARENT_NO_ANCHOR_LAYOUT),
+            "{:?}",
+            analyze(src)
+        );
+    }
+
+    // --- semantic pass: `layout:` block keys ---------------------------------------------------
+
+    #[test]
+    fn layout_block_keys_are_not_unknown_properties() {
+        // Regression: every key inside a `layout:` block is read by the layout object
+        // (`UIGridLayout::applyStyle`), not the widget style parser, so none is an unknown property.
+        // Before this was handled, each of these raised a false `unknown property` hint.
+        let src = "\
+Panel
+  layout:
+    type: grid
+    cell-size: 32 32
+    cell-spacing: 2
+    num-columns: 4
+    fit-children: true
+    flow: true
+";
+        assert!(
+            analyze(src).is_empty(),
+            "a grid `layout:` block must be silent, got {:?}",
+            analyze(src)
+        );
+    }
+
+    #[test]
+    fn box_layout_block_keys_are_not_unknown_properties() {
+        // The box family: `spacing`/`fit-children` from `UIBoxLayout`, `align-bottom` from
+        // `UIVerticalLayout`, `align-right` from `UIHorizontalLayout`.
+        let src = "\
+Panel
+  layout:
+    type: verticalBox
+    spacing: 4
+    fit-children: true
+    align-bottom: true
+";
+        assert!(analyze(src).is_empty(), "{:?}", analyze(src));
+    }
+
+    #[test]
+    fn real_otclient_layout_fixture_is_silent() {
+        // Copied from the engine's own `data/styles/30-inputboxes.otui` — content the engine loads
+        // without complaint, so the LSP must not flag it.
+        let src = "\
+Panel
+  layout:
+    type: horizontalBox
+    spacing: 8
+";
+        assert!(analyze(src).is_empty(), "{:?}", analyze(src));
+    }
+
+    #[test]
+    fn layout_leaf_form_still_works() {
+        // The leaf form (`layout: <type>`) has no block, so it is value-validated as before.
+        assert!(analyze("Panel\n  layout: verticalBox\n").is_empty());
+        let diags = analyze("Panel\n  layout: bogusLayout\n");
+        assert_eq!(
+            only(&diags, INVALID_PROPERTY_VALUE).severity,
+            Severity::Error
+        );
+    }
+
+    #[test]
+    fn unknown_key_inside_layout_block_is_still_hinted() {
+        // The block context accepts the layout catalog, it does not blanket-accept: a key no layout
+        // class reads is still ignored by the engine, so it stays a hint.
+        let src = "Panel\n  layout:\n    type: grid\n    cell-siz: 32 32\n";
+        let diags = analyze(src);
+        let d = only(&diags, UNKNOWN_PROPERTY);
+        assert_eq!(d.severity, Severity::Hint);
+        assert_eq!(&src[d.span.start..d.span.end], "cell-siz");
+    }
+
+    #[test]
+    fn a_block_shaped_key_inside_a_layout_block_is_still_hinted() {
+        // Every key a layout reads is a leaf, so a *container-form* key inside `layout:` is read by
+        // nobody. The generic `has_block` skip (which exists for child-widget groups and list
+        // parents) must not swallow it, or the layout check stops being exclusive.
+        let src = "Panel\n  layout:\n    type: grid\n    bogus:\n      x: 1\n";
+        let diags = analyze(src);
+        let d = diags
+            .iter()
+            .find(|d| d.code == UNKNOWN_PROPERTY && &src[d.span.start..d.span.end] == "bogus")
+            .unwrap_or_else(|| panic!("`bogus` must be hinted: {diags:?}"));
+        assert_eq!(d.severity, Severity::Hint);
+    }
+
+    #[test]
+    fn layout_key_at_widget_level_is_still_unknown() {
+        // The layout catalog is exclusive to the block: a bare `cell-size:` on a widget is read by
+        // nobody, so it remains an unknown property.
+        let src = "Panel\n  cell-size: 32 32\n";
+        let diags = analyze(src);
+        let d = only(&diags, UNKNOWN_PROPERTY);
+        assert_eq!(d.severity, Severity::Hint);
+        assert_eq!(&src[d.span.start..d.span.end], "cell-size");
+    }
+
+    #[test]
+    fn value_families_are_not_validated_inside_a_layout_block() {
+        // A `display:` nested under `layout:` is never parsed as a display value by the engine (the
+        // layout object reads the block and ignores the key), so it must not raise a value error —
+        // only the unknown-layout-key hint.
+        let src = "Panel\n  layout:\n    type: grid\n    display: bogus\n";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != INVALID_PROPERTY_VALUE),
+            "a key inside a layout block must not be value-validated, got {diags:?}"
+        );
+        assert_eq!(only(&diags, UNKNOWN_PROPERTY).severity, Severity::Hint);
+    }
+
     // --- semantic pass: invalid property value (error) ----------------------------------------
 
     #[test]
@@ -1584,6 +1980,73 @@ Window < UIWindow
         let diags = analyze_with_widgets(src, &ctx);
         let d = only(&diags, UNKNOWN_PROPERTY);
         assert_eq!(&src[d.span.start..d.span.end], "widht");
+    }
+
+    #[test]
+    fn a_class_reroot_applies_inside_the_declaring_styles_own_body() {
+        // `SpinBox < TextEdit` + `__class: UISpinBox` — the engine instantiates a `UISpinBox`, which
+        // declares `minimum` in Lua. Seeding the header's body with its *base* (`TextEdit`) misses
+        // the re-root, because the re-root lives on `SpinBox`'s own StyleDef — so `minimum:` written
+        // right here was hinted, even though the same property on a `SpinBox` *instance* resolved.
+        let styles = styles(&[(
+            "a.otui",
+            "TextEdit < UITextEdit\nSpinBox < TextEdit\n  __class: UISpinBox\n",
+        )]);
+        let lua = lua(&[(
+            "s.lua",
+            "UISpinBox = extends(UITextEdit, 'UISpinBox')\n\
+             function UISpinBox:onStyleApply(styleName, styleNode)\n\
+               for name, value in pairs(styleNode) do\n\
+                 if name == 'minimum' then self:setMinimum(value) end\n\
+               end\n\
+             end\n",
+        )]);
+        let ctx = WidgetContext {
+            styles: &styles,
+            lua: &lua,
+        };
+
+        let src = "SpinBox < TextEdit\n  __class: UISpinBox\n  minimum: 0\n";
+        assert!(
+            analyze_with_widgets(src, &ctx).is_empty(),
+            "{:?}",
+            analyze_with_widgets(src, &ctx)
+        );
+
+        // Still exclusive: the same property on the *base* style is not valid there.
+        let base_src = "TextEdit < UITextEdit\n  minimum: 0\n";
+        assert_eq!(
+            only(&analyze_with_widgets(base_src, &ctx), UNKNOWN_PROPERTY).severity,
+            Severity::Hint
+        );
+    }
+
+    #[test]
+    fn an_unindexed_style_header_still_resolves_through_its_base() {
+        // Fallback: when the declared name is not in the style index, the body must still resolve
+        // through the base — the behaviour before the name became the preferred seed. Otherwise the
+        // degenerate case would regress into *more* hints.
+        let styles = styles(&[]); // `Table` is deliberately NOT indexed
+        let lua = lua(&[(
+            "t.lua",
+            "UITable = extends(UIWidget, 'UITable')\n\
+             function UITable:onStyleApply(styleName, styleNode)\n\
+               for name, value in pairs(styleNode) do\n\
+                 if name == 'column-style' then self:setColumnStyle(value) end\n\
+               end\n\
+             end\n",
+        )]);
+        let ctx = WidgetContext {
+            styles: &styles,
+            lua: &lua,
+        };
+
+        let src = "Table < UITable\n  column-style: SomeColumn\n";
+        assert!(
+            analyze_with_widgets(src, &ctx).is_empty(),
+            "must fall back to the base: {:?}",
+            analyze_with_widgets(src, &ctx)
+        );
     }
 
     #[test]
