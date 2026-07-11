@@ -21,6 +21,7 @@ pub mod format;
 pub mod hierarchy;
 pub mod hover;
 pub mod links;
+pub mod lua_widgets;
 pub mod navigation;
 pub mod references;
 pub mod schema;
@@ -28,6 +29,7 @@ pub mod semantic;
 pub mod style_index;
 pub mod symbols;
 pub mod syntax;
+pub mod widget_resolve;
 
 use fixes::Fix;
 use hierarchy::StyleRef;
@@ -35,6 +37,7 @@ use hover::StyleHover;
 use lang_api::{
     ByteSpan, CompletionItem, Diagnostic, DocumentSymbol, LanguageService, SemanticToken,
 };
+use lua_widgets::{LuaWidgetDef, LuaWidgetIndex};
 use navigation::{BaseRef, IdRef, StyleHeaderRef};
 use references::{IdOccurrences, StyleNameOccurrences};
 use style_index::{StyleDef, StyleIndex};
@@ -63,6 +66,36 @@ impl OtuiService {
         SyntaxTree::parse(source)
             .map(|tree| style_index::extract_style_defs(&tree))
             .unwrap_or_default()
+    }
+
+    /// Extract the widgets a single **Lua** module declares — their custom style properties and
+    /// `extends` parent (see [`lua_widgets`]). The per-file half of the workspace Lua widget index:
+    /// the server calls it on each `*.lua` it scans and feeds the result into a
+    /// [`lua_widgets::LuaWidgetIndex`] keyed by URI, exactly as [`style_defs`](Self::style_defs)
+    /// feeds the [`StyleIndex`].
+    ///
+    /// Inherent (not on the [`LanguageService`] trait): the multi-document index is server-owned.
+    #[must_use]
+    pub fn lua_widgets(&self, source: &str) -> Vec<LuaWidgetDef> {
+        lua_widgets::scan_widgets(source)
+    }
+
+    /// Compute parse-level diagnostics for `source`, **widget-aware**: a property unknown to the C++
+    /// catalog is not flagged when the enclosing widget's resolved ancestry (across the workspace
+    /// `styles` and `lua` indexes) declares it as a Lua-added style property (see
+    /// [`diagnostics::analyze_with_widgets`]). With empty indexes this is identical to the
+    /// [`LanguageService::diagnostics`] catalog-only pass.
+    ///
+    /// Inherent (not on the [`LanguageService`] trait) because it consumes server-owned workspace
+    /// state, mirroring [`style_hover_at`](Self::style_hover_at).
+    #[must_use]
+    pub fn diagnostics_with_widgets(
+        &self,
+        source: &str,
+        styles: &StyleIndex,
+        lua: &LuaWidgetIndex,
+    ) -> Vec<Diagnostic> {
+        diagnostics::analyze_with_widgets(source, &diagnostics::WidgetContext { styles, lua })
     }
 
     /// Locate the top-level `Name < Base` base reference under `offset`, if any (spec §5.3).

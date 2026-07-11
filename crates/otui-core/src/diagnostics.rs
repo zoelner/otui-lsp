@@ -21,8 +21,11 @@
 //!    a tag it does not recognize, so a misspelled/unknown property never errors, it just has no
 //!    effect).
 
+use crate::lua_widgets::LuaWidgetIndex;
 use crate::schema;
+use crate::style_index::StyleIndex;
 use crate::syntax::SyntaxTree;
+use crate::widget_resolve;
 use lang_api::{ByteSpan, Diagnostic, Severity};
 use tree_sitter::Node;
 
@@ -57,17 +60,42 @@ pub const UNKNOWN_PROPERTY: &str = "unknown-property";
 /// [`INVALID_ANCHOR_EDGE`] check.)
 pub const INVALID_PROPERTY_VALUE: &str = "invalid-property-value";
 
-/// Computes all parse-level diagnostics for `source`.
+/// The workspace state that makes [`analyze_with_widgets`] **widget-aware**: the `.otui` style index
+/// and the Lua widget index, both borrowed. Threaded down to [`check_property`] so a property the
+/// C++ catalog does not know can still be accepted when the enclosing widget's Lua ancestry declares
+/// it (see [`widget_resolve`]).
+pub struct WidgetContext<'a> {
+    /// The workspace `Name < Base` style index — resolves a widget node's `.otui` inheritance.
+    pub styles: &'a StyleIndex,
+    /// The workspace Lua widget index — the custom properties each widget declares.
+    pub lua: &'a LuaWidgetIndex,
+}
+
+/// Computes all parse-level diagnostics for `source`, catalog-only (no widget context).
 ///
 /// Returns findings sorted by span (`start`, then `end`). The document is parsed once; the two
-/// passes share nothing beyond the source text.
+/// passes share nothing beyond the source text. An unknown property is judged solely against the
+/// global C++ catalog — see [`analyze_with_widgets`] for the workspace-aware variant that also
+/// accepts Lua-declared custom properties.
 #[must_use]
 pub fn analyze(source: &str) -> Vec<Diagnostic> {
+    analyze_inner(source, None)
+}
+
+/// Like [`analyze`], but **widget-aware**: a property unknown to the C++ catalog is not flagged when
+/// the enclosing widget's resolved ancestry (via `ctx`) declares it as a Lua custom property. All
+/// other diagnostics are identical. With empty indexes it degrades exactly to [`analyze`].
+#[must_use]
+pub fn analyze_with_widgets(source: &str, ctx: &WidgetContext) -> Vec<Diagnostic> {
+    analyze_inner(source, Some(ctx))
+}
+
+fn analyze_inner(source: &str, ctx: Option<&WidgetContext>) -> Vec<Diagnostic> {
     let mut out = indentation_pass(source);
     // The tree is parsed once and shared by the structural and semantic passes.
     if let Some(tree) = SyntaxTree::parse(source) {
         collect_structural_errors(tree.root(), &mut out);
-        collect_semantic_diagnostics(tree.root(), source, &mut out);
+        collect_semantic_diagnostics(tree.root(), source, None, ctx, &mut out);
     }
     out.sort_by_key(|d| (d.span.start, d.span.end));
     out
@@ -326,19 +354,39 @@ fn collect_structural_errors(node: Node<'_>, out: &mut Vec<Diagnostic>) {
 /// arbitrarily nested widgets). Ordinary `property` nodes are validated the same way, since a
 /// property may appear on any widget at any depth. Only these node kinds carry a finding; every
 /// other kind is transparent and simply recursed through.
-fn collect_semantic_diagnostics(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+///
+/// `enclosing` is the type name of the nearest ancestor widget — a `container`'s `tag` or a
+/// `style_header`'s `base` — used by [`check_property`] to resolve the widget's ancestry when `ctx`
+/// is present. It propagates unchanged through non-widget nodes (e.g. a `$state` block's properties
+/// belong to the same widget) and is overridden when entering a new widget.
+fn collect_semantic_diagnostics<'a>(
+    node: Node<'_>,
+    source: &'a str,
+    enclosing: Option<&'a str>,
+    ctx: Option<&WidgetContext>,
+    out: &mut Vec<Diagnostic>,
+) {
     match node.kind() {
         "state_selector" => check_state_selector(node, source, out),
         "anchor_property" => check_anchor_property(node, source, out),
         "property" => {
-            check_property(node, source, out);
+            check_property(node, source, enclosing, ctx, out);
             check_property_value(node, source, out);
         }
         _ => {}
     }
+    // The enclosing widget type for this node's children: a widget node sets it from its own type,
+    // any other node passes the current one through. A `style_header`'s children are properties of
+    // an instance that is-a its `base`, so `base` (not the declared name, a user style with no Lua
+    // props) is the type to resolve; a `container`'s children belong to its `tag`.
+    let child_enclosing = match node.kind() {
+        "style_header" => node.child_by_field_name("base").map(|b| slice(source, b)),
+        "container" => node.child_by_field_name("tag").map(|t| slice(source, t)),
+        _ => enclosing,
+    };
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_semantic_diagnostics(child, source, out);
+        collect_semantic_diagnostics(child, source, child_enclosing, ctx, out);
     }
 }
 
@@ -443,7 +491,19 @@ fn check_anchor_property(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>
 /// container/subtree (a child widget group, or a `key:`/`- item` list parent), not a leaf style
 /// property. Per the "prefer false negatives over false positives" rule, we only flag leaf
 /// properties (a bare `key:` or `key: value` with no nested statements).
-fn check_property(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+///
+/// When a [`WidgetContext`] is present, a key the catalog does not know is additionally checked
+/// against the enclosing widget's Lua ancestry: OTClient widgets add style properties in Lua
+/// (e.g. a `UITable` reads `column-style`), so such a property is valid — not unknown — on a node
+/// whose type descends from the declaring widget. Only when it is in neither the catalog nor the
+/// resolved ancestry is the hint emitted.
+fn check_property(
+    node: Node<'_>,
+    source: &str,
+    enclosing: Option<&str>,
+    ctx: Option<&WidgetContext>,
+    out: &mut Vec<Diagnostic>,
+) {
     let Some(key) = node.child_by_field_name("key") else {
         return;
     };
@@ -460,14 +520,24 @@ fn check_property(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
         return;
     }
     let name = slice(source, key);
-    if !schema::is_known_property(name) {
-        out.push(Diagnostic {
-            severity: Severity::Hint,
-            code: UNKNOWN_PROPERTY,
-            message: format!("unknown property `{name}`: ignored by the engine, has no effect"),
-            span: SyntaxTree::span_of(key),
-        });
+    if schema::is_known_property(name) {
+        return;
     }
+    // Widget-aware acceptance: a catalog-unknown key that the enclosing widget (or a Lua ancestor)
+    // declares is a valid Lua-added property, not an unknown one.
+    if let (Some(ctx), Some(widget)) = (ctx, enclosing) {
+        if widget_resolve::resolve_ancestry(widget, ctx.styles, ctx.lua)
+            .declares_custom_property(ctx.lua, name)
+        {
+            return;
+        }
+    }
+    out.push(Diagnostic {
+        severity: Severity::Hint,
+        code: UNKNOWN_PROPERTY,
+        message: format!("unknown property `{name}`: ignored by the engine, has no effect"),
+        span: SyntaxTree::span_of(key),
+    });
 }
 
 /// Validate the *value* of one of the value-validating properties `display`, `layout`, `border`, and
@@ -1230,6 +1300,133 @@ Panel
         assert!(
             diags.iter().all(|d| d.code != INVALID_PROPERTY_VALUE),
             "mis-cased property must not be value-validated: {diags:?}"
+        );
+    }
+
+    // --- widget-aware unknown property (Lua-added style properties) ----------------------------
+
+    use crate::lua_widgets::{scan_widgets, LuaWidgetIndex};
+    use crate::style_index::{extract_style_defs, StyleIndex};
+
+    /// A [`StyleIndex`] built from `(doc, otui_source)` pairs.
+    fn styles(docs: &[(&str, &str)]) -> StyleIndex {
+        let mut index = StyleIndex::new();
+        for (doc, src) in docs {
+            let tree = SyntaxTree::parse(src).expect("parse otui");
+            index.set_document(*doc, extract_style_defs(&tree));
+        }
+        index
+    }
+
+    /// A [`LuaWidgetIndex`] built from `(doc, lua_source)` pairs.
+    fn lua(docs: &[(&str, &str)]) -> LuaWidgetIndex {
+        let mut index = LuaWidgetIndex::new();
+        for (doc, src) in docs {
+            index.set_document(*doc, scan_widgets(src));
+        }
+        index
+    }
+
+    /// The `uitable.lua` shape used across the widget-aware tests: `UITable` extends `UIWidget` and
+    /// declares `column-style` in its `onStyleApply`.
+    const UITABLE_LUA: &str = "\
+UITable = extends(UIWidget, 'UITable')
+
+function UITable:onStyleApply(styleName, styleNode)
+  for name, value in pairs(styleNode) do
+    if name == 'column-style' then
+    end
+  end
+end
+";
+
+    #[test]
+    fn lua_property_on_a_matching_style_header_is_accepted() {
+        // `column-style` is not a C++ catalog property, but on a `< UITable` header it is a valid
+        // Lua-added property, so no hint.
+        let styles = styles(&[]);
+        let lua = lua(&[("uitable.lua", UITABLE_LUA)]);
+        let ctx = WidgetContext {
+            styles: &styles,
+            lua: &lua,
+        };
+        let src = "Table < UITable\n  column-style: SomeColumn\n";
+        let diags = analyze_with_widgets(src, &ctx);
+        assert!(
+            diags.iter().all(|d| d.code != UNKNOWN_PROPERTY),
+            "column-style on a UITable must be accepted: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn lua_property_on_a_widget_instance_tag_is_accepted_cross_file() {
+        // The property sits on a nested `Table` container whose type resolves cross-file
+        // (`Table < UITable`, defined in the workspace index) to the native UITable.
+        let styles = styles(&[("lib.otui", "Table < UITable\n")]);
+        let lua = lua(&[("uitable.lua", UITABLE_LUA)]);
+        let ctx = WidgetContext {
+            styles: &styles,
+            lua: &lua,
+        };
+        let src = "\
+Window < UIWindow
+  Table
+    column-style: SomeColumn
+";
+        let diags = analyze_with_widgets(src, &ctx);
+        assert!(
+            diags.iter().all(|d| d.code != UNKNOWN_PROPERTY),
+            "column-style on a Table instance must be accepted: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn lua_property_on_an_unrelated_widget_still_hints() {
+        // `column-style` on a Button (which does not descend from UITable) is still unknown.
+        let styles = styles(&[]);
+        let lua = lua(&[("uitable.lua", UITABLE_LUA)]);
+        let ctx = WidgetContext {
+            styles: &styles,
+            lua: &lua,
+        };
+        let src = "Button < UIButton\n  column-style: SomeColumn\n";
+        let diags = analyze_with_widgets(src, &ctx);
+        let d = only(&diags, UNKNOWN_PROPERTY);
+        assert_eq!(d.severity, Severity::Hint);
+        assert_eq!(&src[d.span.start..d.span.end], "column-style");
+    }
+
+    #[test]
+    fn genuinely_misspelled_property_still_hints_with_context() {
+        // A real typo (`widht`) is unknown to both the catalog and the widget's Lua ancestry.
+        let styles = styles(&[]);
+        let lua = lua(&[("uitable.lua", UITABLE_LUA)]);
+        let ctx = WidgetContext {
+            styles: &styles,
+            lua: &lua,
+        };
+        let src = "Table < UITable\n  widht: 10\n";
+        let diags = analyze_with_widgets(src, &ctx);
+        let d = only(&diags, UNKNOWN_PROPERTY);
+        assert_eq!(&src[d.span.start..d.span.end], "widht");
+    }
+
+    #[test]
+    fn empty_context_degrades_to_catalog_only() {
+        // With no styles and no Lua widgets, a Lua-added property is (correctly) still just a hint —
+        // identical to catalog-only `analyze`.
+        let styles = styles(&[]);
+        let lua = lua(&[]);
+        let ctx = WidgetContext {
+            styles: &styles,
+            lua: &lua,
+        };
+        let src = "Table < UITable\n  column-style: SomeColumn\n";
+        let with = analyze_with_widgets(src, &ctx);
+        let without = analyze(src);
+        assert_eq!(
+            only(&with, UNKNOWN_PROPERTY).span,
+            only(&without, UNKNOWN_PROPERTY).span
         );
     }
 }
