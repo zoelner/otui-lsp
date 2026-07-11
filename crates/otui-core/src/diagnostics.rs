@@ -407,7 +407,24 @@ fn collect_semantic_diagnostics<'a>(
     // an instance that is-a its `base`, so `base` (not the declared name, a user style with no Lua
     // props) is the type to resolve; a `container`'s children belong to its `tag`.
     let child_enclosing = match node.kind() {
-        "style_header" => node.child_by_field_name("base").map(|b| slice(source, b)),
+        // Prefer the **declared name** over the base. Resolving from the name walks the same
+        // `< Base` chain, but it also picks up a `__class:` re-root declared in this very header's
+        // body — which resolving from the base cannot see, since the re-root lives on the name's own
+        // `StyleDef`. Without this, a `minimum:` written inside `SpinBox < TextEdit` /
+        // `__class: UISpinBox` resolves against `TextEdit` and is wrongly hinted, even though the
+        // same property on a `SpinBox` *instance* elsewhere resolves fine.
+        //
+        // Fall back to the base when the name is not in the style index (an un-indexed buffer):
+        // that is exactly what resolving from the base always did, so the degenerate case cannot
+        // regress into *more* hints.
+        "style_header" => {
+            let name = node.child_by_field_name("name").map(|n| slice(source, n));
+            let base = node.child_by_field_name("base").map(|b| slice(source, b));
+            match (ctx, name) {
+                (Some(ctx), Some(name)) if !ctx.styles.lookup(name).is_empty() => Some(name),
+                _ => base,
+            }
+        }
         "container" => node.child_by_field_name("tag").map(|t| slice(source, t)),
         _ => enclosing,
     };
@@ -1945,6 +1962,73 @@ Window < UIWindow
         let diags = analyze_with_widgets(src, &ctx);
         let d = only(&diags, UNKNOWN_PROPERTY);
         assert_eq!(&src[d.span.start..d.span.end], "widht");
+    }
+
+    #[test]
+    fn a_class_reroot_applies_inside_the_declaring_styles_own_body() {
+        // `SpinBox < TextEdit` + `__class: UISpinBox` — the engine instantiates a `UISpinBox`, which
+        // declares `minimum` in Lua. Seeding the header's body with its *base* (`TextEdit`) misses
+        // the re-root, because the re-root lives on `SpinBox`'s own StyleDef — so `minimum:` written
+        // right here was hinted, even though the same property on a `SpinBox` *instance* resolved.
+        let styles = styles(&[(
+            "a.otui",
+            "TextEdit < UITextEdit\nSpinBox < TextEdit\n  __class: UISpinBox\n",
+        )]);
+        let lua = lua(&[(
+            "s.lua",
+            "UISpinBox = extends(UITextEdit, 'UISpinBox')\n\
+             function UISpinBox:onStyleApply(styleName, styleNode)\n\
+               for name, value in pairs(styleNode) do\n\
+                 if name == 'minimum' then self:setMinimum(value) end\n\
+               end\n\
+             end\n",
+        )]);
+        let ctx = WidgetContext {
+            styles: &styles,
+            lua: &lua,
+        };
+
+        let src = "SpinBox < TextEdit\n  __class: UISpinBox\n  minimum: 0\n";
+        assert!(
+            analyze_with_widgets(src, &ctx).is_empty(),
+            "{:?}",
+            analyze_with_widgets(src, &ctx)
+        );
+
+        // Still exclusive: the same property on the *base* style is not valid there.
+        let base_src = "TextEdit < UITextEdit\n  minimum: 0\n";
+        assert_eq!(
+            only(&analyze_with_widgets(base_src, &ctx), UNKNOWN_PROPERTY).severity,
+            Severity::Hint
+        );
+    }
+
+    #[test]
+    fn an_unindexed_style_header_still_resolves_through_its_base() {
+        // Fallback: when the declared name is not in the style index, the body must still resolve
+        // through the base — the behaviour before the name became the preferred seed. Otherwise the
+        // degenerate case would regress into *more* hints.
+        let styles = styles(&[]); // `Table` is deliberately NOT indexed
+        let lua = lua(&[(
+            "t.lua",
+            "UITable = extends(UIWidget, 'UITable')\n\
+             function UITable:onStyleApply(styleName, styleNode)\n\
+               for name, value in pairs(styleNode) do\n\
+                 if name == 'column-style' then self:setColumnStyle(value) end\n\
+               end\n\
+             end\n",
+        )]);
+        let ctx = WidgetContext {
+            styles: &styles,
+            lua: &lua,
+        };
+
+        let src = "Table < UITable\n  column-style: SomeColumn\n";
+        assert!(
+            analyze_with_widgets(src, &ctx).is_empty(),
+            "must fall back to the base: {:?}",
+            analyze_with_widgets(src, &ctx)
+        );
     }
 
     #[test]
