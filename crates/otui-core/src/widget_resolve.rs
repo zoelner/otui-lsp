@@ -86,6 +86,9 @@ pub fn resolve_ancestry(start: &str, styles: &StyleIndex, lua: &LuaWidgetIndex) 
     let mut chain = Vec::new();
     let mut seen = HashSet::new();
     let mut native = None;
+    // Widget classes named by a `__class:` on some style in the chain. Each re-roots the widget onto
+    // a class its `< Base` chain never mentions, so each seeds its own Lua-parent walk in phase 2.
+    let mut reroots: Vec<String> = Vec::new();
 
     // Phase 1: the cross-file `.otui` style chain. `seen.insert` is false on a repeat, so a cycle
     // exits the loop without re-pushing.
@@ -96,38 +99,51 @@ pub fn resolve_ancestry(start: &str, styles: &StyleIndex, lua: &LuaWidgetIndex) 
             native = Some(current.clone());
             break;
         }
-        match pick_base(styles, &current) {
-            Some(base) => current = base,
-            None => break, // undefined base or malformed header — dead end, no native class
+        let Some(def) = pick_def(styles, &current) else {
+            break; // undefined base or malformed header — dead end, no native class
+        };
+        // `__class:` names the class the engine actually instantiates for this style, regardless of
+        // what it inherits its look from. Record it; the base walk continues as normal.
+        if let Some(class) = &def.lua_class {
+            reroots.push(class.clone());
+        }
+        match &def.base {
+            Some(base) => current = base.clone(),
+            None => break,
         }
     }
 
-    // Phase 2: the native class's Lua parent chain (only if the `.otui` chain reached a native class).
-    let Some(native_name) = native.clone() else {
-        return WidgetAncestry { chain, native };
-    };
-    let mut current = native_name;
-    while let Some(parent) = lua.parent_of(&current) {
-        let parent = parent.to_owned();
-        if !seen.insert(parent.clone()) {
-            break; // cycle guard
+    // Phase 2: the Lua parent chain of each class we landed on — the native `UI*` the style chain
+    // reached, plus every `__class:` re-root. A `__class` class (e.g. `UISpinBox`) is typically a Lua
+    // widget, so its own `extends` parents carry properties too.
+    for root in native.iter().cloned().chain(reroots) {
+        let mut current = root;
+        if seen.insert(current.clone()) {
+            chain.push(current.clone());
         }
-        chain.push(parent.clone());
-        current = parent;
+        while let Some(parent) = lua.parent_of(&current) {
+            let parent = parent.to_owned();
+            if !seen.insert(parent.clone()) {
+                break; // cycle guard
+            }
+            chain.push(parent.clone());
+            current = parent;
+        }
     }
 
     WidgetAncestry { chain, native }
 }
 
-/// The base of the deterministically-chosen definition of the style `name`, or `None` when `name` is
-/// defined nowhere (or only by malformed headers with no base).
+/// The deterministically-chosen definition of the style `name`, or `None` when `name` is defined
+/// nowhere (or only by malformed headers with no base). Carries both the base to keep walking and
+/// any `__class:` re-root the style declares.
 ///
 /// Duplicate style names are legal (the engine's last registration wins at runtime, which a static
 /// index cannot know), so this picks a **stable** winner rather than guessing runtime order: among
 /// the defs that carry a base, the one ordered first by `(document id, name-span start)`. The choice
 /// is arbitrary but deterministic, so resolution never flickers between runs; a base that actually
 /// differs across duplicates is pathological.
-fn pick_base(styles: &StyleIndex, name: &str) -> Option<String> {
+fn pick_def<'a>(styles: &'a StyleIndex, name: &str) -> Option<&'a StyleDef> {
     let mut defs: Vec<(&str, &StyleDef)> = styles
         .lookup(name)
         .into_iter()
@@ -138,7 +154,7 @@ fn pick_base(styles: &StyleIndex, name: &str) -> Option<String> {
         a.0.cmp(b.0)
             .then(a.1.name_span.start.cmp(&b.1.name_span.start))
     });
-    defs.first().and_then(|(_, d)| d.base.clone())
+    defs.first().map(|(_, d)| *d)
 }
 
 #[cfg(test)]
@@ -254,6 +270,61 @@ mod tests {
         // UIA is native, so phase 2 follows UIA -> UIB, then UIB -> UIA is already seen and stops.
         assert_eq!(a.chain, ["UIA", "UIB"]);
         assert_eq!(a.native.as_deref(), Some("UIA"));
+    }
+
+    #[test]
+    fn a_class_reroot_pulls_in_the_lua_widgets_properties() {
+        // `SpinBox < TextEdit` + `__class: UISpinBox` — the engine instantiates a `UISpinBox` (which
+        // declares `minimum`/`maximum`/`step` in Lua) styled from `TextEdit`. The `< Base` chain
+        // alone never mentions `UISpinBox`, so without the re-root those properties look unknown.
+        let styles = styles(&[(
+            "a.otui",
+            "TextEdit < UITextEdit\nSpinBox < TextEdit\n  __class: UISpinBox\n",
+        )]);
+        let lua = lua(&[(
+            "uispinbox.lua",
+            "UISpinBox = extends(UITextEdit, 'UISpinBox')\n\
+             function UISpinBox:onStyleApply(styleName, styleNode)\n\
+               for name, value in pairs(styleNode) do\n\
+                 if name == 'minimum' then self:setMinimum(value)\n\
+                 elseif name == 'maximum' then self:setMaximum(value)\n\
+                 end\n\
+               end\n\
+             end\n",
+        )]);
+
+        let spin = resolve_ancestry("SpinBox", &styles, &lua);
+        assert!(
+            spin.chain.contains(&"UISpinBox".to_owned()),
+            "{:?}",
+            spin.chain
+        );
+        assert!(spin.declares_custom_property(&lua, "minimum"));
+        assert!(spin.declares_custom_property(&lua, "maximum"));
+        // The style chain is still walked, so the base's native properties still resolve.
+        assert!(spin.declares_custom_property(&lua, "placeholder"));
+    }
+
+    #[test]
+    fn a_class_reroot_does_not_leak_to_the_base_style() {
+        // The re-root belongs to `SpinBox`, not to the `TextEdit` it inherits its look from.
+        let styles = styles(&[(
+            "a.otui",
+            "TextEdit < UITextEdit\nSpinBox < TextEdit\n  __class: UISpinBox\n",
+        )]);
+        let lua = lua(&[(
+            "uispinbox.lua",
+            "UISpinBox = extends(UITextEdit, 'UISpinBox')\n\
+             function UISpinBox:onStyleApply(s, n)\n\
+               for name, value in pairs(n) do\n\
+                 if name == 'minimum' then self:setMinimum(value) end\n\
+               end\n\
+             end\n",
+        )]);
+
+        assert!(
+            !resolve_ancestry("TextEdit", &styles, &lua).declares_custom_property(&lua, "minimum")
+        );
     }
 
     #[test]
