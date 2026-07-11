@@ -62,6 +62,7 @@ use otui_core::fixes::Fix;
 use otui_core::hover::{Inheritance, StyleHover, StyleHoverKind};
 use otui_core::links::PathRef;
 use otui_core::lua_widgets::LuaWidgetIndex;
+use otui_core::property_hover::{PropertyHover, PropertyValueKind};
 use otui_core::style_index::{is_native_base, DocId, StyleDef, StyleIndex};
 use otui_core::OtuiService;
 
@@ -1215,6 +1216,51 @@ fn render_hover(desc: &StyleHover, line_index: &LineIndex, encoding: PositionEnc
     }
 }
 
+/// Format a [`PropertyHover`] (a property-key description from the engine) into an LSP Markdown
+/// [`Hover`]. Pure presentation: [`otui_core`] decided the property's value kind from its catalog +
+/// schema metadata; here we only word it and map the key span to a range.
+fn render_property_hover(
+    desc: &PropertyHover,
+    line_index: &LineIndex,
+    encoding: PositionEncoding,
+) -> Hover {
+    let name = &desc.name;
+    // Prefer the curated behavior sentence; fall back to a value-kind description when the property
+    // is known but outside the curated canonical set.
+    let title = match desc.doc {
+        Some(doc) => format!("**`{name}`** — {doc}"),
+        None => {
+            let body = match &desc.value {
+                PropertyValueKind::Color => "a color value",
+                PropertyValueKind::AssetPath => {
+                    "an asset path (a texture) — the `.png` extension is optional"
+                }
+                PropertyValueKind::Enum { .. } => "one of a fixed value set (see below)",
+                PropertyValueKind::Border => "a border shorthand: a width and a color (or `none`)",
+                PropertyValueKind::Plain => "an OTUI style property",
+            };
+            format!("**`{name}`** — {body}")
+        }
+    };
+    let mut value = title;
+    // For a fixed-value-set property (display, layout), always append the full accepted list.
+    if let PropertyValueKind::Enum { values } = &desc.value {
+        let list = values
+            .iter()
+            .map(|v| format!("`{v}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        value.push_str(&format!("\n\nOne of: {list}"));
+    }
+    Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value,
+        }),
+        range: Some(line_index.range(desc.span.start, desc.span.end, encoding)),
+    }
+}
+
 /// Append an "Inherits from `Base`" line (marking a native base as `(built-in)`) when `inherits` is
 /// present; a no-op otherwise.
 fn append_inherits(value: &mut String, inherits: Option<&Inheritance>) {
@@ -1616,13 +1662,15 @@ impl Backend {
                 // Completion: the OTML closed sets (spec §6). `$` / `@` / `.` / `!` re-trigger
                 // completion as those characters open a `$state` selector, an `@event` key, an
                 // `anchors.<edge>` / `<target>.<edge>` dotted position, or a `!`-negated state in a
-                // multi-state selector (`$hover !…`).
+                // multi-state selector (`$hover !…`); `:` opens the value position of a `key: value`
+                // property (offering the `display`/`layout` keyword set or the named-color list).
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![
                         "$".to_owned(),
                         "@".to_owned(),
                         ".".to_owned(),
                         "!".to_owned(),
+                        ":".to_owned(),
                     ]),
                     ..CompletionOptions::default()
                 }),
@@ -2354,8 +2402,14 @@ impl Backend {
         let line_index = LineIndex::new(&text);
         let offset = line_index.offset_at(position, encoding);
         let index = self.style_index.read().expect("style_index lock poisoned");
-        let desc = self.service.style_hover_at(&text, offset, &index)?;
-        Some(render_hover(&desc, &line_index, encoding))
+        if let Some(desc) = self.service.style_hover_at(&text, offset, &index) {
+            return Some(render_hover(&desc, &line_index, encoding));
+        }
+        drop(index);
+        // Not a style token — fall back to a property-key hover (value type from the catalog/schema
+        // metadata; no workspace index needed).
+        let pdesc = self.service.property_hover_at(&text, offset)?;
+        Some(render_property_hover(&pdesc, &line_index, encoding))
     }
 
     fn completion(&self, params: CompletionParams) -> Option<CompletionResponse> {
@@ -4293,6 +4347,57 @@ end
         assert!(OtuiService::new()
             .style_hover_at(src, offset, &index)
             .is_none());
+    }
+
+    /// Render the property-key hover at `needle` in `text` (the fallback path of the hover handler).
+    fn property_hover_text(text: &str, needle: &str) -> String {
+        let offset = text.find(needle).expect("needle present") + 1;
+        let desc = OtuiService::new()
+            .property_hover_at(text, offset)
+            .expect("cursor is on a known property key");
+        let line_index = LineIndex::new(text);
+        let h = render_property_hover(&desc, &line_index, PositionEncoding::Utf16);
+        match h.contents {
+            HoverContents::Markup(m) => m.value,
+            other => panic!("expected markup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hover_on_an_asset_path_property_describes_it() {
+        let t = property_hover_text("Panel\n  image-source: /images/ui/x\n", "image-source");
+        assert!(t.contains("**`image-source`**"), "{t}");
+        // Curated behavior for image-source mentions the texture path.
+        assert!(t.contains("texture path"), "{t}");
+    }
+
+    #[test]
+    fn hover_on_an_enum_property_lists_its_values() {
+        let t = property_hover_text("Panel\n  display: flex\n", "display");
+        assert!(t.contains("**`display`**"), "{t}");
+        // Enum properties always append the full accepted value list.
+        assert!(t.contains("One of:"), "{t}");
+        assert!(t.contains("`flex`"), "{t}");
+    }
+
+    #[test]
+    fn hover_on_a_color_property_describes_it() {
+        let t = property_hover_text("Panel\n  color: red\n", "color");
+        // Curated behavior for color describes the draw color.
+        assert!(t.contains("**`color`**") && t.contains("draw color"), "{t}");
+    }
+
+    #[test]
+    fn hover_on_a_known_uncurated_property_uses_the_value_kind_fallback() {
+        // `min-width` is a real catalog property with no curated doc → the plain value-kind fallback.
+        let t = property_hover_text("Panel\n  min-width: 10\n", "min-width");
+        assert!(
+            t.contains("**`min-width`**") && t.contains("OTUI style property"),
+            "{t}"
+        );
+        // `border-color-bottom` is a color property with no curated doc → the color-value fallback.
+        let t2 = property_hover_text("Panel\n  border-color-bottom: red\n", "border-color-bottom");
+        assert!(t2.contains("a color value"), "{t2}");
     }
 
     /// The [`CodeAction`] inside a [`CodeActionOrCommand`] (panics if it is a bare command).
