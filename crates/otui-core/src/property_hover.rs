@@ -105,7 +105,6 @@ pub fn property_doc(name: &str) -> Option<&'static str> {
 /// base/image/text properties; per-widget style tags (a `UITable`'s `column-style`, `UIItem`'s
 /// `item-id`, …) are not here. **Kept sorted by key** for the binary search in [`property_doc`].
 pub static PROPERTY_DOCS: &[(&str, &str)] = &[
-    ("anchors.bottom", "Anchor an edge of this widget to a target's edge (`<target>.<edge>`; target = parent/next/prev or a sibling id)."),
     ("background", "Filled background color drawn behind the widget."),
     ("background-color", "Filled background color drawn behind the widget."),
     ("border", "Border shorthand: a width and a color (or `none`)."),
@@ -123,7 +122,6 @@ pub static PROPERTY_DOCS: &[(&str, &str)] = &[
     ("icon", "Icon texture path (extension optional; `.png` assumed)."),
     ("icon-color", "Tint color applied to the icon."),
     ("icon-source", "Icon texture path (extension optional; `.png` assumed)."),
-    ("id", "The widget's id — used by `getChildById` and as an anchor target by its siblings."),
     ("image-clip", "Source rect (`x y w h`) clipped out of the image texture."),
     ("image-color", "Tint color multiplied into the image."),
     ("image-fixed-ratio", "Keep the image's aspect ratio when scaling."),
@@ -234,6 +232,19 @@ mod tests {
         let src = "Panel\n  width: 10\n";
         let h = hover(src, "width").expect("hover");
         assert_eq!(&src[h.span.start..h.span.end], "width");
+    }
+
+    #[test]
+    fn every_property_doc_key_is_a_real_catalog_property() {
+        // A curated doc for a key that is not a dispatched catalog property (e.g. the prefix-based
+        // `anchors.*`, or the special-cased `id`) is dead code: `property_hover_at` gates on
+        // `is_known_property`, and those forms are their own grammar nodes, never a `property_key`.
+        for (key, _) in PROPERTY_DOCS {
+            assert!(
+                schema::is_known_property(key),
+                "PROPERTY_DOCS key `{key}` is not a catalog property — it can never be hovered"
+            );
+        }
     }
 
     #[test]
