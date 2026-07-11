@@ -126,13 +126,21 @@ module.exports = grammar({
       choice($._newline, $._block),
     ),
 
+    // In both, a `!` binds tight to the name it negates. The engine splits the tag
+    // on spaces and only then strips a leading `!` off each token, so `!disabled` is
+    // one token but `! disabled` is two — a lone `!` (which `translateState("")`
+    // rejects) followed by `disabled`. Requiring the name to be `token.immediate`
+    // after the `!` keeps us from reading that as a negation the engine never saw.
     _head_state: $ => seq(
       optional(field('negated', alias(token.immediate('!'), $.state_negation))),
       field('name', alias(token.immediate(IDENT), $.state_name)),
     ),
 
-    state: $ => seq(
-      optional(field('negated', alias('!', $.state_negation))),
+    state: $ => choice(
+      seq(
+        field('negated', alias('!', $.state_negation)),
+        field('name', alias(token.immediate(IDENT), $.state_name)),
+      ),
       field('name', alias(IDENT, $.state_name)),
     ),
 

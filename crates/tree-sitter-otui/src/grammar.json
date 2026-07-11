@@ -218,10 +218,10 @@
       ]
     },
     "state": {
-      "type": "SEQ",
+      "type": "CHOICE",
       "members": [
         {
-          "type": "CHOICE",
+          "type": "SEQ",
           "members": [
             {
               "type": "FIELD",
@@ -237,7 +237,20 @@
               }
             },
             {
-              "type": "BLANK"
+              "type": "FIELD",
+              "name": "name",
+              "content": {
+                "type": "ALIAS",
+                "content": {
+                  "type": "IMMEDIATE_TOKEN",
+                  "content": {
+                    "type": "PATTERN",
+                    "value": "[A-Za-z_][A-Za-z0-9_\\-]*"
+                  }
+                },
+                "named": true,
+                "value": "state_name"
+              }
             }
           ]
         },

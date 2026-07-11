@@ -187,14 +187,14 @@ pub fn scan_widgets(source: &str) -> Vec<LuaWidgetDef> {
 /// ```
 ///
 /// The handler then reads `styleNode.tooltip`, which makes `tooltip:` a valid style property on the
-/// connected class and everything descending from it. Scanned across a small window after the
-/// `connect(` so the table literal may span lines, as it does in practice.
+/// connected class and everything descending from it.
+///
+/// The table literal may span lines, so the scan continues past the `connect(` — but it stops at the
+/// **end of that table** (a line closing it with `}`) or at the next `connect(`, whichever comes
+/// first. Scanning blindly ahead would let a *later* `connect(OtherClass, {onStyleApply = …})` donate
+/// its handler to a preceding `connect(` that declared no style hook of its own, attributing the
+/// properties to the wrong class.
 fn parse_connect_style_hooks(lines: &[&str]) -> Vec<(String, String)> {
-    /// How many lines after a `connect(` the `onStyleApply = …` entry is looked for. The engine's
-    /// tables are a handful of entries; a bounded window keeps an unrelated later `onStyleApply`
-    /// from being mis-attributed.
-    const WINDOW: usize = 12;
-
     let mut out = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let Some(rest) = find_call_arg(line, "connect") else {
@@ -208,10 +208,18 @@ fn parse_connect_style_hooks(lines: &[&str]) -> Vec<(String, String)> {
         else {
             continue;
         };
-        let end = (i + WINDOW).min(lines.len());
-        for hook_line in &lines[i..end] {
+        for (offset, hook_line) in lines[i..].iter().enumerate() {
+            // Stop at the next `connect(` — its table is not ours.
+            if offset > 0 && find_call_arg(hook_line, "connect").is_some() {
+                break;
+            }
             if let Some(handler) = table_entry_value(hook_line, "onStyleApply") {
                 out.push((class.clone(), handler));
+                break;
+            }
+            // Stop at the end of this table. Checked *after* the entry test so a single-line
+            // `connect(C, { onStyleApply = h })` still resolves.
+            if offset > 0 && hook_line.trim_start().starts_with('}') {
                 break;
             }
         }
@@ -231,17 +239,43 @@ fn find_call_arg<'a>(line: &'a str, name: &str) -> Option<&'a str> {
     before_ok.then(|| &line[idx + name.len() + 1..])
 }
 
-/// The value of a `<key> = <value>` entry in a Lua table literal line, e.g. the `onWidgetStyleApply`
-/// in `onStyleApply = onWidgetStyleApply,`. `None` when `key` is not this line's entry.
+/// The value of a `<key> = <value>` entry in a Lua table literal, e.g. the `onWidgetStyleApply` in
+/// `onStyleApply = onWidgetStyleApply,`. `None` when the line carries no such entry.
+///
+/// Found anywhere on the line, not just at its start, so a single-line table
+/// (`connect(C, { onStyleApply = h })`) resolves as well as the multi-line form. Matched as a whole
+/// word (a `myOnStyleApply = f` is not it) and `==` is rejected — that is a comparison, not an entry.
 fn table_entry_value(line: &str, key: &str) -> Option<String> {
-    let trimmed = line.trim();
-    let rest = trimmed.strip_prefix(key)?;
-    let rest = rest.trim_start().strip_prefix('=')?;
-    // Reject `==` (a comparison, not a table entry).
-    if rest.starts_with('=') {
-        return None;
+    let mut search = 0;
+    while let Some(rel) = line[search..].find(key) {
+        let idx = search + rel;
+        search = idx + key.len();
+
+        // Whole-word: `myOnStyleApply = f` is not the `onStyleApply` entry.
+        // `map_or(true, …)` rather than `Option::is_none_or` — the latter is only stable since Rust
+        // 1.82, but the workspace MSRV is 1.75.
+        let word_start = line[..idx]
+            .chars()
+            .last()
+            .map_or(true, |c| !c.is_alphanumeric() && c != '_');
+        if !word_start {
+            continue;
+        }
+        let Some(rest) = line[search..].trim_start().strip_prefix('=') else {
+            continue;
+        };
+        // Reject `==` (a comparison, not a table entry).
+        if rest.starts_with('=') {
+            continue;
+        }
+        // The value runs to the entry's end: the next `,`, or the table's `}`.
+        let value = rest.trim_start();
+        let end = value.find([',', '}', ')']).unwrap_or(value.len());
+        if let Some(id) = last_identifier(value[..end].trim()) {
+            return Some(id);
+        }
     }
-    last_identifier(rest.trim().trim_end_matches(',').trim())
+    None
 }
 
 /// The body of the top-level function named `name` — `[local ]function <name>(` up to (but not
@@ -708,6 +742,56 @@ end
             .expect("the connected class is recorded");
         assert!(w.custom_props.contains("tooltip"));
         assert!(w.custom_props.contains("specialtooltip"));
+    }
+
+    #[test]
+    fn a_style_hook_is_not_donated_to_a_preceding_connect() {
+        // A `connect(A, {...})` with no style hook must NOT pick up the `onStyleApply` of a *later*
+        // `connect(B, {...})`. Scanning blindly ahead would attribute B's properties to A.
+        let src = "\
+local function handler(widget, styleName, styleNode)
+    if styleNode.tooltip then widget.tooltip = styleNode.tooltip end
+end
+
+function m.init()
+    connect(UIButton, {
+        onHoverChange = f,
+        onDestroy = g
+    })
+    connect(UIWidget, {
+        onStyleApply = handler
+    })
+end
+";
+        let defs = scan_widgets(src);
+        let w = defs
+            .iter()
+            .find(|d| d.name == "UIWidget")
+            .expect("the hook's own class");
+        assert!(w.custom_props.contains("tooltip"));
+        // UIButton declared no style hook, so it must declare no properties.
+        assert!(
+            defs.iter()
+                .all(|d| d.name != "UIButton" || d.custom_props.is_empty()),
+            "the later hook leaked onto UIButton: {defs:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_line_connect_style_hook_still_resolves() {
+        // The table-end guard must not cut the scan before the entry on the very same line.
+        let src = "\
+local function h(widget, styleName, styleNode)
+    if styleNode.tooltip then widget.tooltip = styleNode.tooltip end
+end
+connect(UIWidget, { onStyleApply = h })
+";
+        let defs = scan_widgets(src);
+        let w = defs
+            .iter()
+            .find(|d| d.name == "UIWidget")
+            .expect("class recorded");
+        assert!(w.custom_props.contains("tooltip"));
     }
 
     #[test]

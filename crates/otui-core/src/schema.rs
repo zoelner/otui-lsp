@@ -864,7 +864,11 @@ mod tests {
         // Names the engine spells in lowercase (`green`, `teal`, `gray`) match the static chain
         // exactly as written, so they keep the legacy value — and these are the ones real `.otui`
         // files actually use.
-        assert_eq!(color_value("green"), color_value("green"));
+        //
+        // Pinned to the concrete value: the engine's `green` is the bright `0x00ff00`, *not* the
+        // darker CSS `green` (`0x008000`). A regression that routes it to the CSS table must fail
+        // here — asserting `color_value("green") == color_value("green")` would not catch that.
+        assert_eq!(color_value("green"), Some(Rgba::from_u8(0, 255, 0, 255)));
         assert!(is_named_color("green"));
         assert!(is_named_color("alpha"));
     }
