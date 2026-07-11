@@ -200,12 +200,19 @@ fn parse_connect_style_hooks(lines: &[&str]) -> Vec<(String, String)> {
         let Some(rest) = find_call_arg(line, "connect") else {
             continue;
         };
-        // The connected class is the first argument.
-        let Some(class) = rest
-            .split(',')
-            .next()
-            .and_then(|a| last_identifier(a.trim()))
-        else {
+        // The connected class is the first argument. Lua permits `connect(\n  UIWidget, {…})`, so
+        // when nothing follows the `(` on this line, look to the next non-blank one.
+        let head = rest.split(',').next().unwrap_or("").trim();
+        let class = if head.is_empty() {
+            lines[i + 1..]
+                .iter()
+                .find(|l| !l.trim().is_empty())
+                .and_then(|l| l.trim().split(',').next())
+                .and_then(|a| last_identifier(a.trim()))
+        } else {
+            last_identifier(head)
+        };
+        let Some(class) = class else {
             continue;
         };
         for (offset, hook_line) in lines[i..].iter().enumerate() {
@@ -228,15 +235,31 @@ fn parse_connect_style_hooks(lines: &[&str]) -> Vec<(String, String)> {
 }
 
 /// The text after `<name>(` on `line`, or `None` when the call does not appear as a whole word.
+///
+/// Lua allows whitespace between the callee and its `(` — `connect (UIWidget, …)` — so the gap is
+/// tolerated. Matched as a whole word, so a `disconnect(` is not a `connect(`.
 fn find_call_arg<'a>(line: &'a str, name: &str) -> Option<&'a str> {
-    let idx = line.find(&format!("{name}("))?;
-    // `map_or(true, …)` rather than `Option::is_none_or` — the latter is only stable since Rust
-    // 1.82, but the workspace MSRV is 1.75.
-    let before_ok = line[..idx]
-        .chars()
-        .last()
-        .map_or(true, |c| !c.is_alphanumeric() && c != '_');
-    before_ok.then(|| &line[idx + name.len() + 1..])
+    let mut search = 0;
+    while let Some(rel) = line[search..].find(name) {
+        let idx = search + rel;
+        search = idx + name.len();
+
+        // `map_or(true, …)` rather than `Option::is_none_or` — the latter is only stable since Rust
+        // 1.82, but the workspace MSRV is 1.75.
+        let word_start = line[..idx]
+            .chars()
+            .last()
+            .map_or(true, |c| !c.is_alphanumeric() && c != '_');
+        if !word_start {
+            continue;
+        }
+        let after = &line[search..];
+        let trimmed = after.trim_start();
+        if let Some(args) = trimmed.strip_prefix('(') {
+            return Some(args);
+        }
+    }
+    None
 }
 
 /// The value of a `<key> = <value>` entry in a Lua table literal, e.g. the `onWidgetStyleApply` in
@@ -792,6 +815,52 @@ connect(UIWidget, { onStyleApply = h })
             .find(|d| d.name == "UIWidget")
             .expect("class recorded");
         assert!(w.custom_props.contains("tooltip"));
+    }
+
+    #[test]
+    fn a_connect_with_a_space_or_a_wrapped_class_still_resolves() {
+        // Lua allows `connect (` and a class argument on the next line. Missing either form would
+        // drop the hook's properties and turn them back into false `unknown-property` hints.
+        for src in [
+            "\
+local function h(widget, styleName, styleNode)
+    if styleNode.tooltip then widget.tooltip = styleNode.tooltip end
+end
+connect (UIWidget, {
+    onStyleApply = h
+})
+",
+            "\
+local function h(widget, styleName, styleNode)
+    if styleNode.tooltip then widget.tooltip = styleNode.tooltip end
+end
+connect(
+    UIWidget,
+    { onStyleApply = h }
+)
+",
+        ] {
+            let defs = scan_widgets(src);
+            let w = defs
+                .iter()
+                .find(|d| d.name == "UIWidget")
+                .unwrap_or_else(|| panic!("no UIWidget in {defs:?} for {src:?}"));
+            assert!(w.custom_props.contains("tooltip"), "{defs:?}");
+        }
+    }
+
+    #[test]
+    fn disconnect_is_not_mistaken_for_connect() {
+        let src = "\
+local function h(widget, styleName, styleNode)
+    if styleNode.tooltip then widget.tooltip = styleNode.tooltip end
+end
+disconnect(UIWidget, { onStyleApply = h })
+";
+        assert!(
+            scan_widgets(src).iter().all(|d| d.custom_props.is_empty()),
+            "a disconnect must not register the hook"
+        );
     }
 
     #[test]

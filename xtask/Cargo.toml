@@ -10,4 +10,5 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+otui-core = { path = "../crates/otui-core" }
 regex = "1"

@@ -26,6 +26,8 @@
 //! idea in the plan) can reuse [`Catalog`] by writing multiple named tables; the extraction and the
 //! `--src` plumbing already isolate "which engine tree" from "what we emit".
 
+mod corpus;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -138,22 +140,43 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("corpus") => match corpus_task(args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(msg) => {
+                eprintln!("xtask corpus: {msg}");
+                ExitCode::FAILURE
+            }
+        },
         Some(other) => {
-            eprintln!("xtask: unknown task '{other}'. Available: gen-catalog");
+            eprintln!("xtask: unknown task '{other}'. Available: gen-catalog, corpus");
             ExitCode::FAILURE
         }
         None => {
             eprintln!(
                 "usage: cargo xtask <task>\n  tasks:\n    gen-catalog --src <engine-source-root>   \
-                 generate the OTUI property/color catalog"
+                 generate the OTUI property/color catalog\n    corpus --src <engine-source-root>        \
+                 report diagnostics over a real engine .otui corpus"
             );
             ExitCode::FAILURE
         }
     }
 }
 
-fn gen_catalog(mut args: impl Iterator<Item = String>) -> Result<(), String> {
-    // --- resolve the engine-source root (never hard-coded; leak-safety requirement) -------------
+/// `corpus --src <engine-source-root>` — run the fidelity harness over a real engine tree.
+///
+/// Lives here rather than as an `otui-core` example because it does I/O (argument parsing, directory
+/// traversal, file reads) and `otui-core` must stay pure.
+fn corpus_task(args: impl Iterator<Item = String>) -> Result<(), String> {
+    let src = resolve_engine_src(args)?;
+    corpus::run(&src);
+    Ok(())
+}
+
+/// Resolve the engine-source root from `--src <path>` / `--src=<path>` or `OTUI_ENGINE_SRC`.
+///
+/// **Never hard-coded** (leak-safety requirement): with neither given, this errors rather than
+/// guessing a path, so no absolute path or fork identity can be baked into the tool or its output.
+fn resolve_engine_src(mut args: impl Iterator<Item = String>) -> Result<PathBuf, String> {
     let mut src: Option<String> = std::env::var("OTUI_ENGINE_SRC")
         .ok()
         .filter(|s| !s.is_empty());
@@ -179,6 +202,11 @@ fn gen_catalog(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             src.display()
         ));
     }
+    Ok(src)
+}
+
+fn gen_catalog(args: impl Iterator<Item = String>) -> Result<(), String> {
+    let src = resolve_engine_src(args)?;
 
     // --- extract ---------------------------------------------------------------------------------
     let catalog = extract(&src)?;

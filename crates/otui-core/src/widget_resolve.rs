@@ -116,18 +116,22 @@ pub fn resolve_ancestry(start: &str, styles: &StyleIndex, lua: &LuaWidgetIndex) 
     // Phase 2: the Lua parent chain of each class we landed on — the native `UI*` the style chain
     // reached, plus every `__class:` re-root. A `__class` class (e.g. `UISpinBox`) is typically a Lua
     // widget, so its own `extends` parents carry properties too.
+    // `seen` and the traversal guard are deliberately *separate* sets. `seen` de-duplicates entries
+    // in `chain`; `expanded` stops the walk from re-visiting a class. Using `seen` for both would cut
+    // the walk short at a class that is already in the chain but whose own Lua parents were never
+    // traversed — e.g. a `__class:` re-root extending a name that also appears in the `.otui` chain
+    // would silently lose every property inherited above it.
+    let mut expanded: HashSet<String> = HashSet::new();
     for root in native.iter().cloned().chain(reroots) {
         let mut current = root;
-        if seen.insert(current.clone()) {
-            chain.push(current.clone());
-        }
-        while let Some(parent) = lua.parent_of(&current) {
-            let parent = parent.to_owned();
-            if !seen.insert(parent.clone()) {
-                break; // cycle guard
+        while expanded.insert(current.clone()) {
+            if seen.insert(current.clone()) {
+                chain.push(current.clone());
             }
-            chain.push(parent.clone());
-            current = parent;
+            let Some(parent) = lua.parent_of(&current) else {
+                break;
+            };
+            current = parent.to_owned();
         }
     }
 
@@ -344,6 +348,33 @@ mod tests {
         assert!(spin.declares_custom_property(&lua, "maximum"));
         // The style chain is still walked, so the base's native properties still resolve.
         assert!(spin.declares_custom_property(&lua, "placeholder"));
+    }
+
+    #[test]
+    fn a_reroots_lua_ancestors_survive_a_name_shared_with_the_otui_chain() {
+        // The walk must not stop at a class merely because it is already in `chain`. Here the
+        // re-rooted `UIBar` extends `Base` — a name the `.otui` chain already carries — and `Base`
+        // in turn has a Lua parent (`UICore`) that declares a property. Guarding the traversal with
+        // the chain's de-dup set would break at `Base` and silently drop `core-prop`.
+        let styles = styles(&[("a.otui", "Base < UIFoo\nThing < Base\n  __class: UIBar\n")]);
+        let lua = lua(&[(
+            "w.lua",
+            "UIBar = extends(Base, 'UIBar')\n\
+             Base = extends(UICore, 'Base')\n\
+             function UICore:onStyleApply(styleName, styleNode)\n\
+               for name, value in pairs(styleNode) do\n\
+                 if name == 'core-prop' then self:setCore(value) end\n\
+               end\n\
+             end\n",
+        )]);
+
+        let thing = resolve_ancestry("Thing", &styles, &lua);
+        assert!(
+            thing.chain.contains(&"UICore".to_owned()),
+            "the re-root's grandparent was dropped: {:?}",
+            thing.chain
+        );
+        assert!(thing.declares_custom_property(&lua, "core-prop"));
     }
 
     #[test]

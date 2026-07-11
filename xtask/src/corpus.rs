@@ -2,18 +2,16 @@
 //! `unknown-property` finding **with the widget it sits on**, so a genuine dead property (one the
 //! engine reads nowhere) can be told apart from a gap in the LSP's catalog.
 //!
-//! Usage: `cargo run -p otui-core --example corpus -- <engine-source-root>`
+//! Usage: `cargo xtask corpus --src <engine-source-root>`
 use otui_core::diagnostics::{analyze_with_widgets, WidgetContext};
 use otui_core::lua_widgets::{scan_widgets, LuaWidgetIndex};
 use otui_core::style_index::{extract_style_defs, StyleIndex};
 use otui_core::syntax::SyntaxTree;
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
-fn main() {
-    let root = std::env::args()
-        .nth(1)
-        .expect("usage: corpus <engine-root>");
-    let root = std::path::Path::new(&root);
+/// Run the harness over the engine tree at `root` and print the report to stdout.
+pub fn run(root: &Path) {
     let (otui, lua) = (files(root, "otui"), files(root, "lua"));
 
     let mut styles = StyleIndex::new();
@@ -84,9 +82,9 @@ fn enclosing_widget(src: &str, offset: usize) -> Option<String> {
     }
 }
 
-fn files(dir: &std::path::Path, ext: &str) -> Vec<std::path::PathBuf> {
+fn files(dir: &Path, ext: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    fn go(d: &std::path::Path, ext: &str, out: &mut Vec<std::path::PathBuf>) {
+    fn go(d: &Path, ext: &str, out: &mut Vec<PathBuf>) {
         let Ok(rd) = std::fs::read_dir(d) else { return };
         for e in rd.flatten() {
             let p = e.path();
