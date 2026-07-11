@@ -232,6 +232,16 @@ fn widget_names(styles: &StyleIndex, lua: &LuaWidgetIndex) -> Vec<(String, &'sta
     }
     for def in lua.iter() {
         named.entry(def.name.clone()).or_insert("lua widget");
+        // A widget's native `extends` parent is itself a valid child type — this is how the built-in
+        // `UI*` classes (`UIWidget`, `UIButton`, `UIScrollArea`, …) surface as completions without a
+        // hardcoded, fork-specific list: they are the parents the scanned corelib/gamelib widgets
+        // derive from, captured dynamically. (A `UI*` base referenced by an `.otui` style is likewise
+        // captured above.)
+        if let Some(parent) = def.lua_parent.as_deref() {
+            if is_native_base(parent) {
+                named.entry(parent.to_owned()).or_insert("native widget");
+            }
+        }
     }
     named.into_iter().collect()
 }
@@ -1106,6 +1116,23 @@ Window < UIWindow
         assert_eq!(
             named("UITable").and_then(|i| i.detail),
             Some("lua widget".to_owned())
+        );
+    }
+
+    #[test]
+    fn native_widget_classes_surface_from_lua_parents_without_a_style_reference() {
+        // No `.otui` style references `UIWidget`, but the scanned Lua widget `UITable` extends it, so
+        // the native base is still offered as a child type — the built-in `UI*` classes come from the
+        // corelib/gamelib widgets' parents, not a hardcoded list.
+        let styles = styles(&[]);
+        let lua = lua(&[("uitable.lua", UITABLE_LUA)]); // UITable = extends(UIWidget, 'UITable')
+        let src = "SomeWidget\n  UI\n";
+        let items = complete_at_with_widgets(src, at(src, "UI\n") + "UI".len(), &styles, &lua);
+        let ui_widget = items.iter().find(|i| i.label == "UIWidget").cloned();
+        assert_eq!(
+            ui_widget.and_then(|i| i.detail),
+            Some("native widget".to_owned()),
+            "UIWidget must be offered as a native child even with no style referencing it"
         );
     }
 
