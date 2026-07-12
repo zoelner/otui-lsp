@@ -30,6 +30,7 @@ pub mod links;
 pub mod lua_refs;
 pub mod lua_widgets;
 pub mod navigation;
+mod otml_reparent;
 pub mod property_hover;
 pub mod references;
 pub mod schema;

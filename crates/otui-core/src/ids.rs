@@ -33,6 +33,7 @@
 //! turn it into a `Location` in the declaring file without this crate knowing what a URI is.
 
 use crate::lua_widgets::LuaWidgetIndex;
+use crate::otml_reparent::is_reparented_onto_a_unique_sibling;
 use crate::style_index::{DocId, StyleIndex};
 use crate::syntax::SyntaxTree;
 use crate::widget_resolve::resolve_ancestry;
@@ -79,9 +80,10 @@ pub struct VisibleId {
 /// A widget is "instantiated" by a `style_header` (its `base`) or bare `container` (its `tag`) node,
 /// at any depth **the engine actually descends into** — not just the top-level entry: a nested widget
 /// can itself be an instance of a style declared elsewhere, and its inherited ids are visible too. See
-/// [`collect_instantiated_ids`] for why that depth stops at the first `:`-bearing (engine-"unique")
-/// node. Each distinct instantiated type is resolved only once, even if the document instantiates it
-/// repeatedly.
+/// [`collect_instantiated_ids`] for the two ways that depth stops short of "every nested
+/// `container`/`style_header` in the source text": a `:`-bearing (engine-"unique") ancestor, and a
+/// line reparented onto one. Each distinct instantiated type is resolved only once, even if the
+/// document instantiates it repeatedly.
 ///
 /// ## Over-approximation: a duplicated style name contributes every match, not just the winner
 ///
@@ -114,9 +116,19 @@ pub fn visible_ids(source: &str, styles: &StyleIndex) -> Vec<VisibleId> {
     let mut local_names = HashSet::new();
     collect_local_ids(root, source, &mut local, &mut local_names);
 
-    // Ids don't come from Lua-declared widgets (only a style's `.otui` body ever carries an
-    // `id_property`), so an empty `LuaWidgetIndex` is enough to drive `resolve_ancestry`'s cross-file
-    // `.otui` walk without pulling in a Lua parent chain that could never contribute an id anyway.
+    // An empty `LuaWidgetIndex` only truncates `resolve_ancestry`'s *Lua*-parent chain — the walk
+    // above the native `UI*` class it reaches (and above any `__class:` re-root) — never the
+    // `.otui` `< Base` chain itself, which is what actually supplies `body_ids` (via
+    // `StyleIndex::lookup`, keyed by style name). This is a **recall** shortcut, not a soundness
+    // one: it can only make `visible_ids` return *fewer* candidates, by skipping a Lua-only
+    // ancestor between the native class and `UIWidget` (e.g. `UITable`'s `UIScrollArea` parent).
+    // Checked, not assumed: across the full corpus (778 style names/bases), 35 have a longer
+    // ancestry with a real `LuaWidgetIndex` than with an empty one, and in every one of those 35
+    // cases the extra ancestor carries zero `body_ids` — because no `.otui` file declares a
+    // top-level style literally named after a native/Lua-only class (`UITable`, `UIScrollArea`,
+    // …). So this shortcut currently costs nothing measured, but it is a recall gap in principle:
+    // a `.otui` style named e.g. `UIScrollArea` with its own `id:` declarations would be missed by
+    // a caller that only reaches `UITable` directly.
     let lua = LuaWidgetIndex::new();
     let mut seen_types = HashSet::new();
     let mut inherited = Vec::new();
@@ -179,6 +191,9 @@ fn collect_local_ids(
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
+        if is_reparented_onto_a_unique_sibling(child, source) {
+            continue;
+        }
         if matches!(child.kind(), "id_property" | "container" | "style_header") {
             collect_local_ids(child, source, out, names);
         }
@@ -194,15 +209,23 @@ fn collect_local_ids(
 /// elsewhere in the same document, so instantiating the same style twice does not duplicate work or
 /// output.
 ///
-/// Recursion stops at anything that is not a `container` or `style_header`. Every other node kind's
-/// line contains a `:` (a `state_selector`'s `$state:`, a `property`'s `key:`, an `event_property`'s
-/// `@tag:`, …), which makes `OTMLParser::parseNode` mark it **unique**
-/// (`otmlparser.cpp:435`: `node->setUnique(... || dotsPos != std::string::npos)`), and
-/// `UIManager::createWidgetFromOTML`'s child loop never instantiates a unique node's children
-/// (`uimanager.cpp:735`: `if (!childNode->isUnique()) createWidgetFromOTML(childNode, widget);`). A
-/// `style_header` or `container` written under a `$state:`/`layout:`/etc. block is therefore never
-/// created at runtime, so it cannot itself instantiate anything either — walking into it would
-/// resolve ancestry for a widget that does not exist.
+/// Recursion stops short of "every nested `container`/`style_header` in the source text" in two
+/// ways, both because the widget in question is never created at runtime and so cannot itself
+/// instantiate anything either:
+///
+/// 1. It never descends into anything that is not a `container` or `style_header`. Every other
+///    node kind's line contains a `:` (a `state_selector`'s `$state:`, a `property`'s `key:`, an
+///    `event_property`'s `@tag:`, …), which makes `OTMLParser::parseNode` mark it **unique**
+///    (`otmlparser.cpp:435`: `node->setUnique(... || dotsPos != std::string::npos)`), and
+///    `UIManager::createWidgetFromOTML`'s child loop never instantiates a unique node's children
+///    (`uimanager.cpp:735`: `if (!childNode->isUnique()) createWidgetFromOTML(childNode,
+///    widget);`). A `style_header` or `container` written under a `$state:`/`layout:`/etc. block
+///    is therefore never created at runtime.
+/// 2. A `container`/`style_header` [`is_reparented_onto_a_unique_sibling`] also never descends: it
+///    only *looks* like a genuine child because `id_property`/`anchor_property`/`list_item` cannot
+///    carry a block in the grammar (see `crate::otml_reparent`), so tree-sitter attaches an
+///    over-indented line under one of them as a plain sibling instead — but the engine parented it
+///    onto that preceding unique line, not created it.
 fn collect_instantiated_ids(
     node: Node<'_>,
     source: &str,
@@ -241,6 +264,9 @@ fn collect_instantiated_ids(
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
+        if is_reparented_onto_a_unique_sibling(child, source) {
+            continue;
+        }
         if matches!(child.kind(), "container" | "style_header") {
             collect_instantiated_ids(child, source, styles, lua, seen_types, out);
         }
@@ -419,6 +445,78 @@ mod tests {
              id: ListScrollbar\n",
         )]);
         let doc = "Instance < CharacterTitles\n";
+        assert!(visible_ids(doc, &styles).is_empty());
+    }
+
+    #[test]
+    fn a_style_header_nested_under_a_state_block_is_never_treated_as_instantiated() {
+        // Exercises `collect_instantiated_ids`'s OWN allowlist (not `collect_local_ids`'s and not
+        // `style_index::collect_body_ids`'s): `X < Base` sits inside the *asking* document's own
+        // body, over-indented under `$pressed:`. `$pressed:`'s line has a `:`, so the engine's
+        // `!childNode->isUnique()` child loop (uimanager.cpp:735) never creates `X`, and an `X` that
+        // is never created can never instantiate `Base` either -- `baseId` (declared in `Base`'s
+        // own body) must not leak into the visible set.
+        let styles = styles(&[("base.otui", "Base < UIWidget\n  id: baseId\n")]);
+        let doc = "Outer < UIWidget\n  $pressed:\n    X < Base\n";
+        assert!(
+            visible_ids(doc, &styles).is_empty(),
+            "a style_header nested under a $state block must never be instantiated"
+        );
+    }
+
+    #[test]
+    fn a_style_header_nested_under_a_plain_property_is_never_treated_as_instantiated() {
+        // Same gap, reached through a plain `key:` property (e.g. `visible: false`) instead of a
+        // `$state:` block -- the real-world shape of the character.otui:1860 corpus bug, but one
+        // level removed: here the phantom is an *inherited* id via a nested instantiation, not a
+        // locally-declared one.
+        let styles = styles(&[("base.otui", "Base < UIWidget\n  id: baseId\n")]);
+        let doc = "Outer < UIWidget\n  visible: false\n    X < Base\n";
+        assert!(
+            visible_ids(doc, &styles).is_empty(),
+            "a style_header nested under a plain property must never be instantiated"
+        );
+    }
+
+    #[test]
+    fn a_widget_over_indented_under_a_plain_id_is_never_visible() {
+        // `id:` cannot carry a block in the grammar (`id_property`, `crate::otml_reparent`), so a
+        // `Button` written deeper-indented under `id: a` is reparented onto the enclosing block by
+        // tree-sitter rather than genuinely nested under `id: a`. The engine parents it onto the
+        // preceding line too (`otmlparser.cpp:314`), and that line (`id: a`) is unique, so `Button`
+        // — and the `id: phantomUnderId` inside it — is never created (`uimanager.cpp:735`).
+        let local_doc = "Panel\n  id: a\n    Button\n      id: phantomUnderId\n";
+        assert_eq!(
+            ids_of(&visible_ids(local_doc, &StyleIndex::new())),
+            ["a"],
+            "the over-indented Button's id must not be visible"
+        );
+
+        // Same shape, but the phantom lives in the body of a style the document merely instantiates.
+        let styles = styles(&[(
+            "styles.otui",
+            "Panel < UIWidget\n  id: a\n    Button\n      id: phantomUnderId\n",
+        )]);
+        let doc = "Instance < Panel\n";
+        assert_eq!(
+            ids_of(&visible_ids(doc, &styles)),
+            ["a"],
+            "the over-indented Button's id must not be visible when inherited either"
+        );
+    }
+
+    #[test]
+    fn a_widget_over_indented_under_an_anchor_property_is_never_visible() {
+        let local_doc =
+            "Panel\n  anchors.left: parent.left\n    Button\n      id: phantomUnderAnchor\n";
+        assert!(visible_ids(local_doc, &StyleIndex::new()).is_empty());
+
+        let styles = styles(&[(
+            "styles.otui",
+            "Panel < UIWidget\n  anchors.left: parent.left\n    Button\n      \
+             id: phantomUnderAnchor\n",
+        )]);
+        let doc = "Instance < Panel\n";
         assert!(visible_ids(doc, &styles).is_empty());
     }
 

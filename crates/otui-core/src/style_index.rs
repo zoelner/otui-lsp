@@ -39,6 +39,7 @@
 //!
 //! Everything here is byte-offset based. No I/O, no `lsp-types`.
 
+use crate::otml_reparent::is_reparented_onto_a_unique_sibling;
 use crate::syntax::SyntaxTree;
 use lang_api::ByteSpan;
 use std::collections::HashMap;
@@ -64,10 +65,13 @@ pub struct StyleDef {
     /// `UISpinBox` (a Lua widget declaring `minimum` / `maximum` / `step`) wearing a `TextEdit`'s
     /// look — so the style chain alone would miss every property `UISpinBox` adds.
     pub lua_class: Option<String>,
-    /// Every `id:` declared anywhere within the style's **body**, at any depth (spec §2.3). See
-    /// [`body_ids_of`] for why this walks the whole subtree rather than just the header's direct
-    /// children, and [`crate::ids`] for the module that turns this into "ids visible from a document
-    /// that merely instantiates this style".
+    /// Every `id:` declared within the style's **body** that the engine actually creates a widget
+    /// for — at any depth the engine descends into, which is *not* the same as "at any depth in the
+    /// source text" (spec §2.3). See [`body_ids_of`] for why this walks the subtree rather than
+    /// just the header's direct children, and for the two ways a nested `id:` is deliberately
+    /// excluded (a unique ancestor line, or a line reparented onto one). [`crate::ids`] is the
+    /// module that turns this into "ids visible from a document that merely instantiates this
+    /// style".
     pub body_ids: Vec<StyleBodyId>,
     /// The span of the declared name identifier — the go-to-definition **target** for later nodes.
     pub name_span: ByteSpan,
@@ -131,7 +135,8 @@ fn build_def(node: Node<'_>, source: &str) -> StyleDef {
 }
 
 /// Every `id:` declared anywhere within `node`'s subtree that the engine actually turns into a
-/// widget — the whole `style_header`'s body, at any depth the engine descends into.
+/// widget — **not necessarily every `id:` written in the source text**: see below for the two ways
+/// this walk stops short of that.
 ///
 /// Unlike [`lua_class_of`], which reads only a leaf `__class:` property directly on `node`, an
 /// `id:` typically sits several levels deep inside the style's block: `MiniWindow < UIMiniWindow`
@@ -150,6 +155,15 @@ fn build_def(node: Node<'_>, source: &str) -> StyleDef {
 /// `styleNode->get("id")` (`uiwidget.cpp:1918`) is also a direct-child lookup
 /// (`otmlnode.cpp:53-59`), so the id this returns for a given `container`/`style_header` is always
 /// the one declared directly inside it, never one found by searching past a unique descendant.
+///
+/// A second, narrower case: `id_property`, `anchor_property` and `list_item` cannot carry an
+/// indented block **in the grammar** (see [`crate::otml_reparent`]), so a line written
+/// over-indented under one of them parses as a plain sibling in the enclosing block rather than a
+/// genuine child — even though the real engine parents it onto that preceding line
+/// (`otmlparser.cpp:314`) and, if that line is unique, never creates it either. Each child is
+/// checked against [`is_reparented_onto_a_unique_sibling`] before being walked, so that case is
+/// excluded too — see that module for why the check is based on the preceding line's raw text
+/// (does it contain a `:`) rather than another hand-picked node-kind list.
 fn body_ids_of(node: Node<'_>, source: &str) -> Vec<StyleBodyId> {
     let mut out = Vec::new();
     collect_body_ids(node, source, &mut out);
@@ -168,6 +182,9 @@ fn collect_body_ids(node: Node<'_>, source: &str, out: &mut Vec<StyleBodyId>) {
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
+        if is_reparented_onto_a_unique_sibling(child, source) {
+            continue;
+        }
         if matches!(child.kind(), "id_property" | "container" | "style_header") {
             collect_body_ids(child, source, out);
         }
@@ -419,6 +436,43 @@ mod tests {
         assert!(
             defs[0].body_ids.is_empty(),
             "an id nested under a property block must not surface as a body id: {:?}",
+            defs[0].body_ids
+        );
+    }
+
+    #[test]
+    fn a_widget_over_indented_under_a_plain_id_is_reparented_not_nested() {
+        // `id:` is one of the three block-less grammar rules (`id_property`, `anchor_property`,
+        // `list_item` — see `crate::otml_reparent`): it cannot carry an indented child in the
+        // grammar, so a `Button` written deeper-indented under `id: a` does not nest inside the
+        // `id_property` the way it would under a `property`/`state_selector` — tree-sitter instead
+        // attaches it as a plain sibling of `id: a` in the enclosing block. The engine parents it
+        // onto the *preceding line* instead (`otmlparser.cpp:314`), and `id: a`'s line is unique, so
+        // `Button` (and its own nested `id: phantomUnderId`) is never created
+        // (`uimanager.cpp:735`).
+        let src = "MainWindow < UIWindow\n  id: a\n    Button\n      id: phantomUnderId\n";
+        let defs = defs_of(src);
+        assert_eq!(defs.len(), 1);
+        let ids: Vec<&str> = defs[0].body_ids.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["a"],
+            "the over-indented Button must not contribute a body id: {:?}",
+            defs[0].body_ids
+        );
+    }
+
+    #[test]
+    fn a_widget_over_indented_under_an_anchor_property_is_reparented_not_nested() {
+        // Same gap as above, reached through `anchor_property` (the other block-less rule besides
+        // `id_property`/`list_item`) instead of `id_property`.
+        let src = "MainWindow < UIWindow\n  anchors.left: parent.left\n    Button\n      \
+                    id: phantomUnderAnchor\n";
+        let defs = defs_of(src);
+        assert_eq!(defs.len(), 1);
+        assert!(
+            defs[0].body_ids.is_empty(),
+            "the over-indented Button must not contribute a body id: {:?}",
             defs[0].body_ids
         );
     }
