@@ -37,21 +37,45 @@
 //!   text-only — disambiguate the two: every dot-chain segment after `.ui.` is recorded, tagged
 //!   [`LuaIdRefKind::DotUi`], and it is the **consumer's** job to decide whether it matches a known
 //!   id (no match ⇒ no navigation, no diagnostic — silence, not noise).
-//! * **`setId("literal")` matters too.** 20 real references in the engine resolve to a widget
-//!   created purely at runtime (`button:setId("bidButton")`), never declared in any `.otui` — Lua is
-//!   the id's only definition site. Indexing the literal form of `setId` gives navigation for free;
-//!   the 82 real `setId(<variable>)` calls are excluded by the same complete-literal rule.
+//! * **`setId("literal")` matters too.** Some references in the engine resolve to a widget created
+//!   purely at runtime (`button:setId("bidButton")`), never declared in any `.otui` — Lua is the id's
+//!   only definition site. Indexing the literal form of `setId` gives navigation for free; the 179
+//!   `setId(<non-literal>)` calls are excluded by the same complete-literal rule, since an id
+//!   assembled at run time has no source location to navigate to.
+//!
+//! ## Measured on the engine (370 readable `.lua` of 375; 5 are not valid UTF-8)
+//!
+//! | | |
+//! |---|---|
+//! | `getChildById` | 800 |
+//! | `recursiveGetChildById` | 571 |
+//! | `.ui.` chain segments | 493 |
+//! | `setId("literal")` defs | 45 |
+//! | concatenation calls indexed | 0 |
+//!
+//! These were re-derived **after** the exclusion pre-pass was fixed, and cross-checked against an
+//! independently written scanner. The earlier figures in this module were the output of a buggy
+//! pre-pass validating itself — a number a scanner reports about its own corpus proves nothing until
+//! something else counts it too.
 //!
 //! ## Heuristic parse (no Lua grammar)
 //!
 //! Exactly like [`lua_widgets`](crate::lua_widgets): there is no Lua parser in this workspace, so
-//! the scan is byte-oriented and deliberately conservative. Unlike `lua_widgets`, it *does* exclude
-//! `--` line comments, `--[[ ... ]]` block comments, and (as a side effect of the same pre-pass)
-//! string-literal bodies from the positions where a call name or a `.ui.` chain is recognized — a
-//! `getChildById('x')` written inside a comment must never be indexed. The excluded-range pre-pass
-//! does not handle escaped quotes beyond a single backslash check, and does not understand Lua's
-//! long-bracket comment/string forms (`--[==[ ]==]`) — both acceptable trade-offs for staying
-//! dependency-free, matching the rest of this module's heuristic style.
+//! the scan is byte-oriented and deliberately conservative. Unlike `lua_widgets`, it *does* need an
+//! excluded-range pre-pass — a `getChildById('x')` written inside a comment or a string must never
+//! become a clickable reference. That pre-pass ([`excluded_ranges`]) covers `--` line comments, long
+//! comments and long strings at **any** bracket level (`--[==[ … ]==]`, `[==[ … ]==]`), and
+//! short-string bodies with correct backslash-escape handling.
+//!
+//! Two of those were learned the hard way, and both are load-bearing rather than pedantic:
+//!
+//! * **Escapes must be scanned forward, not sniffed backwards.** Testing "is the byte before this
+//!   quote a backslash?" misreads a string ending in an escaped backslash — `'\\'`, as in the real
+//!   `path:gsub('\\', '/')`. The closing quote looks escaped, the scan runs to the next quote in the
+//!   file, and quote parity flips for everything below: references simply stop being found, silently.
+//! * **A short string ends at the newline.** Lua forbids a raw newline inside one, and an LSP buffer
+//!   is mid-edit most of the time — so a half-typed quote is the normal case. Bounding it to its own
+//!   line is what keeps one stray character from blanking the rest of the file.
 
 use crate::style_index::DocId;
 use lang_api::ByteSpan;
@@ -262,37 +286,90 @@ fn excluded_ranges(source: &str) -> Vec<(usize, usize)> {
                 let quote = bytes[i];
                 let start = i;
                 let mut j = i + 1;
-                while j < len {
-                    if bytes[j] == quote && bytes[j - 1] != b'\\' {
-                        j += 1;
-                        break;
+                let end = loop {
+                    let Some(&b) = bytes.get(j) else { break len };
+                    match b {
+                        // An escape consumes whatever byte follows it. Testing the *preceding* byte
+                        // instead (`bytes[j - 1] != b'\\'`) misreads a string that ends in an escaped
+                        // backslash — `'\\'`, a single literal backslash, as in the real
+                        // `path:gsub('\\', '/')`. There the closing quote is preceded by `\` and so
+                        // looks escaped; the scan then runs on to the next quote in the file,
+                        // swallowing a real opening quote and flipping quote parity for the entire
+                        // remainder of the source. Everything after it silently stops being indexed.
+                        b'\\' => j += 2,
+                        // A Lua short string cannot span a raw newline. Stopping here bounds the blast
+                        // radius of an unterminated quote — routine in a buffer that is being typed —
+                        // to a single line instead of the rest of the file.
+                        b'\n' => break j,
+                        b if b == quote => break j + 1,
+                        _ => j += 1,
                     }
-                    j += 1;
-                }
-                ranges.push((start, j));
-                i = j;
+                };
+                ranges.push((start, end));
+                i = end;
             }
-            b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
                 let start = i;
-                if source[i..].starts_with("--[[") {
-                    if let Some(rel) = source[i + 4..].find("]]") {
-                        let end = i + 4 + rel + 2;
-                        ranges.push((start, end));
-                        i = end;
-                    } else {
-                        ranges.push((start, len));
-                        i = len;
-                    }
+                // A long comment at any bracket level: `--[[ … ]]`, `--[==[ … ]==]`. Matching only
+                // the literal `--[[` would leave the body of a level-N comment to be scanned as
+                // code, handing back a clickable reference that points inside a comment.
+                if let Some(end) = long_bracket_end(source, i + 2) {
+                    ranges.push((start, end));
+                    i = end;
                 } else {
                     let end = source[i..].find('\n').map_or(len, |rel| i + rel);
                     ranges.push((start, end));
                     i = end;
                 }
             }
+            // A long-bracket *string*: `[[ … ]]`, `[=[ … ]=]`. Its body is opaque and may hold
+            // anything — the engine has 138 of these, some embedding literal OTUI source, and three
+            // with an odd number of quotes in the body, which would desync the short-string scanner
+            // above. Skipping it wholesale is what keeps both a bogus reference and that desync out.
+            b'[' => {
+                if let Some(end) = long_bracket_end(source, i) {
+                    ranges.push((i, end));
+                    i = end;
+                } else {
+                    i += 1;
+                }
+            }
             _ => i += 1,
         }
     }
     ranges
+}
+
+/// The byte offset just past the close of the Lua long bracket opening at `at` — `[`, then N `=`,
+/// then `[`, closed by `]`, N `=`, `]` — or the end of `source` when it is never closed. [`None`] when
+/// no long bracket opens at `at`.
+///
+/// One matcher serves both long comments (`--[==[ … ]==]`) and long strings (`[==[ … ]==]`); they
+/// differ only in the `--` in front.
+fn long_bracket_end(source: &str, at: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    if bytes.get(at) != Some(&b'[') {
+        return None;
+    }
+    let mut level = 0usize;
+    let mut k = at + 1;
+    while bytes.get(k) == Some(&b'=') {
+        level += 1;
+        k += 1;
+    }
+    if bytes.get(k) != Some(&b'[') {
+        return None;
+    }
+    let body = k + 1;
+    let mut close = String::with_capacity(level + 2);
+    close.push(']');
+    close.extend(std::iter::repeat('=').take(level));
+    close.push(']');
+    Some(
+        source[body..]
+            .find(&close)
+            .map_or(source.len(), |rel| body + rel + close.len()),
+    )
 }
 
 /// Whether byte offset `pos` falls inside one of the sorted, non-overlapping `ranges`.
@@ -389,6 +466,14 @@ impl LuaRefIndex {
     /// found in. Because `DotUi` refs are best-effort (spec-corpus rule), a match here is not a
     /// guarantee the id is real — it is the caller's job to cross-check against a known `id:`
     /// declaration before treating it as navigable.
+    ///
+    /// **This fans out across the whole workspace, and spec §5.4 does not.** An `id:` is
+    /// document-local (ids repeat freely across modules — `holder` is declared in both
+    /// `30-messageboxes.otui` and `game_store/style/ui.otui`), so find-references for a declaration
+    /// is scoped to the **paired** `.lua` controller (§2.3: the sibling of the same stem). A consumer
+    /// that hands this method's full result straight to the client will report cross-module
+    /// references that are not references to that declaration at all. Use [`document`](Self::document)
+    /// to scope to the paired file; `lookup` is the unscoped primitive underneath it.
     #[must_use]
     pub fn lookup(&self, id: &str) -> Vec<(&DocId, &LuaIdRef)> {
         self.iter().filter(|(_, r)| r.id == id).collect()
@@ -513,6 +598,80 @@ mod tests {
     fn set_id_with_a_variable_is_not_indexed() {
         let src = "button:setId(data.id)\n";
         assert!(scan_id_defs(src).is_empty());
+    }
+
+    #[test]
+    fn a_string_ending_in_an_escaped_backslash_does_not_swallow_the_rest_of_the_file() {
+        // The bug this pins was real and silent. `bytes[j - 1] != b'\\'` treats the closing quote of
+        // `'\\'` (one literal backslash) as escaped, so the scan runs on to the next quote in the
+        // file, flips quote parity, and every reference below simply stops being indexed.
+        //
+        // This exact line is `modules/client_assets/client_assets.lua:96` in the engine, and it cost
+        // that file all 5 of its references — including two ids that really are declared in
+        // `data/styles/30-messageboxes.otui`.
+        let src = "local p = tostring(path or ''):gsub('\\\\', '/')\nw:getChildById('realId')\n";
+        let refs = scan_id_refs(src);
+        let ids: Vec<&str> = refs.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["realId"],
+            "the file after the gsub must still be scanned"
+        );
+    }
+
+    #[test]
+    fn an_unterminated_quote_costs_only_its_own_line() {
+        // An LSP buffer is mid-edit most of the time, so a half-typed string is the normal case, not
+        // the exotic one. A Lua short string cannot span a raw newline, so the scan stops at the
+        // newline — which is what keeps a single stray quote from blanking every reference below it.
+        let src = "local broken = 'oops\nw:getChildById('survivor')\n";
+        let ids: Vec<String> = scan_id_refs(src).into_iter().map(|r| r.id).collect();
+        assert!(
+            ids.contains(&"survivor".to_owned()),
+            "a stray quote must not blank the rest of the file: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn a_level_n_long_comment_body_is_not_indexed() {
+        // `--[[ … ]]` was handled, but `--[==[ … ]==]` was not: it fell through to the line-comment
+        // branch, which excludes only the first line, leaving the body to be scanned as code. The
+        // result is the worst kind of wrong — a clickable Location pointing inside a comment.
+        let src = "--[==[\nw:getChildById('ghost')\ncontroller.ui.phantom:hide()\n]==]\nw:getChildById('realId')\n";
+        let ids: Vec<String> = scan_id_refs(src).into_iter().map(|r| r.id).collect();
+        assert_eq!(
+            ids,
+            ["realId"],
+            "a level-N long comment must be opaque: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_bracket_string_body_is_not_indexed() {
+        // The engine has 138 long-bracket strings, some embedding literal OTUI source. Scanning
+        // their bodies invents references that live inside a string — and three of them carry an odd
+        // number of quotes, which also desyncs the short-string scanner for everything after.
+        let src = "local code = [[ w:getChildById('inString') ]]\nw:getChildById('realId')\n";
+        let ids: Vec<String> = scan_id_refs(src).into_iter().map(|r| r.id).collect();
+        assert_eq!(
+            ids,
+            ["realId"],
+            "a long-bracket string must be opaque: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn a_span_is_a_byte_offset_and_survives_multibyte_text() {
+        // The span becomes an LSP Location. A byte/char mix-up here puts the user's cursor on the
+        // quote instead of the name — and only shows up when a non-ASCII character precedes the call.
+        let src = "local t = 'ação'\nw:getChildById('mbId')\n";
+        let r = scan_id_refs(src);
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert_eq!(
+            &src[r[0].span.start..r[0].span.end],
+            "mbId",
+            "the span must slice to exactly the id token"
+        );
     }
 
     #[test]
