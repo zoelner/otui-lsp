@@ -373,6 +373,19 @@ impl OtuiService {
     pub fn document_links(&self, source: &str) -> Vec<links::PathRef> {
         links::document_links(source)
     }
+
+    /// Point-locate the file-path-valued property value under `offset` (hover's sprite-preview
+    /// case): `None` unless the cursor sits inside the trimmed path text of a `property` whose key
+    /// is in [`schema::PATH_PROPERTIES`]. Complements [`document_links`](Self::document_links)'s
+    /// bulk sweep with a single-cursor query.
+    ///
+    /// Inherent (not on the [`LanguageService`] trait) so the protocol-agnostic trait stays minimal,
+    /// mirroring [`document_links`](Self::document_links). Kept **pure** — resolving the path against
+    /// the filesystem is the server's job.
+    #[must_use]
+    pub fn asset_ref_at(&self, source: &str, offset: usize) -> Option<links::PathRef> {
+        links::asset_ref_at(source, offset)
+    }
 }
 
 impl LanguageService for OtuiService {

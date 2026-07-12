@@ -11,4 +11,8 @@ publish = false
 
 [dependencies]
 otui-core = { path = "../crates/otui-core" }
+# One source of truth for asset-path resolution: `resolve_asset_candidates` lives in the server
+# crate (it is the same walk `document_link`/hover/`missing-asset` use), so the corpus harness
+# reuses it rather than growing a second copy of the resolution rules.
+otui-lsp-server = { path = "../crates/otui-lsp-server" }
 regex = "1"

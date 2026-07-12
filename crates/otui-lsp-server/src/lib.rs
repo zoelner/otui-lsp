@@ -39,25 +39,25 @@ use lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
     CodeActionProviderCapability, CodeActionResponse, ColorInformation, ColorPresentation,
     ColorPresentationParams, ColorProviderCapability, CompletionOptions, CompletionParams,
-    CompletionResponse, Diagnostic as LspDiagnostic, DidChangeTextDocumentParams,
-    DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentColorParams,
-    DocumentFormattingParams, DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
-    DocumentLink, DocumentLinkOptions, DocumentLinkParams, DocumentOnTypeFormattingOptions,
-    DocumentOnTypeFormattingParams, DocumentRangeFormattingParams, DocumentSymbolParams,
-    DocumentSymbolResponse, FileChangeType, FileSystemWatcher, FoldingRange, FoldingRangeParams,
-    FoldingRangeProviderCapability, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse,
-    Hover, HoverContents, HoverParams, HoverProviderCapability, ImplementationProviderCapability,
-    InitializeParams, InitializeResult, Location, LogMessageParams, MarkupContent, MarkupKind,
-    MessageType, NumberOrString, OneOf, PositionEncodingKind, PrepareRenameResponse,
-    PublishDiagnosticsParams, ReferenceParams, Registration, RegistrationParams, RenameOptions,
-    RenameParams, SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions,
-    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, ServerInfo, SymbolInformation, SymbolKind, TextDocumentPositionParams,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, TypeDefinitionProviderCapability,
-    TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
-    TypeHierarchySupertypesParams, Uri, WorkDoneProgressOptions, WorkspaceEdit,
-    WorkspaceSymbolParams,
+    CompletionResponse, Diagnostic as LspDiagnostic, DiagnosticSeverity,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DocumentColorParams, DocumentFormattingParams, DocumentHighlight,
+    DocumentHighlightKind, DocumentHighlightParams, DocumentLink, DocumentLinkOptions,
+    DocumentLinkParams, DocumentOnTypeFormattingOptions, DocumentOnTypeFormattingParams,
+    DocumentRangeFormattingParams, DocumentSymbolParams, DocumentSymbolResponse, FileChangeType,
+    FileSystemWatcher, FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability,
+    GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
+    Location, LogMessageParams, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf,
+    PositionEncodingKind, PrepareRenameResponse, PublishDiagnosticsParams, ReferenceParams,
+    Registration, RegistrationParams, RenameOptions, RenameParams, SemanticTokens,
+    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SymbolInformation,
+    SymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextEdit, TypeDefinitionProviderCapability, TypeHierarchyItem, TypeHierarchyPrepareParams,
+    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri, WorkDoneProgressOptions,
+    WorkspaceEdit, WorkspaceSymbolParams,
 };
 use otui_core::fixes::Fix;
 use otui_core::hover::{Inheritance, StyleHover, StyleHoverKind};
@@ -218,10 +218,14 @@ pub struct Backend {
     /// buffer wins (it may have unsaved edits); see [`merge_documents`]. [`Arc`] so the background
     /// scan can populate it from a spawned task.
     disk_texts: Arc<RwLock<HashMap<Uri, String>>>,
-    /// The workspace root URLs captured during `initialize` (`workspace_folders`, else `root_uri`),
-    /// consumed once by the background scan in `run_initialized`. Empty when the client opened no
-    /// folder — the server then falls back to open-docs-only indexing. Guarded by a [`Mutex`]
-    /// because it is written once and read once.
+    /// The workspace root URLs captured during `initialize` (`workspace_folders`, else `root_uri`).
+    /// Written once, then read by the background scan in `run_initialized` and by every handler that
+    /// resolves a `/`-rooted asset path against the data root (`document_link`, `hover`'s asset
+    /// preview, the missing-asset diagnostic — see [`Backend::workspace_root_paths`]). Empty when the
+    /// client opened no folder — the server then falls back to open-docs-only indexing (and asset
+    /// resolution / the missing-asset diagnostic conservatively produce nothing). Guarded by a
+    /// [`Mutex`] because it is written once and read many times, never mutated concurrently with a
+    /// read.
     roots: Mutex<Vec<Uri>>,
     /// Serializes the "check whether a URI is open, then write its index entry" critical section so
     /// an open buffer's index always wins over stale disk text. The background scan
@@ -285,6 +289,18 @@ impl Backend {
             .expect("hierarchical_symbols mutex poisoned")
     }
 
+    /// The current workspace roots as filesystem paths — the heuristic "data root" candidates for a
+    /// `/`-rooted OTUI asset path (see [`resolve_asset_candidates`]). Shared by every asset-path
+    /// resolution seam: `document_link`, the hover sprite preview, and the missing-asset diagnostic.
+    fn workspace_root_paths(&self) -> Vec<PathBuf> {
+        self.roots
+            .lock()
+            .expect("roots mutex poisoned")
+            .iter()
+            .filter_map(uri_to_file_path)
+            .collect()
+    }
+
     fn snippet_support(&self) -> bool {
         *self
             .snippet_support
@@ -344,6 +360,10 @@ impl Backend {
         let encoding = self.encoding();
         let styles = self.style_index.read().expect("style_index lock poisoned");
         let lua = self.lua_index.read().expect("lua_index lock poisoned");
+        // Same asset resolution as `document_link` (§ missing-asset diagnostic): the current
+        // document's directory (for relative paths) and the workspace roots (for `/`-rooted ones).
+        let doc_dir = uri_to_file_path(&uri).and_then(|p| p.parent().map(Path::to_path_buf));
+        let workspace_roots = self.workspace_root_paths();
         compute_and_send_diagnostics(
             &self.sender,
             &self.service,
@@ -354,6 +374,8 @@ impl Backend {
             uri,
             text,
             version,
+            doc_dir.as_deref(),
+            &workspace_roots,
         );
     }
 
@@ -545,9 +567,18 @@ fn compute_and_send_diagnostics(
     uri: Uri,
     text: &str,
     version: i32,
+    doc_dir: Option<&Path>,
+    workspace_roots: &[PathBuf],
 ) {
     let core_diags = service.diagnostics_with_widgets(text, styles, lua);
-    let lsp_diags = convert::all_to_lsp(text, &core_diags, encoding);
+    let mut lsp_diags = convert::all_to_lsp(text, &core_diags, encoding);
+    lsp_diags.extend(missing_asset_diagnostics(
+        service,
+        text,
+        doc_dir,
+        workspace_roots,
+        encoding,
+    ));
     let latest = documents
         .read()
         .expect("documents lock poisoned")
@@ -639,24 +670,51 @@ fn uri_from_file_path(path: &Path) -> Option<Uri> {
     Uri::from_str(url::Url::from_file_path(path).ok()?.as_str()).ok()
 }
 
+/// The top-level directories OTClient overlays onto one virtual root filesystem at startup, in the
+/// engine's search order (first match wins). Verified against `init.lua`:
+/// ```lua
+/// g_resources.addSearchPath(g_resources.getWorkDir() .. 'data', true)     -- mounted, then...
+/// g_resources.addSearchPath(g_resources.getWorkDir() .. 'modules', true)  -- ...pushed in front...
+/// g_resources.addSearchPath(g_resources.getWorkDir() .. 'mods', true)     -- ...of this.
+/// ```
+/// `ResourceManager::addSearchPath(path, pushFront)` (`resourcemanager.cpp`) does
+/// `pushFront ? m_searchPaths.push_front(...) : push_back(...)` — so each successive call *in front*
+/// of the previous, making the actual lookup order (first match wins) `mods`, then `modules`, then
+/// `data`. A `/`-rooted OTUI asset path (`UIWidget::parseImageStyle` → `g_textures.getTexture` →
+/// `TextureManager::getTexture` → `g_resources.resolvePath`, all in the engine source) is resolved
+/// against this overlay, **not** against a single flat "data root" — so `/game_x/images/y` can
+/// legitimately resolve inside `modules/game_x/images/y.png`, a module's own asset folder, with no
+/// `data/` involved at all.
+const ASSET_MOUNT_DIRS: [&str; 3] = ["mods", "modules", "data"];
+
 /// Compute the candidate filesystem paths a raw OTUI asset path could resolve to, **without**
 /// touching the filesystem (no existence check — that stays in the handler).
 ///
-/// This mirrors OTClient's path model heuristically: the real data root is configurable, so the best
-/// the server can do offline is treat the workspace root(s) as the data root.
+/// This mirrors OTClient's path model: the real virtual filesystem is an overlay of `mods/`,
+/// `modules/` and `data/` (see [`ASSET_MOUNT_DIRS`]) mounted under one workspace root — the true
+/// data root is configurable at runtime, so this is the closest offline approximation.
 ///
-/// * A **`/`-rooted** path is an OTClient "absolute" path — relative to the *data root*, not the OS
-///   root. The leading `/` is stripped and the remainder joined onto each workspace root candidate
-///   (there may be several workspace folders, or none — in which case a `/`-rooted path yields no
-///   candidates offline).
-/// * Any **other** (relative) path is resolved against the current document's directory.
+/// * A **`/`-rooted** path is an OTClient "absolute" path — relative to the mounted virtual root,
+///   not the OS root or any single "data" directory. The leading `/` is stripped and the remainder
+///   is joined directly onto each workspace root (covering a workspace folder that already points
+///   *at* one of the mounted directories, e.g. a multi-root workspace with a folder literally named
+///   `data`), **and** onto each of `workspace_root/mods`, `workspace_root/modules`,
+///   `workspace_root/data` — the engine's actual overlay, for the common case of a single workspace
+///   root opened at the repository root. With no workspace roots at all a `/`-rooted path yields no
+///   candidates offline.
+/// * Any **other** (relative) path is resolved against the current document's directory (approximating
+///   the engine's "resolve relative to the currently executing script" rule).
 /// * **Extensionless** paths get a `.png` variant probed first: OTClient's texture loader appends
 ///   `.png` to a source with no extension, and OTUI authors almost always omit it
 ///   (`image-source: /images/ui/button` → `button.png` on disk). Without this the link would never
 ///   resolve for the overwhelmingly common extensionless form. See [`asset_probe_variants`].
 ///
 /// Returns the candidates in probe order; the caller keeps the first that exists.
-fn resolve_asset_candidates(
+///
+/// `pub` so `xtask corpus` can drive the exact same resolution when counting `missing-asset` over
+/// a real engine tree — one source of truth for path resolution, not a second copy in `xtask`.
+#[must_use]
+pub fn resolve_asset_candidates(
     raw: &str,
     doc_dir: &Path,
     workspace_roots: &[PathBuf],
@@ -666,13 +724,124 @@ fn resolve_asset_candidates(
         return Vec::new();
     }
     let bases: Vec<PathBuf> = if let Some(rest) = path.strip_prefix('/') {
-        // OTClient "absolute" = relative to the data root; approximate the data root as each
-        // workspace root. Strip the leading `/` so `join` does not discard the root.
-        workspace_roots.iter().map(|root| root.join(rest)).collect()
+        // OTClient "absolute" = relative to the mounted virtual root; approximate the mount as each
+        // workspace root directly, plus each of its conventional `mods`/`modules`/`data`
+        // subdirectories (the engine's real overlay — see `ASSET_MOUNT_DIRS`). Strip the leading `/`
+        // so `join` does not discard the root.
+        workspace_roots
+            .iter()
+            .flat_map(|root| {
+                std::iter::once(root.join(rest)).chain(
+                    ASSET_MOUNT_DIRS
+                        .iter()
+                        .map(|mount| root.join(mount).join(rest)),
+                )
+            })
+            .collect()
     } else {
         vec![doc_dir.join(path)]
     };
     bases.into_iter().flat_map(asset_probe_variants).collect()
+}
+
+/// A path value containing `$` is an OTML runtime-resolved variable (`otmlparser.cpp` substitutes
+/// `$name` from an alias/Lua-field map when the *document* is parsed at runtime), not a literal
+/// filesystem path — the server has no way to know what it resolves to, so it must never be
+/// diagnosed as missing.
+///
+/// `pub` so `xtask corpus` counts `missing-asset` under the exact same guard, not a re-guessed one.
+#[must_use]
+pub fn is_runtime_variable_path(path: &str) -> bool {
+    path.contains('$')
+}
+
+/// A path property value that is not actually a path at all: an explicit "no image" sentinel, not
+/// a broken reference. Verified against `UIWidget::parseImageStyle` (`uiwidgetimage.cpp`):
+/// ```cpp
+/// if (value == "" || value == "none") { setImageSource("", base64); } // else resolve_path(value, ...)
+/// ```
+/// — `image-source: none` and `image-source: ""` are the documented ways to clear an inherited
+/// image, found in the real corpus (`game_cyclopedia/tab/house/house.otui`,
+/// `client_options/styles/controls/keybinds.otui`). The engine's OTML parser normalizes a scalar
+/// value by trimming, then stripping one layer of matching `"…"`/`'…'` quotes, before this
+/// comparison runs (`otmlparser.cpp`'s `normalizeValue`/`stripQuotes`) — this mirrors that so the
+/// literal token text `""` (quotes included, as captured by [`links::PathRef`]) is recognized too.
+///
+/// Deliberately applied to **every** `otui_core::schema::PATH_PROPERTIES` key, not just `image-source` (the
+/// only one actually special-cased in the engine source above): `icon`/`icon-source` have no
+/// matching short-circuit in `uiwidgetbasestyle.cpp` (they call `resolve_path` unconditionally), so
+/// treating their `""`/`none` the same way is a deliberately conservative generalization, not a
+/// verified engine behavior — false-negative (a genuinely broken `icon: none` typo goes unflagged)
+/// is the safe side to err on for a diagnostic (see the module doc's false-positive-is-the-failure-
+/// mode framing), not false-positive (flagging an intentional "no icon").
+///
+/// `pub` for the same reason as [`is_runtime_variable_path`]: `xtask corpus` reuses this guard.
+#[must_use]
+pub fn is_asset_sentinel_value(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    let unquoted = strip_matching_quotes(trimmed);
+    unquoted.is_empty() || unquoted == "none"
+}
+
+/// Strip one layer of matching `"…"` or `'…'` quotes from `s`, mirroring `otmlparser.cpp`'s
+/// `stripQuotes` (the real OTML scalar-value normalization). `s` unchanged if it is not quoted.
+fn strip_matching_quotes(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 {
+        let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &s[1..s.len() - 1];
+        }
+    }
+    s
+}
+
+/// Compute the `missing-asset` diagnostics for `text`: a **warning** (never an error — spec §2.10,
+/// the LSP is never stricter than the engine) on every path-valued property whose target does not
+/// resolve to a file on disk, via the exact same walk `document_link` uses
+/// ([`OtuiService::document_links`] + [`resolve_asset_candidates`] + the `is_file()` probe).
+///
+/// Guards that keep this from being a false-positive machine (the whole risk of the rule):
+/// * a path containing `$` is a runtime-resolved OTML variable ([`is_runtime_variable_path`]) —
+///   never diagnosed, since the server cannot know what it resolves to;
+/// * an explicit "no image" sentinel value ([`is_asset_sentinel_value`]: `""` / `none`, after
+///   OTML's quote-stripping) is not a broken reference — never diagnosed;
+/// * with **no** `doc_dir` (a non-`file:` document) or **no** workspace roots at all, nothing is
+///   resolvable, so nothing is diagnosed — nothing is claimed to be "missing" when the server has
+///   no data root to check against.
+fn missing_asset_diagnostics(
+    service: &OtuiService,
+    text: &str,
+    doc_dir: Option<&Path>,
+    workspace_roots: &[PathBuf],
+    encoding: PositionEncoding,
+) -> Vec<LspDiagnostic> {
+    let (Some(doc_dir), false) = (doc_dir, workspace_roots.is_empty()) else {
+        return Vec::new();
+    };
+    let index = LineIndex::new(text);
+    service
+        .document_links(text)
+        .into_iter()
+        .filter(|link| !is_runtime_variable_path(&link.path))
+        .filter(|link| !is_asset_sentinel_value(&link.path))
+        .filter(|link| {
+            !resolve_asset_candidates(&link.path, doc_dir, workspace_roots)
+                .into_iter()
+                .any(|candidate| candidate.is_file())
+        })
+        .map(|link| LspDiagnostic {
+            range: index.range(link.span.start, link.span.end, encoding),
+            severity: Some(DiagnosticSeverity::WARNING),
+            code: Some(NumberOrString::String("missing-asset".to_owned())),
+            code_description: None,
+            source: Some(convert::DIAGNOSTIC_SOURCE.to_owned()),
+            message: format!("Asset not found on disk: {}", link.path),
+            related_information: None,
+            tags: None,
+            data: None,
+        })
+        .collect()
 }
 
 /// Expand one resolved base path into the on-disk variants to probe, mirroring OTClient's texture
@@ -1435,6 +1604,41 @@ fn render_property_hover(
     }
 }
 
+/// Format a [`PathRef`] (an asset path *value* under the cursor) into an LSP Markdown [`Hover`] —
+/// the sprite-preview hover. `resolved` is the on-disk target file, already found by the caller via
+/// [`resolve_asset_candidates`] (the same resolution `document_link` and the missing-asset
+/// diagnostic use); `None` when it could not be resolved, in which case only the path text is
+/// shown — no image, no "not found" note (that claim belongs to the missing-asset diagnostic, which
+/// unlike this hover only fires with a workspace root to back it).
+///
+/// **Client-dependent rendering, by design**: this embeds the resolved file as Markdown image
+/// syntax (`![](file:///…)`). Whether the connected editor actually renders that inline (as opposed
+/// to a plain link, or nothing) is entirely up to the client's Markdown renderer — this crate has no
+/// way to verify it, and no test here proves an image appears on screen. The `![]( … )` line is
+/// isolated to the branch below so swapping it for a plain clickable link
+/// (`[Open asset](file:///…)`) — the safe fallback if a target client does not render inline images
+/// from hover Markdown — is a one-line change.
+fn render_asset_hover(
+    path_ref: &PathRef,
+    resolved: Option<&Path>,
+    line_index: &LineIndex,
+    encoding: PositionEncoding,
+) -> Hover {
+    let mut value = format!("**Asset** `{}`", path_ref.path);
+    if let Some(target_uri) = resolved.and_then(uri_from_file_path) {
+        // Sprite preview: an inline image if the client's Markdown renderer supports it (see the
+        // doc comment above — unverified here, client-dependent).
+        value.push_str(&format!("\n\n![]({})", target_uri.as_str()));
+    }
+    Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value,
+        }),
+        range: Some(line_index.range(path_ref.span.start, path_ref.span.end, encoding)),
+    }
+}
+
 /// Append an "Inherits from `Base`" line (marking a native base as `(built-in)`) when `inherits` is
 /// present; a no-op otherwise.
 fn append_inherits(value: &mut String, inherits: Option<&Inheritance>) {
@@ -2061,10 +2265,25 @@ impl Backend {
                 if !open.is_empty() {
                     let styles = style_index.read().expect("style_index lock poisoned");
                     let lua = lua_index.read().expect("lua_index lock poisoned");
+                    // Same asset resolution as `Backend::publish`: the workspace roots computed once
+                    // for the whole refresh batch, each document's own directory computed per-URI.
+                    let workspace_roots: Vec<PathBuf> =
+                        roots.iter().filter_map(uri_to_file_path).collect();
                     for (uri, text, version) in open {
+                        let doc_dir =
+                            uri_to_file_path(&uri).and_then(|p| p.parent().map(Path::to_path_buf));
                         compute_and_send_diagnostics(
-                            &sender, &service, &styles, &lua, &documents, encoding, uri, &text,
+                            &sender,
+                            &service,
+                            &styles,
+                            &lua,
+                            &documents,
+                            encoding,
+                            uri,
+                            &text,
                             version,
+                            doc_dir.as_deref(),
+                            &workspace_roots,
                         );
                     }
                 }
@@ -2219,14 +2438,7 @@ impl Backend {
         // Only `file://` documents have a directory to resolve relative paths against.
         let doc_path = uri_to_file_path(&uri)?;
         let doc_dir = doc_path.parent()?.to_path_buf();
-        // The workspace roots as filesystem paths (the heuristic "data root" for `/`-rooted paths).
-        let workspace_roots: Vec<PathBuf> = self
-            .roots
-            .lock()
-            .expect("roots mutex poisoned")
-            .iter()
-            .filter_map(uri_to_file_path)
-            .collect();
+        let workspace_roots = self.workspace_root_paths();
 
         let encoding = self.encoding();
         let index = LineIndex::new(&text);
@@ -2564,8 +2776,26 @@ impl Backend {
         drop(index);
         // Not a style token — fall back to a property-key hover (value type from the catalog/schema
         // metadata; no workspace index needed).
-        let pdesc = self.service.property_hover_at(&text, offset)?;
-        Some(render_property_hover(&pdesc, &line_index, encoding))
+        if let Some(pdesc) = self.service.property_hover_at(&text, offset) {
+            return Some(render_property_hover(&pdesc, &line_index, encoding));
+        }
+        // Not a property key either — is the cursor on an asset path *value* (a sprite-preview
+        // hover)? Same resolution as `document_link`/the missing-asset diagnostic; unlike the
+        // diagnostic this is not a claim of absence, so it degrades silently (no image, no note) when
+        // the path cannot be resolved rather than requiring a workspace root up front.
+        let path_ref = self.service.asset_ref_at(&text, offset)?;
+        let doc_dir = uri_to_file_path(&uri).and_then(|p| p.parent().map(Path::to_path_buf));
+        let resolved = doc_dir.and_then(|doc_dir| {
+            resolve_asset_candidates(&path_ref.path, &doc_dir, &self.workspace_root_paths())
+                .into_iter()
+                .find(|candidate| candidate.is_file())
+        });
+        Some(render_asset_hover(
+            &path_ref,
+            resolved.as_deref(),
+            &line_index,
+            encoding,
+        ))
     }
 
     fn completion(&self, params: CompletionParams) -> Option<CompletionResponse> {
@@ -5309,8 +5539,9 @@ end
 
     #[test]
     fn resolve_asset_candidates_maps_rooted_path_against_workspace_roots() {
-        // A `/`-rooted OTClient "absolute" path is joined onto each workspace root with the leading
-        // `/` stripped — never against the doc dir.
+        // A `/`-rooted OTClient "absolute" path is joined directly onto each workspace root with the
+        // leading `/` stripped (never against the doc dir), **and** onto each root's `mods`/
+        // `modules`/`data` subdirectory, in the engine's real overlay order — see `ASSET_MOUNT_DIRS`.
         let doc_dir = Path::new("/project/modules/game_things");
         let roots = vec![PathBuf::from("/data-a"), PathBuf::from("/data-b")];
         let candidates = resolve_asset_candidates("/images/ui/window.png", doc_dir, &roots);
@@ -5318,9 +5549,48 @@ end
             candidates,
             vec![
                 PathBuf::from("/data-a/images/ui/window.png"),
+                PathBuf::from("/data-a/mods/images/ui/window.png"),
+                PathBuf::from("/data-a/modules/images/ui/window.png"),
+                PathBuf::from("/data-a/data/images/ui/window.png"),
                 PathBuf::from("/data-b/images/ui/window.png"),
+                PathBuf::from("/data-b/mods/images/ui/window.png"),
+                PathBuf::from("/data-b/modules/images/ui/window.png"),
+                PathBuf::from("/data-b/data/images/ui/window.png"),
             ]
         );
+    }
+
+    #[test]
+    fn resolve_asset_candidates_finds_a_module_local_asset_under_the_modules_overlay() {
+        // The fidelity finding this test locks in: a `/`-rooted path with no `data/` involved at all
+        // is a real, common shape in the OTClient corpus (e.g. `/game_rewardwall/images/...`
+        // resolves inside `modules/game_rewardwall/images/...`, the module's own asset folder) — see
+        // `ASSET_MOUNT_DIRS`'s doc comment for the `init.lua`/`resourcemanager.cpp` trace. Treating
+        // the workspace root as the single flat data root (the pre-fix behavior) would call this
+        // missing.
+        let base = std::env::temp_dir().join(format!(
+            "otui-asset-overlay-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let module_dir = base.join("modules").join("game_rewardwall").join("images");
+        std::fs::create_dir_all(&module_dir).expect("mkdir");
+        std::fs::write(module_dir.join("rewardButton.png"), b"png").expect("write asset");
+
+        let candidates = resolve_asset_candidates(
+            "/game_rewardwall/images/rewardButton",
+            Path::new("/irrelevant/doc/dir"),
+            std::slice::from_ref(&base),
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c == &module_dir.join("rewardButton.png")),
+            "candidates should include the modules-overlay path: {candidates:?}"
+        );
+        assert!(candidates.iter().any(|c| c.is_file()));
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
@@ -5345,7 +5615,8 @@ end
     #[test]
     fn resolve_asset_candidates_appends_png_to_an_extensionless_path() {
         // OTUI authors omit the extension; the engine appends `.png`. The `.png` variant is probed
-        // first, then the literal as a fallback.
+        // first, then the literal as a fallback — for every base the rooted path expands to (the
+        // direct join, then each `mods`/`modules`/`data` overlay candidate).
         let roots = vec![PathBuf::from("/data")];
         let candidates =
             resolve_asset_candidates("/images/ui/button", Path::new("/project"), &roots);
@@ -5354,6 +5625,12 @@ end
             vec![
                 PathBuf::from("/data/images/ui/button.png"),
                 PathBuf::from("/data/images/ui/button"),
+                PathBuf::from("/data/mods/images/ui/button.png"),
+                PathBuf::from("/data/mods/images/ui/button"),
+                PathBuf::from("/data/modules/images/ui/button.png"),
+                PathBuf::from("/data/modules/images/ui/button"),
+                PathBuf::from("/data/data/images/ui/button.png"),
+                PathBuf::from("/data/data/images/ui/button"),
             ]
         );
     }
