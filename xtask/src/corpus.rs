@@ -124,7 +124,8 @@ fn missing_asset_findings(otui: &[PathBuf], root: &Path) -> (usize, Vec<(PathBuf
             continue;
         };
         for link in document_links(&src) {
-            if is_runtime_variable_path(&link.path) || is_asset_sentinel_value(&link.path) {
+            if is_runtime_variable_path(&link.path) || is_asset_sentinel_value(link.key, &link.path)
+            {
                 continue;
             }
             let resolved = resolve_asset_candidates(&link.path, doc_dir, &client_roots)

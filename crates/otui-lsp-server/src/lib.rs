@@ -861,8 +861,11 @@ fn otpkg_present_under_cached(cache: &RwLock<HashMap<PathBuf, bool>>, root: &Pat
 /// Guards that keep this from being a false-positive machine (the whole risk of the rule):
 /// * a path containing `$` is a runtime-resolved OTML variable ([`is_runtime_variable_path`]) —
 ///   never diagnosed, since the server cannot know what it resolves to;
-/// * an explicit "no image" sentinel value ([`is_asset_sentinel_value`]: `""` / `none` / an inline
-///   `base64:` image, after OTML's quote-stripping) is not a broken reference — never diagnosed;
+/// * an explicit "no image" sentinel value on `image-source` specifically ([`is_asset_sentinel_value`]:
+///   `""` / `none` / an inline `base64:` image, after the engine's double-quote stripping) is not a
+///   broken reference — never diagnosed. `icon`/`icon-source` have no such engine-verified
+///   short-circuit and are never treated as sentinels, however they are spelled — see
+///   [`is_asset_sentinel_value`]'s doc comment;
 /// * with **no** `doc_dir` (a non-`file:` document) — nothing is resolvable, so nothing is
 ///   diagnosed;
 /// * with **no detected OTClient install root** ([`detect_client_roots`]) — a `/`-rooted path has no
@@ -892,7 +895,7 @@ fn missing_asset_diagnostics(
     let missing: Vec<PathRef> = asset_links
         .into_iter()
         .filter(|link| !is_runtime_variable_path(&link.path))
-        .filter(|link| !is_asset_sentinel_value(&link.path))
+        .filter(|link| !is_asset_sentinel_value(link.key, &link.path))
         .filter(|link| {
             !resolve_asset_candidates(&link.path, doc_dir, &client_roots)
                 .into_iter()
@@ -2552,7 +2555,7 @@ impl Backend {
         let encoding = self.encoding();
         let index = LineIndex::new(&text);
         let mut links = Vec::new();
-        for PathRef { span, path } in self.service.document_links(&text) {
+        for PathRef { span, path, .. } in self.service.document_links(&text) {
             // Pure resolution → candidate filesystem paths; the `.is_file()` I/O is the only fs work,
             // kept thin here (a handful of links per document). `is_file()` (not `exists()`) so a path
             // resolving to a directory is not linked — a directory target isn't openable and would be
