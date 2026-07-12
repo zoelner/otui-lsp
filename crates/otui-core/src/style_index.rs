@@ -55,12 +55,31 @@ pub struct StyleDef {
     /// `UISpinBox` (a Lua widget declaring `minimum` / `maximum` / `step`) wearing a `TextEdit`'s
     /// look — so the style chain alone would miss every property `UISpinBox` adds.
     pub lua_class: Option<String>,
+    /// Every `id:` declared anywhere within the style's **body**, at any depth (spec §2.3). See
+    /// [`body_ids_of`] for why this walks the whole subtree rather than just the header's direct
+    /// children, and [`crate::ids`] for the module that turns this into "ids visible from a document
+    /// that merely instantiates this style".
+    pub body_ids: Vec<StyleBodyId>,
     /// The span of the declared name identifier — the go-to-definition **target** for later nodes.
     pub name_span: ByteSpan,
     /// The span of the whole `style_header` node. For a bare declaration this is just the
     /// `Name < Base` line; when the style carries an indented body, the node — and so this span —
     /// extends over that block too (mirroring the document-symbol span semantics).
     pub header_span: ByteSpan,
+}
+
+/// A single `id:` declared somewhere in a [`StyleDef`]'s body — the ids a document inherits merely
+/// by instantiating that style (spec §2.3), the substrate for resolving a Lua `getChildById`
+/// reference into an inherited style file rather than the document's own tree (see [`crate::ids`]).
+///
+/// `span` is a byte span into the **declaring** document (the one the [`StyleDef`] itself came
+/// from) — a caller can turn it directly into a go-to-definition `Location` in that file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StyleBodyId {
+    /// The declared id text.
+    pub id: String,
+    /// The byte span of the `id:` value token, in the declaring document.
+    pub span: ByteSpan,
 }
 
 /// Extract every top-level style definition declared in `tree`.
@@ -96,8 +115,39 @@ fn build_def(node: Node<'_>, source: &str) -> StyleDef {
         name,
         base,
         lua_class: lua_class_of(node, source),
+        body_ids: body_ids_of(node, source),
         name_span,
         header_span: SyntaxTree::span_of(node),
+    }
+}
+
+/// Every `id:` declared anywhere within `node`'s subtree — the whole `style_header`'s body, at any
+/// depth.
+///
+/// Unlike [`lua_class_of`], which reads only a leaf `__class:` property directly on `node`, an
+/// `id:` typically sits several levels deep inside the style's block: `MiniWindow < UIMiniWindow`
+/// declares `id: contentsPanel` on a nested `MiniWindowContents` child, not on the header itself.
+/// So this walks every descendant, not just `node`'s direct children — including into nested
+/// `Name < Base` instances the body declares (those are widget instances, not styles, but their ids
+/// still belong to whoever instantiates this style).
+fn body_ids_of(node: Node<'_>, source: &str) -> Vec<StyleBodyId> {
+    let mut out = Vec::new();
+    collect_body_ids(node, source, &mut out);
+    out
+}
+
+fn collect_body_ids(node: Node<'_>, source: &str, out: &mut Vec<StyleBodyId>) {
+    if node.kind() == "id_property" {
+        if let Some(value) = node.child_by_field_name("value") {
+            out.push(StyleBodyId {
+                id: slice(source, value).to_owned(),
+                span: SyntaxTree::span_of(value),
+            });
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_body_ids(child, source, out);
     }
 }
 
@@ -286,6 +336,34 @@ mod tests {
         let header = &src[def.header_span.start..def.header_span.end];
         assert!(header.starts_with("MainWindow < UIWindow"));
         assert!(header.contains("id: main"));
+    }
+
+    #[test]
+    fn body_ids_include_a_direct_id_property_on_the_header() {
+        let src = "MainWindow < UIWindow\n  id: main\n";
+        let defs = defs_of(src);
+        assert_eq!(defs[0].body_ids.len(), 1);
+        let body_id = &defs[0].body_ids[0];
+        assert_eq!(body_id.id, "main");
+        assert_eq!(&src[body_id.span.start..body_id.span.end], "main");
+    }
+
+    #[test]
+    fn body_ids_are_found_at_any_depth_inside_nested_widgets() {
+        // The real shape: MiniWindow's own `id:` values sit on nested child widgets, not on the
+        // style header itself.
+        let src = "MiniWindow < UIMiniWindow\n  MiniWindowContents\n    id: contentsPanel\n  \
+                    Button\n    id: closeButton\n";
+        let defs = defs_of(src);
+        assert_eq!(defs.len(), 1);
+        let ids: Vec<&str> = defs[0].body_ids.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(ids, ["contentsPanel", "closeButton"]);
+    }
+
+    #[test]
+    fn body_ids_are_empty_for_a_bare_declaration_with_no_block() {
+        let defs = defs_of("MainWindow < UIWindow\n");
+        assert!(defs[0].body_ids.is_empty());
     }
 
     #[test]
