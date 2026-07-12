@@ -28,6 +28,9 @@
 //!    has no style index and must never invent a resolution failure it cannot actually check.
 
 use crate::catalog;
+use crate::indent::{
+    is_block_scalar_marker, is_comment, leading_spaces, line_value, split_lines, Line,
+};
 use crate::lua_widgets::LuaWidgetIndex;
 use crate::schema;
 use crate::style_index::{is_native_base, StyleIndex};
@@ -136,65 +139,6 @@ fn analyze_inner(source: &str, ctx: Option<&WidgetContext>) -> Vec<Diagnostic> {
     }
     out.sort_by_key(|d| (d.span.start, d.span.end));
     out
-}
-
-/// One physical line of the source, sliced without its trailing `\n` (a trailing `\r` is kept and
-/// treated as ordinary trailing whitespace, matching the engine's right-trim).
-struct Line<'a> {
-    /// Byte offset of the line's first character within the source.
-    start: usize,
-    /// The line text, excluding the terminating `\n`.
-    text: &'a str,
-}
-
-/// Splits `source` into lines carrying their byte offsets.
-fn split_lines(source: &str) -> Vec<Line<'_>> {
-    let mut lines = Vec::new();
-    let mut start = 0usize;
-    for (i, b) in source.bytes().enumerate() {
-        if b == b'\n' {
-            lines.push(Line {
-                start,
-                text: &source[start..i],
-            });
-            start = i + 1;
-        }
-    }
-    if start < source.len() {
-        lines.push(Line {
-            start,
-            text: &source[start..],
-        });
-    }
-    lines
-}
-
-/// Number of leading ASCII space (`' '`) bytes — tabs and other bytes stop the count, exactly like
-/// `getLineDepth`'s `while (line[spaces] == ' ')`.
-fn leading_spaces(text: &str) -> usize {
-    text.bytes().take_while(|&b| b == b' ').count()
-}
-
-/// The value portion of a structural line, used only to detect block-scalar markers so their raw
-/// content lines can be skipped by the indentation pass. Mirrors the tag/value split of
-/// `parseNode` closely enough for that purpose (list items via a leading `-`, otherwise the text
-/// after the first `:`).
-fn line_value(trimmed: &str) -> &str {
-    if let Some(rest) = trimmed.strip_prefix('-') {
-        return rest.trim();
-    }
-    match trimmed.find(':') {
-        Some(pos) => trimmed[pos + 1..].trim(),
-        None => "",
-    }
-}
-
-fn is_block_scalar_marker(value: &str) -> bool {
-    matches!(value, "|" | "|-" | "|+")
-}
-
-fn is_comment(trimmed: &str) -> bool {
-    trimmed.starts_with("//") || trimmed.starts_with('#')
 }
 
 /// Emit a tab / odd-indentation diagnostic for `line`'s leading whitespace if malformed, returning
