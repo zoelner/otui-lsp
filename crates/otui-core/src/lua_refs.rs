@@ -213,14 +213,28 @@ fn sole_string_literal_arg(rest: &str) -> Option<(String, usize, usize)> {
         return None;
     }
     let content_start = ws + quote.len_utf8();
-    let close_rel = rest[content_start..].find(quote)? + content_start;
+    // Bound the search for the closing quote to the same line. A Lua short string cannot span a raw
+    // newline, and `excluded_ranges` already relies on that — but this function used to scan on to
+    // EOF, so the two disagreed and the module's advertised "an unterminated quote costs only its own
+    // line" was false here. Mid-edit (which is most of the time in an editor) `w:getChildById('` with
+    // the quote not yet closed would then borrow the next line's quote — and `if c == ')'`, an
+    // everyday idiom, supplies both a quote and the `)` this function looks for — yielding an id with
+    // a newline inside it and a span painted across several lines.
+    let line_end = rest[content_start..]
+        .find('\n')
+        .map_or(rest.len(), |rel| content_start + rel);
+    let close_rel = rest[content_start..line_end].find(quote)? + content_start;
+    let body = &rest[content_start..close_rel];
+    // A literal carrying an escape is not navigable: this function hands back the *raw source text*,
+    // whereas Lua's actual value is the decoded one (`'a\t'` is a tab, not a backslash and a `t`), so
+    // the id would never match a real `id:` anyway. Reject it rather than index a value that does not
+    // exist. Zero occurrences in the engine.
+    if body.contains('\\') {
+        return None;
+    }
     let after = rest[close_rel + quote.len_utf8()..].trim_start();
     if after.starts_with(')') {
-        Some((
-            rest[content_start..close_rel].to_owned(),
-            content_start,
-            close_rel,
-        ))
+        Some((body.to_owned(), content_start, close_rel))
     } else {
         None
     }
@@ -296,21 +310,31 @@ fn excluded_ranges(source: &str) -> Vec<(usize, usize)> {
                         // looks escaped; the scan then runs on to the next quote in the file,
                         // swallowing a real opening quote and flipping quote parity for the entire
                         // remainder of the source. Everything after it silently stops being indexed.
+                        // `\z` skips the whitespace that follows it, **newlines included** — LuaJIT,
+                        // which is what OTClient actually links, implements it in `lj_lex.c`. So the
+                        // string body continues past a blank run, and treating `\z` as an ordinary
+                        // two-byte escape would end the range at the newline and hand the rest of the
+                        // string body to the code scanner. That does not lose a reference — it
+                        // *manufactures* one, inside a string, and a manufactured reference is a
+                        // clickable jump to the wrong place. Zero occurrences in the engine today, but
+                        // it is ordinary Lua and the failure mode is the worst one this module has.
+                        b'\\' if bytes.get(j + 1) == Some(&b'z') => {
+                            j += 2;
+                            while matches!(bytes.get(j), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+                                j += 1;
+                            }
+                        }
                         b'\\' => j += 2,
                         // A Lua short string cannot span a *raw* newline. Stopping here bounds the
                         // blast radius of an unterminated quote — routine in a buffer that is being
                         // typed — to a single line instead of the rest of the file.
                         //
-                        // ORDER IS LOAD-BEARING: this arm must stay *below* the escape arm above. A
+                        // ORDER IS LOAD-BEARING: this arm must stay *below* both escape arms. A
                         // backslash-newline line continuation (`'a\` + newline + `b'`) is legal Lua,
                         // and it survives only because the escape arm consumes the newline before this
-                        // arm can see it. Reorder the two and every continuation string terminates
-                        // early, flipping quote parity for what follows —
+                        // arm can see it. Reorder them and every continuation string terminates early,
+                        // flipping quote parity for what follows —
                         // `a_short_string_may_span_a_line_via_a_backslash_continuation` pins it.
-                        //
-                        // Knowingly unhandled: Lua's `\z` (skip-whitespace) escape also spans lines,
-                        // and here it terminates early. Zero occurrences in the engine, and the
-                        // newline rule keeps the damage inside one region rather than the file.
                         b'\n' => break j,
                         b if b == quote => break j + 1,
                         _ => j += 1,
@@ -628,6 +652,55 @@ mod tests {
             ["realId"],
             "the file after the gsub must still be scanned"
         );
+    }
+
+    #[test]
+    fn a_z_escape_does_not_manufacture_a_reference_inside_a_string() {
+        // `\z` skips the following whitespace, newlines included (LuaJIT `lj_lex.c` — and LuaJIT is
+        // what OTClient links). So this whole call *is* string content: the real Lua value of `s` is
+        // `prefix w:getChildById("ghost") suffix`, and there is no call on that line at all.
+        //
+        // Treating `\z` as an ordinary escape ended the excluded range at the newline and handed the
+        // rest of the string body to the code scanner, which then reported `ghost` — a clickable jump
+        // into the middle of a string literal. That is the worst failure this module can have: not a
+        // missing reference, an invented one.
+        let src = "local s = 'prefix \\z\n   w:getChildById(\"ghost\") suffix'\nw:getChildById('realId')\n";
+        let ids: Vec<String> = scan_id_refs(src).into_iter().map(|r| r.id).collect();
+        assert_eq!(
+            ids,
+            ["realId"],
+            "a `\\z` continuation is still string body — nothing inside it is a reference: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn an_unclosed_literal_never_borrows_the_next_lines_quote() {
+        // Mid-edit is the normal state of an LSP buffer. With the closing quote not yet typed, the
+        // scan for it used to run to EOF — and `if c == ')'` (an everyday idiom) obligingly supplies
+        // both a quote and the `)` the arg check looks for. The result was an id with a newline inside
+        // it and a span painted across two lines.
+        let src = "w:getChildById('\nif c == ')' then end\n";
+        let refs = scan_id_refs(src);
+        assert!(
+            refs.is_empty(),
+            "an unclosed literal must yield nothing, not a multi-line id: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn a_literal_carrying_an_escape_is_not_indexed() {
+        // The scan hands back the raw source text of the literal, while Lua's actual value is the
+        // decoded one — `'a\tb'` is `a<TAB>b`, not `a\tb`. Indexing the raw form would record an id
+        // that does not exist, so such a literal is rejected outright rather than half-understood.
+        assert!(scan_id_refs("w:getChildById('a\\tb')\n").is_empty());
+        assert!(scan_id_refs("w:getChildById('a\\\\')\n").is_empty());
+        assert!(scan_id_defs("w:setId('a\\tb')\n").is_empty());
+        // …and an ordinary id is of course still indexed.
+        let ids: Vec<String> = scan_id_refs("w:getChildById('plain')\n")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, ["plain"]);
     }
 
     #[test]
