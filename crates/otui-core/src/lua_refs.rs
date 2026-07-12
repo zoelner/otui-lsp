@@ -297,9 +297,20 @@ fn excluded_ranges(source: &str) -> Vec<(usize, usize)> {
                         // swallowing a real opening quote and flipping quote parity for the entire
                         // remainder of the source. Everything after it silently stops being indexed.
                         b'\\' => j += 2,
-                        // A Lua short string cannot span a raw newline. Stopping here bounds the blast
-                        // radius of an unterminated quote — routine in a buffer that is being typed —
-                        // to a single line instead of the rest of the file.
+                        // A Lua short string cannot span a *raw* newline. Stopping here bounds the
+                        // blast radius of an unterminated quote — routine in a buffer that is being
+                        // typed — to a single line instead of the rest of the file.
+                        //
+                        // ORDER IS LOAD-BEARING: this arm must stay *below* the escape arm above. A
+                        // backslash-newline line continuation (`'a\` + newline + `b'`) is legal Lua,
+                        // and it survives only because the escape arm consumes the newline before this
+                        // arm can see it. Reorder the two and every continuation string terminates
+                        // early, flipping quote parity for what follows —
+                        // `a_short_string_may_span_a_line_via_a_backslash_continuation` pins it.
+                        //
+                        // Knowingly unhandled: Lua's `\z` (skip-whitespace) escape also spans lines,
+                        // and here it terminates early. Zero occurrences in the engine, and the
+                        // newline rule keeps the damage inside one region rather than the file.
                         b'\n' => break j,
                         b if b == quote => break j + 1,
                         _ => j += 1,
@@ -323,7 +334,7 @@ fn excluded_ranges(source: &str) -> Vec<(usize, usize)> {
                 }
             }
             // A long-bracket *string*: `[[ … ]]`, `[=[ … ]=]`. Its body is opaque and may hold
-            // anything — the engine has 138 of these, some embedding literal OTUI source, and three
+            // anything — the engine has 121 of these, some embedding literal OTUI source, and two
             // with an odd number of quotes in the body, which would desync the short-string scanner
             // above. Skipping it wholesale is what keeps both a bogus reference and that desync out.
             b'[' => {
@@ -620,6 +631,23 @@ mod tests {
     }
 
     #[test]
+    fn a_short_string_may_span_a_line_via_a_backslash_continuation() {
+        // A backslash-newline continuation is legal inside a Lua short string, and it survives the
+        // scan only because the escape arm consumes the newline before the newline arm can see it.
+        // The two arms are coupled, and nothing but this test says so: reorder them while
+        // "simplifying" and every continuation string terminates early, flipping quote parity for
+        // everything below it — the exact class of silent failure this pre-pass was rewritten to end.
+        let src = "local s = 'a\\\nb'\nw:getChildById('realId')\n";
+        let ids: Vec<String> = scan_id_refs(src).into_iter().map(|r| r.id).collect();
+        assert_eq!(
+            ids,
+            ["realId"],
+            "the continuation string must be excluded as one range, and the line after it scanned: \
+             {ids:?}"
+        );
+    }
+
+    #[test]
     fn an_unterminated_quote_costs_only_its_own_line() {
         // An LSP buffer is mid-edit most of the time, so a half-typed string is the normal case, not
         // the exotic one. A Lua short string cannot span a raw newline, so the scan stops at the
@@ -648,7 +676,7 @@ mod tests {
 
     #[test]
     fn a_long_bracket_string_body_is_not_indexed() {
-        // The engine has 138 long-bracket strings, some embedding literal OTUI source. Scanning
+        // The engine has 121 long-bracket strings, some embedding literal OTUI source. Scanning
         // their bodies invents references that live inside a string — and three of them carry an odd
         // number of quotes, which also desyncs the short-string scanner for everything after.
         let src = "local code = [[ w:getChildById('inString') ]]\nw:getChildById('realId')\n";
