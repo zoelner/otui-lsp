@@ -5,6 +5,7 @@
 use std::path::Path;
 use std::str::FromStr;
 use std::thread;
+use std::time::Duration;
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
@@ -55,13 +56,27 @@ impl Drop for TempDirGuard {
     }
 }
 
+/// How long [`recv_response`]/[`recv_diagnostics`] wait for the expected message before giving up.
+/// Generous for a fully in-memory, single-process test (no real network), but bounded: a blocking
+/// `recv()` here would hang the *whole test binary* — every test after it too, since `cargo test`
+/// only reports a suite-wide timeout, never which test stalled — if publication ever regresses or
+/// the server thread dies without sending what the test is waiting for (CodeRabbit Finding 5 on
+/// PR #51).
+const RECV_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Read from the client end until the [`Response`] for `id` arrives, skipping anything else the
 /// server pushed in the meantime (log notifications, `client/registerCapability` requests, …).
+///
+/// Bounded by [`RECV_TIMEOUT`] (see its doc comment for why a blocking `recv()` here is not safe).
 fn recv_response(client: &Connection, id: &RequestId) -> Response {
     loop {
-        match client.receiver.recv().expect("server channel open") {
-            Message::Response(resp) if &resp.id == id => return resp,
-            _ => continue,
+        match client.receiver.recv_timeout(RECV_TIMEOUT) {
+            Ok(Message::Response(resp)) if &resp.id == id => return resp,
+            Ok(_) => continue,
+            Err(e) => panic!(
+                "timed out after {RECV_TIMEOUT:?} waiting for a response to request {id:?} \
+                 (server channel: {e})"
+            ),
         }
     }
 }
@@ -91,17 +106,25 @@ fn run_server(server: Connection) -> Termination {
 /// Read from the client end until a `textDocument/publishDiagnostics` notification for `uri`
 /// arrives, skipping anything else in between (log notifications, `client/registerCapability`
 /// requests, a diagnostics push for some other document, …).
+///
+/// Bounded by [`RECV_TIMEOUT`] (see its doc comment): a blocking `recv()` here would hang the whole
+/// suite the moment `publishDiagnostics` ever regressed or the server thread died mid-test, instead
+/// of failing just this one test with a readable message (CodeRabbit Finding 5 on PR #51).
 fn recv_diagnostics(client: &Connection, uri: &Uri) -> PublishDiagnosticsParams {
     loop {
-        match client.receiver.recv().expect("server channel open") {
-            Message::Notification(n) if n.method == "textDocument/publishDiagnostics" => {
+        match client.receiver.recv_timeout(RECV_TIMEOUT) {
+            Ok(Message::Notification(n)) if n.method == "textDocument/publishDiagnostics" => {
                 let params: PublishDiagnosticsParams =
                     serde_json::from_value(n.params).expect("deserialize PublishDiagnosticsParams");
                 if &params.uri == uri {
                     return params;
                 }
             }
-            _ => continue,
+            Ok(_) => continue,
+            Err(e) => panic!(
+                "timed out after {RECV_TIMEOUT:?} waiting for publishDiagnostics for {uri:?} \
+                 (server channel: {e})"
+            ),
         }
     }
 }
@@ -383,6 +406,170 @@ Panel < UIWidget
     assert_eq!(
         d.range.start.line, 2,
         "range must point at the `icon:` line"
+    );
+
+    shutdown_and_exit(&client, server_thread, 2);
+}
+
+/// Finding 1 on PR #51, pinned end-to-end: a workspace holding **two** unrelated OTClient install
+/// roots (two client checkouts opened as separate workspace folders — not contrived; e.g. comparing
+/// a fork against upstream) must resolve each document against **its own** root only. An asset that
+/// exists only under the *other* root must never rescue a `missing-asset` finding for a document that
+/// has nothing to do with that other install.
+#[test]
+fn missing_asset_diagnostic_is_not_rescued_by_an_unrelated_second_client_root() {
+    let base = std::env::temp_dir().join(format!(
+        "otui-two-client-roots-e2e-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _cleanup = TempDirGuard(base.clone());
+    let root_a = base.join("client-a");
+    let root_b = base.join("client-b");
+    mark_as_client_root(&root_a);
+    mark_as_client_root(&root_b);
+    // The asset exists only under root B's `data/` overlay — never under root A.
+    let images_b = root_b.join("data").join("images");
+    std::fs::create_dir_all(&images_b).expect("mkdir");
+    std::fs::write(images_b.join("shared.png"), b"png").expect("write asset");
+
+    let doc_path = root_a.join("widget.otui");
+    let source = "\
+Panel < UIWidget
+  icon: /images/shared
+";
+    std::fs::write(&doc_path, source).expect("write doc");
+
+    let uri = file_uri(&doc_path);
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+
+    // Both roots opened as workspace folders — root A (the document's own tree) first, root B
+    // second, so an implementation that naively concatenated every workspace root's client root
+    // (the pre-fix behavior) would have found the asset via B and wrongly stayed silent.
+    #[allow(deprecated)]
+    client_handshake_with_params(
+        &client,
+        InitializeParams {
+            workspace_folders: Some(vec![
+                WorkspaceFolder {
+                    uri: file_uri(&root_a),
+                    name: "client-a".to_owned(),
+                },
+                WorkspaceFolder {
+                    uri: file_uri(&root_b),
+                    name: "client-b".to_owned(),
+                },
+            ]),
+            ..InitializeParams::default()
+        },
+    );
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: source.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+
+    let diags = recv_diagnostics(&client, &uri);
+    let missing: Vec<_> = diags
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == Some(NumberOrString::String("missing-asset".to_owned())))
+        .collect();
+    assert_eq!(
+        missing.len(),
+        1,
+        "root B's asset must not rescue a document that belongs to root A — got {missing:#?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 2);
+}
+
+/// Pinned end-to-end, corrected after verifying against the real engine: a CodeRabbit review of this
+/// crate (PR #51, Finding 2) claimed `init.lua` mounts only the overlay directories (`data/`,
+/// `modules/`, `mods/`) and never the install root itself, and asked for a test proving a file at
+/// `<installroot>/foo.png` must NOT satisfy `/foo.png`. That claim does not hold: `main.cpp`
+/// unconditionally calls `g_resources.discoverWorkDir("init.lua")` before any Lua runs;
+/// `ResourceManager::discoverWorkDir` (`resourcemanager.cpp`) mounts the install root via
+/// `PHYSFS_mount` and — on the candidate directory that has `init.lua` — breaks out of its loop
+/// *without* ever unmounting it, so the bare install root stays mounted for the whole session. This
+/// pins the corrected, verified behavior instead: a file sitting directly at the install root DOES
+/// satisfy a `/`-rooted reference, so `missing-asset` must stay silent for it. Real, shipped,
+/// autoloaded OTClient modules depend on exactly this (see `otui_core::links::ASSET_MOUNT_DIRS`'s
+/// doc comment for the on-disk corpus evidence).
+#[test]
+fn missing_asset_diagnostic_is_silent_for_a_file_sitting_directly_at_the_install_root() {
+    let base = std::env::temp_dir().join(format!(
+        "otui-root-itself-is-mounted-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _cleanup = TempDirGuard(base.clone());
+    mark_as_client_root(&base);
+    // Present directly at the install root, not under `mods/`/`modules/`/`data/` — exactly the
+    // shape `discoverWorkDir`'s always-on mount serves.
+    std::fs::write(base.join("foo.png"), b"png").expect("write asset");
+
+    let doc_path = base.join("widget.otui");
+    let source = "\
+Panel < UIWidget
+  icon: /foo
+";
+    std::fs::write(&doc_path, source).expect("write doc");
+
+    let root = file_uri(&base);
+    let uri = file_uri(&doc_path);
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+
+    #[allow(deprecated)]
+    client_handshake_with_params(
+        &client,
+        InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: root,
+                name: "ws".to_owned(),
+            }]),
+            ..InitializeParams::default()
+        },
+    );
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: source.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+
+    let diags = recv_diagnostics(&client, &uri);
+    let missing: Vec<_> = diags
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == Some(NumberOrString::String("missing-asset".to_owned())))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "a file at the bare install root must satisfy a `/`-rooted path — got {missing:#?}"
     );
 
     shutdown_and_exit(&client, server_thread, 2);
