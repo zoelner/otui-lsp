@@ -132,7 +132,7 @@ pub struct WidgetContext<'a> {
 /// accepts Lua-declared custom properties.
 #[must_use]
 pub fn analyze(source: &str) -> Vec<Diagnostic> {
-    analyze_inner(source, None)
+    analyze_inner(source, SyntaxTree::parse(source).as_ref(), None)
 }
 
 /// Like [`analyze`], but **widget-aware**: a property unknown to the C++ catalog is not flagged when
@@ -140,13 +140,32 @@ pub fn analyze(source: &str) -> Vec<Diagnostic> {
 /// other diagnostics are identical. With empty indexes it degrades exactly to [`analyze`].
 #[must_use]
 pub fn analyze_with_widgets(source: &str, ctx: &WidgetContext) -> Vec<Diagnostic> {
-    analyze_inner(source, Some(ctx))
+    analyze_inner(source, SyntaxTree::parse(source).as_ref(), Some(ctx))
 }
 
-fn analyze_inner(source: &str, ctx: Option<&WidgetContext>) -> Vec<Diagnostic> {
+/// Like [`analyze_with_widgets`], but over an already-parsed `tree` instead of parsing `source`
+/// again — for a caller that needs another source-derived pass over the same document (e.g.
+/// asset-link extraction for the missing-asset diagnostic) and wants exactly one parse shared by
+/// both, instead of the document being parsed twice per request. `tree` is `None` exactly when
+/// [`SyntaxTree::parse`] would have returned `None` for `source` — same degrade-to-parse-errors-only
+/// behavior as [`analyze_with_widgets`].
+#[must_use]
+pub fn analyze_with_widgets_from_tree(
+    source: &str,
+    tree: Option<&SyntaxTree>,
+    ctx: &WidgetContext,
+) -> Vec<Diagnostic> {
+    analyze_inner(source, tree, Some(ctx))
+}
+
+fn analyze_inner(
+    source: &str,
+    tree: Option<&SyntaxTree>,
+    ctx: Option<&WidgetContext>,
+) -> Vec<Diagnostic> {
     let mut out = indentation_pass(source);
-    // The tree is parsed once and shared by the structural and semantic passes.
-    if let Some(tree) = SyntaxTree::parse(source) {
+    // The tree is parsed once (by the caller) and shared by the structural and semantic passes.
+    if let Some(tree) = tree {
         collect_structural_errors(tree.root(), &mut out);
         collect_semantic_diagnostics(tree.root(), source, None, ctx, &mut out);
         check_top_level_style_resolution(tree.root(), source, ctx, &mut out);

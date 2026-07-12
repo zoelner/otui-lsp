@@ -10,5 +10,12 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+# One source of truth for asset-path resolution: the pure half (`resolve_asset_candidates` and its
+# guards) lives in `otui_core::links`, so the corpus harness reuses it rather than growing a second
+# copy of the resolution rules.
 otui-core = { path = "../crates/otui-core" }
+# The I/O half of the same resolution (`detect_client_roots`/`otpkg_present_under` walk the real
+# filesystem, so they cannot live in the I/O-free `otui-core`) still comes from the server crate —
+# the same walk `document_link`/hover/`missing-asset` use.
+otui-lsp-server = { path = "../crates/otui-lsp-server" }
 regex = "1"
