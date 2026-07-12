@@ -43,20 +43,21 @@ use lsp_types::{
     DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentColorParams,
     DocumentFormattingParams, DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
-    DocumentLink, DocumentLinkOptions, DocumentLinkParams, DocumentRangeFormattingParams,
-    DocumentSymbolParams, DocumentSymbolResponse, FileChangeType, FileSystemWatcher, FoldingRange,
-    FoldingRangeParams, FoldingRangeProviderCapability, GlobPattern, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    ImplementationProviderCapability, InitializeParams, InitializeResult, Location,
-    LogMessageParams, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf,
-    PositionEncodingKind, PrepareRenameResponse, PublishDiagnosticsParams, ReferenceParams,
-    Registration, RegistrationParams, RenameOptions, RenameParams, SemanticTokens,
-    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SymbolInformation,
-    SymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextEdit, TypeDefinitionProviderCapability, TypeHierarchyItem, TypeHierarchyPrepareParams,
-    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri, WorkDoneProgressOptions,
-    WorkspaceEdit, WorkspaceSymbolParams,
+    DocumentLink, DocumentLinkOptions, DocumentLinkParams, DocumentOnTypeFormattingOptions,
+    DocumentOnTypeFormattingParams, DocumentRangeFormattingParams, DocumentSymbolParams,
+    DocumentSymbolResponse, FileChangeType, FileSystemWatcher, FoldingRange, FoldingRangeParams,
+    FoldingRangeProviderCapability, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse,
+    Hover, HoverContents, HoverParams, HoverProviderCapability, ImplementationProviderCapability,
+    InitializeParams, InitializeResult, Location, LogMessageParams, MarkupContent, MarkupKind,
+    MessageType, NumberOrString, OneOf, PositionEncodingKind, PrepareRenameResponse,
+    PublishDiagnosticsParams, ReferenceParams, Registration, RegistrationParams, RenameOptions,
+    RenameParams, SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions,
+    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
+    ServerCapabilities, ServerInfo, SymbolInformation, SymbolKind, TextDocumentPositionParams,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, TypeDefinitionProviderCapability,
+    TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
+    TypeHierarchySupertypesParams, Uri, WorkDoneProgressOptions, WorkspaceEdit,
+    WorkspaceSymbolParams,
 };
 use otui_core::fixes::Fix;
 use otui_core::hover::{Inheritance, StyleHover, StyleHoverKind};
@@ -1508,6 +1509,12 @@ impl Backend {
                 DocumentRangeFormattingParams,
                 |p| self.range_formatting(p)
             ),
+            "textDocument/onTypeFormatting" => reply!(
+                req,
+                "textDocument/onTypeFormatting",
+                DocumentOnTypeFormattingParams,
+                |p| self.on_type_formatting(p)
+            ),
             "textDocument/foldingRange" => {
                 reply!(req, "textDocument/foldingRange", FoldingRangeParams, |p| {
                     self.folding_range(p)
@@ -1690,6 +1697,13 @@ impl Backend {
                 // Range formatting: reuse the whole-document formatter but scope the resulting edits
                 // to the lines the user selected (spec §8).
                 document_range_formatting_provider: Some(OneOf::Left(true)),
+                // On-type formatting: auto-indent the line Enter just created, computed lexically
+                // (no CST) so it still works on a mid-edit document (spec §8). Only `\n` triggers —
+                // there is no dedent trigger character, as a dedent is always a user action.
+                document_on_type_formatting_provider: Some(DocumentOnTypeFormattingOptions {
+                    first_trigger_character: "\n".to_string(),
+                    more_trigger_character: None,
+                }),
                 // Completion: the OTML closed sets (spec §6). `$` / `@` / `.` / `!` re-trigger
                 // completion as those characters open a `$state` selector, an `@event` key, an
                 // `anchors.<edge>` / `<target>.<edge>` dotted position, or a `!`-negated state in a
@@ -2578,6 +2592,71 @@ impl Backend {
             })
             .collect();
         Some(edits)
+    }
+
+    /// `textDocument/onTypeFormatting`: auto-indent the line Enter just created.
+    ///
+    /// This wraps [`OtuiService::indent_for_line`] — a **lexical**, CST-free computation that keeps
+    /// working on a mid-edit/broken document (unlike [`Backend::formatting`]'s `format` /
+    /// `format_line_edits`, which hard-gate on a clean parse and would refuse to act at the exact
+    /// moment on-type formatting fires). That primitive only ever proposes the previous line's depth
+    /// or one level deeper: it cannot, and must not, guess a dedent — returning to a shallower level
+    /// is always a user action (Backspace / Shift+Tab). Consequently this handler only ever edits
+    /// the single line `params.text_document_position.position.line` names (the line the newline
+    /// just produced); it never touches any other line, however "wrong" that other line's existing
+    /// indentation looks — reindenting an existing line could silently move it under a different
+    /// parent and change what the UI does.
+    fn on_type_formatting(&self, params: DocumentOnTypeFormattingParams) -> Option<Vec<TextEdit>> {
+        // Only Enter is wired: there is no trigger character for a dedent (see the capability
+        // registration in `initialize_result`), so any other typed character is a no-op here.
+        if params.ch != "\n" {
+            return None;
+        }
+
+        let uri = params.text_document_position.text_document.uri;
+        let encoding = self.encoding();
+
+        // Serve from the stored document text; an unknown (not open) document has nothing to
+        // format, matching every other formatting handler.
+        let text = self
+            .documents
+            .read()
+            .expect("documents lock poisoned")
+            .get(&uri)
+            .map(|doc| doc.text.clone())?;
+
+        let line = params.text_document_position.position.line;
+
+        // `None` means "make no edit": inside a block-scalar body (that indentation is raw Lua
+        // content — reindenting it would be data loss) or on a tab-indented line (the
+        // `tab-indentation` diagnostic + quick fix owns that, not this handler). Never substitute a
+        // guess for either case.
+        let target = self.service.indent_for_line(&text, line)?;
+
+        // The line's existing leading spaces, counted the same way the engine counts indentation
+        // (`otui_core::indent::leading_spaces`: a run of ASCII spaces, stopping at the first
+        // non-space byte).
+        let line_index = LineIndex::new(&text);
+        let line_start = line_index.offset_at(lsp_types::Position::new(line, 0), encoding);
+        let current = text[line_start..]
+            .bytes()
+            .take_while(|&b| b == b' ')
+            .count();
+
+        // Idempotence: most clients already run their own auto-indent on Enter, so an already
+        // correct line must produce no edit — echoing a no-op edit would just make the buffer churn.
+        if current == target {
+            return None;
+        }
+
+        let whitespace_end = line_start + current;
+        Some(vec![TextEdit {
+            range: lsp_types::Range {
+                start: lsp_types::Position::new(line, 0),
+                end: line_index.position(whitespace_end, encoding),
+            },
+            new_text: " ".repeat(target),
+        }])
     }
 
     fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -4960,6 +5039,115 @@ end
         };
         assert!(backend
             .range_formatting(range_formatting_params(&uri, range))
+            .is_none());
+    }
+
+    fn on_type_formatting_params(
+        uri: &Uri,
+        position: lsp_types::Position,
+        ch: &str,
+    ) -> DocumentOnTypeFormattingParams {
+        use lsp_types::{FormattingOptions, TextDocumentIdentifier, TextDocumentPositionParams};
+        DocumentOnTypeFormattingParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position,
+            },
+            ch: ch.to_owned(),
+            options: FormattingOptions::default(),
+        }
+    }
+
+    #[test]
+    fn on_type_formatting_after_a_block_opening_line_indents_one_level() {
+        use lsp_types::Position;
+        // Enter right after "Panel" (a bare container tag, which opens a block): the new, still
+        // blank line 1 must be indented two spaces deeper.
+        let uri = Uri::from_str("file:///x.otui").expect("uri");
+        let text = "Panel\n\n";
+        let backend = backend_with_doc(&uri, text, Vec::new());
+
+        let edits = backend
+            .on_type_formatting(on_type_formatting_params(&uri, Position::new(1, 0), "\n"))
+            .expect("indent_for_line resolves for this document");
+
+        assert_eq!(edits.len(), 1, "got {edits:?}");
+        let edit = &edits[0];
+        assert_eq!(edit.range.start, Position::new(1, 0));
+        assert_eq!(edit.range.end, Position::new(1, 0));
+        assert_eq!(edit.new_text, "  ");
+    }
+
+    #[test]
+    fn on_type_formatting_after_a_plain_property_line_keeps_the_same_indent() {
+        use lsp_types::Position;
+        // Enter right after "  id: main" (a colon-keyed line with an inline value, a leaf): the new
+        // line stays at the same depth, not one deeper.
+        let uri = Uri::from_str("file:///x.otui").expect("uri");
+        let text = "Panel\n  id: main\n\n";
+        let backend = backend_with_doc(&uri, text, Vec::new());
+
+        let edits = backend
+            .on_type_formatting(on_type_formatting_params(&uri, Position::new(2, 0), "\n"))
+            .expect("indent_for_line resolves for this document");
+
+        assert_eq!(edits.len(), 1, "got {edits:?}");
+        let edit = &edits[0];
+        assert_eq!(edit.range.start, Position::new(2, 0));
+        assert_eq!(edit.range.end, Position::new(2, 0));
+        assert_eq!(edit.new_text, "  ");
+    }
+
+    #[test]
+    fn on_type_formatting_already_at_the_target_indent_is_none() {
+        use lsp_types::Position;
+        // The new line already carries exactly the two spaces `indent_for_line` would propose:
+        // idempotence requires no edit, not a no-op replace.
+        let uri = Uri::from_str("file:///x.otui").expect("uri");
+        let text = "Panel\n  id: main\n  ";
+        let backend = backend_with_doc(&uri, text, Vec::new());
+
+        assert!(backend
+            .on_type_formatting(on_type_formatting_params(&uri, Position::new(2, 2), "\n"))
+            .is_none());
+    }
+
+    #[test]
+    fn on_type_formatting_ignores_a_non_newline_trigger_character() {
+        use lsp_types::Position;
+        // Only "\n" is registered as a trigger character; anything else must be a no-op even though
+        // the line itself would otherwise need reindenting.
+        let uri = Uri::from_str("file:///x.otui").expect("uri");
+        let text = "Panel\n\n";
+        let backend = backend_with_doc(&uri, text, Vec::new());
+
+        assert!(backend
+            .on_type_formatting(on_type_formatting_params(&uri, Position::new(1, 0), "}"))
+            .is_none());
+    }
+
+    #[test]
+    fn on_type_formatting_inside_a_block_scalar_body_is_none() {
+        use lsp_types::Position;
+        // `indent_for_line` refuses to guess inside an open block-scalar body (raw Lua content);
+        // the handler must pass that refusal straight through rather than substitute a guess.
+        let uri = Uri::from_str("file:///x.otui").expect("uri");
+        let text = "Panel\n  @onClick: |\n    self:hide()\n";
+        let backend = backend_with_doc(&uri, text, Vec::new());
+
+        assert!(backend
+            .on_type_formatting(on_type_formatting_params(&uri, Position::new(2, 4), "\n"))
+            .is_none());
+    }
+
+    #[test]
+    fn on_type_formatting_on_unknown_document_is_none() {
+        use lsp_types::Position;
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let backend = Backend::new(tx, &InitializeParams::default());
+        let uri = Uri::from_str("file:///nope.otui").expect("uri");
+        assert!(backend
+            .on_type_formatting(on_type_formatting_params(&uri, Position::new(0, 0), "\n"))
             .is_none());
     }
 }
