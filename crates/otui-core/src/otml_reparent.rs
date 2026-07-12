@@ -88,12 +88,21 @@ const STATEMENT_KINDS: &[&str] = &[
 /// runtime.
 #[must_use]
 pub(crate) fn is_reparented_onto_a_unique_sibling(child: Node<'_>, source: &str) -> bool {
-    let Some(prev) = child.prev_named_sibling() else {
-        return false;
-    };
-    STATEMENT_KINDS.contains(&prev.kind())
-        && child.start_position().column > prev.start_position().column
-        && line_contains_colon(prev, source)
+    // Skip `comment` nodes: they are tree-sitter `extras`, so they appear between real statements as
+    // named siblings, but `OTMLParser::parseLine` discards a comment line before it updates
+    // `previousNode`/`currentDepth` (`otmlparser.cpp`), so the statement the engine reparents onto is
+    // the last *non-comment* line above `child`, not an interposed comment.
+    let mut cursor = child.prev_named_sibling();
+    while let Some(prev) = cursor {
+        if prev.kind() == "comment" {
+            cursor = prev.prev_named_sibling();
+            continue;
+        }
+        return STATEMENT_KINDS.contains(&prev.kind())
+            && child.start_position().column > prev.start_position().column
+            && line_contains_colon(prev, source);
+    }
+    false
 }
 
 /// Whether `node`'s own source line — from its first byte (leading indentation is never part of a
@@ -161,6 +170,24 @@ mod tests {
         let header = node_at(src, &[0, 2]);
         assert_eq!(header.kind(), "style_header");
         assert!(is_reparented_onto_a_unique_sibling(header, src));
+    }
+
+    #[test]
+    fn a_widget_over_indented_under_an_id_with_a_comment_between_is_reparented() {
+        // A full-line comment is a tree-sitter `extra`, so it sits as a named sibling between the
+        // unique `id: a` line and the over-indented `Child`. The engine discards the comment line
+        // before advancing its parse state, so it reparents `Child` onto `id: a` and never creates
+        // it — the guard must see past the comment to the real preceding statement.
+        let src = "Panel\n  id: a\n  // note\n    Child\n      id: afterComment\n";
+        let comment = node_at(src, &[0, 2]);
+        assert_eq!(
+            comment.kind(),
+            "comment",
+            "the `// note` line must parse as a comment"
+        );
+        let child = node_at(src, &[0, 3]);
+        assert_eq!(child.kind(), "container");
+        assert!(is_reparented_onto_a_unique_sibling(child, src));
     }
 
     #[test]
