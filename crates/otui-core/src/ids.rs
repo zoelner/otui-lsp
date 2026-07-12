@@ -76,10 +76,31 @@ pub struct VisibleId {
 /// chain reaches (see the module docs for the shadowing rule and why [`resolve_ancestry`] is reused
 /// rather than a second ancestry walker).
 ///
-/// A widget is "instantiated" by any `style_header` (its `base`) or bare `container` (its `tag`) node
-/// in the tree, at any depth — not just the top-level entry: a nested widget can itself be an
-/// instance of a style declared elsewhere, and its inherited ids are visible too. Each distinct
-/// instantiated type is resolved only once, even if the document instantiates it repeatedly.
+/// A widget is "instantiated" by a `style_header` (its `base`) or bare `container` (its `tag`) node,
+/// at any depth **the engine actually descends into** — not just the top-level entry: a nested widget
+/// can itself be an instance of a style declared elsewhere, and its inherited ids are visible too. See
+/// [`collect_instantiated_ids`] for why that depth stops at the first `:`-bearing (engine-"unique")
+/// node. Each distinct instantiated type is resolved only once, even if the document instantiates it
+/// repeatedly.
+///
+/// ## Over-approximation: a duplicated style name contributes every match, not just the winner
+///
+/// The engine's style registry is **last-wins**: `m_styles[name] = style` fully replaces any earlier
+/// definition of the same name (`uimanager.cpp:508`), except that an existing style already marked
+/// `__unique` is never overwritten (`uimanager.cpp:500`). Import order — and so which definition
+/// actually wins at runtime — is a property of the engine's module load sequence, which this static
+/// index cannot know. Rather than guess, [`collect_instantiated_ids`] unions in the body ids of
+/// **every** [`StyleDef`](crate::style_index::StyleDef) matching a given name (via
+/// [`StyleIndex::lookup`]), including ones that would have lost at runtime. This is deliberate: it
+/// favours recall for navigation (offering more than one candidate `Location` is a legal, harmless
+/// answer to "where might this id be declared"), at the cost of sometimes offering an id that a
+/// particular runtime load order would never actually create.
+///
+/// **This makes [`visible_ids`] sound only for "might this id exist", never for "this id does not
+/// exist".** A caller must not use an id's absence from this list to justify an "unknown id" *error*
+/// diagnostic — the over-approximation only adds false positives to existence, it does not add false
+/// negatives, so a missing id here is not proof of anything. (This repo has already retired one
+/// diagnostic for exactly this class of unsoundness; do not reintroduce it here.)
 ///
 /// Returns an empty vec when `source` cannot be parsed.
 #[must_use]
@@ -104,13 +125,39 @@ pub fn visible_ids(source: &str, styles: &StyleIndex) -> Vec<VisibleId> {
     // Shadowing (see module docs): a local declaration wins over an inherited id of the same name.
     inherited.retain(|v| !local_names.contains(&v.id));
 
+    // Two different instantiated types can share an ancestor in their `< Base` chain (e.g. two
+    // widgets both ultimately deriving from the same base), so the same (id, span, declaring
+    // document) triple can be pushed once per type that reaches it. Collapse those exact repeats —
+    // they name the very same declaration site, not distinct candidates.
+    dedup_by_declaration_site(&mut inherited);
+
     let mut out = local;
     out.extend(inherited);
     out
 }
 
-/// Depth-first collection of every `id:` declared directly in `node`'s subtree (ids nest at any
-/// depth), recording each id's name into `names` as it goes for the shadowing check.
+/// Drop every entry whose `(id, span, declaring document)` triple duplicates one already kept,
+/// preserving the order of first occurrence. The declaring document is `None` for
+/// [`IdOrigin::Document`] (there is only ever one such document: the one being asked about) and
+/// `Some(doc)` for [`IdOrigin::InheritedStyle`].
+fn dedup_by_declaration_site(ids: &mut Vec<VisibleId>) {
+    let mut seen = HashSet::new();
+    ids.retain(|v| {
+        let doc = match &v.origin {
+            IdOrigin::Document => None,
+            IdOrigin::InheritedStyle { doc, .. } => Some(doc.as_str().to_owned()),
+        };
+        seen.insert((v.id.clone(), v.span.start, v.span.end, doc))
+    });
+}
+
+/// Depth-first collection of every `id:` the engine actually creates a widget for, declared anywhere
+/// in `node`'s subtree, recording each id's name into `names` as it goes for the shadowing check.
+///
+/// Only descends through `container` and `style_header` children — see [`collect_instantiated_ids`]'s
+/// doc comment (and [`crate::style_index`]'s equivalent allowlist for a style's own body) for why:
+/// every other node kind's line carries a `:`, which makes the engine treat it as unique and never
+/// turn its children into widgets.
 fn collect_local_ids(
     node: Node<'_>,
     source: &str,
@@ -128,10 +175,13 @@ fn collect_local_ids(
                 origin: IdOrigin::Document,
             });
         }
+        return;
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_local_ids(child, source, out, names);
+        if matches!(child.kind(), "id_property" | "container" | "style_header") {
+            collect_local_ids(child, source, out, names);
+        }
     }
 }
 
@@ -143,6 +193,16 @@ fn collect_local_ids(
 /// by any style along that chain is visible here. `seen_types` skips a type already resolved
 /// elsewhere in the same document, so instantiating the same style twice does not duplicate work or
 /// output.
+///
+/// Recursion stops at anything that is not a `container` or `style_header`. Every other node kind's
+/// line contains a `:` (a `state_selector`'s `$state:`, a `property`'s `key:`, an `event_property`'s
+/// `@tag:`, …), which makes `OTMLParser::parseNode` mark it **unique**
+/// (`otmlparser.cpp:435`: `node->setUnique(... || dotsPos != std::string::npos)`), and
+/// `UIManager::createWidgetFromOTML`'s child loop never instantiates a unique node's children
+/// (`uimanager.cpp:735`: `if (!childNode->isUnique()) createWidgetFromOTML(childNode, widget);`). A
+/// `style_header` or `container` written under a `$state:`/`layout:`/etc. block is therefore never
+/// created at runtime, so it cannot itself instantiate anything either — walking into it would
+/// resolve ancestry for a widget that does not exist.
 fn collect_instantiated_ids(
     node: Node<'_>,
     source: &str,
@@ -181,7 +241,9 @@ fn collect_instantiated_ids(
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_instantiated_ids(child, source, styles, lua, seen_types, out);
+        if matches!(child.kind(), "container" | "style_header") {
+            collect_instantiated_ids(child, source, styles, lua, seen_types, out);
+        }
     }
 }
 
@@ -321,5 +383,62 @@ mod tests {
         let visible = visible_ids(doc, &styles);
         let matches: Vec<&VisibleId> = visible.iter().filter(|v| v.id == "itemId").collect();
         assert_eq!(matches.len(), 1, "must not duplicate: {visible:?}");
+    }
+
+    #[test]
+    fn an_id_nested_inside_a_state_block_is_never_visible() {
+        // `$pressed:` is a `state_selector`: its line has a `:`, so the engine's
+        // `!childNode->isUnique()` child loop (uimanager.cpp:735) never creates its children as
+        // widgets. An id declared inside must be invisible whether it would have been local...
+        let local_doc = "Outer < UIWidget\n  $pressed:\n    VerticalScrollBar\n      id: phantom\n";
+        assert!(visible_ids(local_doc, &StyleIndex::new()).is_empty());
+
+        // ...or inherited through a style the document instantiates.
+        let styles = styles(&[(
+            "styles.otui",
+            "MiniWindow < UIMiniWindow\n  $pressed:\n    VerticalScrollBar\n      id: phantom\n",
+        )]);
+        let doc = "MainWindow < MiniWindow\n";
+        assert!(visible_ids(doc, &styles).is_empty());
+    }
+
+    #[test]
+    fn an_id_nested_under_a_plain_property_block_is_never_visible() {
+        // The real-world corpus bug (character.otui:1860 in the OTClient engine): an id
+        // over-indented under a plain `key:` property (e.g. `visible: false`) parents to a
+        // `property` node, unique for the same reason as `$state:` — its line has a `:` — so the
+        // engine never creates it and the id must not be offered as a navigation target.
+        let local_doc =
+            "CharacterTitles < UIWidget\n  visible: false\n    VerticalScrollBar\n      \
+             id: ListScrollbar\n";
+        assert!(visible_ids(local_doc, &StyleIndex::new()).is_empty());
+
+        let styles = styles(&[(
+            "styles.otui",
+            "CharacterTitles < UIWidget\n  visible: false\n    VerticalScrollBar\n      \
+             id: ListScrollbar\n",
+        )]);
+        let doc = "Instance < CharacterTitles\n";
+        assert!(visible_ids(doc, &styles).is_empty());
+    }
+
+    #[test]
+    fn a_shared_ancestor_reached_by_two_instantiated_types_contributes_its_id_once() {
+        // A and B both derive from Base; Base declares `shared`. Instantiating both A and B walks
+        // Base's ancestry twice (once per starting type), so without deduping by declaration site
+        // the exact same (id, span, doc) triple would be pushed twice.
+        let styles = styles(&[(
+            "styles.otui",
+            "Base < UIWidget\n  id: shared\nA < Base\nB < Base\n",
+        )]);
+        let doc = "Outer < UIWidget\n  A\n  B\n";
+        let visible = visible_ids(doc, &styles);
+        let matches: Vec<&VisibleId> = visible.iter().filter(|v| v.id == "shared").collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "the shared ancestor's id must appear once, not once per instantiating type: \
+             {visible:?}"
+        );
     }
 }

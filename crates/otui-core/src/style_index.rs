@@ -20,13 +20,22 @@
 //!
 //! ## Fidelity notes
 //!
-//! * **Duplicate style names are allowed.** The engine registers styles into a flat map where the
-//!   last registration wins at runtime; authoring the same `Name` in two files is legal. The index
-//!   therefore stores and returns **every** matching def (never dedupes/overwrites across docs) and
-//!   leaves any "which one wins" decision to later nodes.
+//! * **Duplicate style names are allowed, and the engine is last-wins.** `importStyleFromOTML` does
+//!   `m_styles[name] = style` (`uimanager.cpp:508`), which fully **replaces** any earlier definition
+//!   of the same name — not a union of the two — with one exception: an existing style already
+//!   flagged `__unique` (a `#Name < Base` freeze) is never overwritten (`uimanager.cpp:500`). Which
+//!   definition wins is therefore a property of the engine's *module load order*, something a static
+//!   index has no way to know. So the index does not try: it stores and returns **every** matching
+//!   def (never dedupes/overwrites across docs) and leaves any "which one wins" decision to later
+//!   nodes — see [`crate::ids`]'s module docs for the concrete consequence (an over-approximation
+//!   that is safe for "might this id exist" and unsafe for "this id does not exist").
 //! * **Only top-level declarations are styles.** A `Name < Base` nested inside a widget's block is
 //!   a widget *instance*, not a style definition, so only the direct children of the document root
-//!   are indexed — nested nodes are never walked as styles.
+//!   are indexed — nested nodes are never walked as styles. If the engine ever tried to instantiate
+//!   one, it would call `getStyle("Name < Base")`, which is undefined and **throws**
+//!   (`uimanager.cpp:708-710`: `if (!originalStyleNode) throw Exception(...)`) — so this is not
+//!   merely an indexing simplification, it mirrors a real engine failure mode. Styles are imported
+//!   only from a document's **root** nodes (`uimanager.cpp:438-444`).
 //!
 //! Everything here is byte-offset based. No I/O, no `lsp-types`.
 
@@ -121,15 +130,26 @@ fn build_def(node: Node<'_>, source: &str) -> StyleDef {
     }
 }
 
-/// Every `id:` declared anywhere within `node`'s subtree — the whole `style_header`'s body, at any
-/// depth.
+/// Every `id:` declared anywhere within `node`'s subtree that the engine actually turns into a
+/// widget — the whole `style_header`'s body, at any depth the engine descends into.
 ///
 /// Unlike [`lua_class_of`], which reads only a leaf `__class:` property directly on `node`, an
 /// `id:` typically sits several levels deep inside the style's block: `MiniWindow < UIMiniWindow`
 /// declares `id: contentsPanel` on a nested `MiniWindowContents` child, not on the header itself.
-/// So this walks every descendant, not just `node`'s direct children — including into nested
-/// `Name < Base` instances the body declares (those are widget instances, not styles, but their ids
-/// still belong to whoever instantiates this style).
+/// So this walks descendants, not just `node`'s direct children — but **only** through `container`
+/// and `style_header` nodes, the two grammar kinds a bare-tag or `Name < Base` line without a `:`
+/// parses to. Every other kind's line carries a `:` (`state_selector`'s `$state:`, `property`'s
+/// `key:`, `event_property`'s `@tag:`, …), which `OTMLParser::parseNode` marks **unique**
+/// (`otmlparser.cpp:435`: `node->setUnique(... || dotsPos != std::string::npos)`), and
+/// `UIManager::createWidgetFromOTML`'s child loop skips a unique node outright
+/// (`uimanager.cpp:735`: `if (!childNode->isUnique()) createWidgetFromOTML(childNode, widget);`).
+/// So a widget nested under `$pressed:`, under `layout:`, or under `visible: false` is never
+/// created — walking into it would harvest an `id:` for a widget that does not exist at runtime.
+/// This mirrors the `check_property_after_child` diagnostic's allowlist
+/// (`crate::diagnostics`), which faced the identical problem for the identical reason.
+/// `styleNode->get("id")` (`uiwidget.cpp:1918`) is also a direct-child lookup
+/// (`otmlnode.cpp:53-59`), so the id this returns for a given `container`/`style_header` is always
+/// the one declared directly inside it, never one found by searching past a unique descendant.
 fn body_ids_of(node: Node<'_>, source: &str) -> Vec<StyleBodyId> {
     let mut out = Vec::new();
     collect_body_ids(node, source, &mut out);
@@ -144,10 +164,13 @@ fn collect_body_ids(node: Node<'_>, source: &str, out: &mut Vec<StyleBodyId>) {
                 span: SyntaxTree::span_of(value),
             });
         }
+        return;
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_body_ids(child, source, out);
+        if matches!(child.kind(), "id_property" | "container" | "style_header") {
+            collect_body_ids(child, source, out);
+        }
     }
 }
 
@@ -364,6 +387,40 @@ mod tests {
     fn body_ids_are_empty_for_a_bare_declaration_with_no_block() {
         let defs = defs_of("MainWindow < UIWindow\n");
         assert!(defs[0].body_ids.is_empty());
+    }
+
+    #[test]
+    fn an_id_nested_inside_a_state_block_is_not_a_body_id() {
+        // `$pressed:` (and any `$state:`) is a `state_selector` node — its line carries a `:`, so
+        // the engine marks it unique and its child loop (`uimanager.cpp:735`) never turns a unique
+        // node's children into widgets. A `VerticalScrollBar` written under `$pressed:` therefore
+        // never exists at runtime, and its `id:` must not be reported as a body id.
+        let src = "MiniWindow < UIMiniWindow\n  $pressed:\n    VerticalScrollBar\n      \
+                    id: phantom\n";
+        let defs = defs_of(src);
+        assert_eq!(defs.len(), 1);
+        assert!(
+            defs[0].body_ids.is_empty(),
+            "an id under $state must not surface as a body id: {:?}",
+            defs[0].body_ids
+        );
+    }
+
+    #[test]
+    fn an_id_nested_under_a_plain_property_block_is_not_a_body_id() {
+        // The real-world corpus bug (character.otui:1860 in the OTClient engine): a widget
+        // over-indented under a plain `key:` property (e.g. `visible: false`) parents to a
+        // `property` node, which is unique for the same reason as a `$state:` block — its line has
+        // a `:` — so the engine never creates it.
+        let src = "CharacterTitles < UIWidget\n  visible: false\n    VerticalScrollBar\n      \
+                    id: ListScrollbar\n";
+        let defs = defs_of(src);
+        assert_eq!(defs.len(), 1);
+        assert!(
+            defs[0].body_ids.is_empty(),
+            "an id nested under a property block must not surface as a body id: {:?}",
+            defs[0].body_ids
+        );
     }
 
     #[test]
