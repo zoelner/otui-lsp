@@ -16,9 +16,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # No setup action: rust-toolchain.toml is the single source of the version, and a setup action
+      # that exports RUSTUP_TOOLCHAIN would silently outrank it. Argument-less `install` reads the
+      # file, components and all.
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       # ci.sh is the single source of truth for the gate — CI just invokes it.
       - run: ./ci.sh

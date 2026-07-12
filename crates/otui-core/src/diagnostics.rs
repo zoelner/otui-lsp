@@ -169,7 +169,7 @@ fn check_indent_chars(line: &Line<'_>, out: &mut Vec<Diagnostic>) -> bool {
             span: ByteSpan::new(line.start + sp, line.start + sp + 1),
         });
         true
-    } else if sp % 2 != 0 {
+    } else if !sp.is_multiple_of(2) {
         out.push(Diagnostic {
             severity: Severity::Error,
             code: ODD_INDENTATION,
@@ -283,7 +283,7 @@ pub(crate) fn line_indentation_is_valid(source: &str, offset: usize) -> bool {
 
         let sp = leading_spaces(line.text);
         let has_tab = line.text.as_bytes().get(sp) == Some(&b'\t');
-        let odd = sp % 2 != 0;
+        let odd = !sp.is_multiple_of(2);
         let depth = sp / 2;
         // `parseLine`: a jump of more than one level is fatal (checked only when the line is not
         // already tab/odd-flagged, mirroring `indentation_pass`).
@@ -813,9 +813,7 @@ fn check_property(
     let mut cursor = node.walk();
     let has_block = node
         .named_children(&mut cursor)
-        // `map_or(true, …)` rather than `Option::is_none_or` — the latter is only stable since Rust
-        // 1.82, but the workspace MSRV is 1.75.
-        .any(|child| child.id() != key.id() && value.map_or(true, |v| child.id() != v.id()));
+        .any(|child| child.id() != key.id() && value.is_none_or(|v| child.id() != v.id()));
     let name = slice(source, key);
     // A key nested directly under a `layout:` block is read by the *layout object*
     // (`UIBoxLayout`/`UIGridLayout`/…`::applyStyle`), not the widget style parser, so it lives in its

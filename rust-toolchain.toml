@@ -1,0 +1,10 @@
+# Pins the toolchain so CI and local development never disagree about which compiler — and, more to
+# the point, which clippy — judges the code. A lint that only fires on one of the two is a lint that
+# gets discovered at the worst moment.
+#
+# Bumping: raise `channel` here and `workspace.package.rust-version` in Cargo.toml together. They are
+# deliberately the same release: this workspace is not published, so nothing downstream pins us to an
+# older compiler, and a lower MSRV would only serve to forbid language features for no one's benefit.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]

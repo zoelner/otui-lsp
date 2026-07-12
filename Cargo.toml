@@ -11,7 +11,9 @@ members = [
 [workspace.package]
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.75"
+# Tracks the pinned toolchain in rust-toolchain.toml — bump the two together. Nothing downstream
+# consumes these crates, so a lower MSRV would protect no one while forbidding language features.
+rust-version = "1.97"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zoelner/otui-lsp"
 authors = ["Everton Zoelner <everton.zoelner@gmail.com>"]
