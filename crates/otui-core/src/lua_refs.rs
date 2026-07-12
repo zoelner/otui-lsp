@@ -282,6 +282,12 @@ fn collect_dot_ui_refs(source: &str, excluded: &[(usize, usize)], out: &mut Vec<
                 break;
             }
         }
+        // Resume *past the whole chain*, not one byte past the trigger. A chain segment that is
+        // itself named `ui` re-forms the `.ui.` pattern — `a.ui.ui.b` contains a second `.ui.`
+        // straddling the first `ui` segment — and restarting the walk there re-emits every segment
+        // that follows, with identical spans. It compounds: `d.ui.ui.ui.z` yielded `z` three times.
+        // Duplicate refs would reach the index and surface as duplicate locations in find-references.
+        search = search.max(pos);
     }
 }
 
@@ -785,6 +791,33 @@ mod tests {
     fn a_reference_inside_a_block_comment_is_not_indexed() {
         let src = "--[[\nwidget:getChildById('closeButton')\n]]\nlocal x = 1\n";
         assert!(scan_id_refs(src).is_empty());
+    }
+
+    #[test]
+    fn a_chain_segment_named_ui_does_not_duplicate_the_segments_after_it() {
+        // `a.ui.ui.b` contains a *second* `.ui.` — the one straddling the first `ui` segment. The
+        // outer scan used to resume one byte past the trigger, so it walked the tail of the chain
+        // again and re-emitted every following segment with an identical span. It compounded:
+        // `d.ui.ui.ui.z` produced `z` three times. Duplicates reach the index and would surface as
+        // duplicate locations in find-references.
+        let ids: Vec<String> = scan_id_refs("a.ui.ui.b\n")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, ["ui", "b"], "each segment exactly once: {ids:?}");
+
+        let ids: Vec<String> = scan_id_refs("d.ui.ui.ui.z\n")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, ["ui", "ui", "z"], "no compounding: {ids:?}");
+
+        // And the ordinary chain is untouched.
+        let ids: Vec<String> = scan_id_refs("c.ui.x.y\n")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, ["x", "y"]);
     }
 
     #[test]
