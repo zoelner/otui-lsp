@@ -404,7 +404,7 @@ fn long_bracket_end(source: &str, at: usize) -> Option<usize> {
     let body = k + 1;
     let mut close = String::with_capacity(level + 2);
     close.push(']');
-    close.extend(std::iter::repeat('=').take(level));
+    close.extend(std::iter::repeat_n('=', level));
     close.push(']');
     Some(
         source[body..]
@@ -437,12 +437,10 @@ fn is_ident_boundary_before(source: &str, idx: usize) -> bool {
 /// Whether the byte at `idx` (if any) is not an identifier character — i.e. the word ending at `idx`
 /// is whole.
 fn is_ident_boundary_after(source: &str, idx: usize) -> bool {
-    // `map_or(true, …)` rather than `Option::is_none_or` — the latter is only stable since Rust
-    // 1.82, but the workspace MSRV is 1.75.
     source
         .as_bytes()
         .get(idx)
-        .map_or(true, |&b| !is_ident_byte(b))
+        .is_none_or(|&b| !is_ident_byte(b))
 }
 
 /// The end offset of the identifier run starting at `start` (may equal `start` if none).

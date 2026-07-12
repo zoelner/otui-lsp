@@ -3816,7 +3816,7 @@ mod tests {
         // No top-level `Name < Base` header → no entries for this document.
         assert!(index
             .document(&DocId::from(uri.to_string()))
-            .map_or(true, <[StyleDef]>::is_empty));
+            .is_none_or(<[StyleDef]>::is_empty));
         // And a lookup of anything finds nothing from it.
         assert!(index.lookup("garbage").is_empty());
     }

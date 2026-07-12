@@ -16,9 +16,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # No setup action: rust-toolchain.toml is the single source of the version, so a setup action
+      # would only install a second toolchain nobody uses (the toml outranks the default it sets) and
+      # attach rustfmt/clippy to that wrong one. Argument-less `install` reads the file, components
+      # and all — it needs rustup >= 1.28, which the GitHub-hosted images ship.
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       # ci.sh is the single source of truth for the gate — CI just invokes it.
       - run: ./ci.sh

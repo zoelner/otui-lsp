@@ -247,12 +247,10 @@ fn find_call_arg<'a>(line: &'a str, name: &str) -> Option<&'a str> {
         let idx = search + rel;
         search = idx + name.len();
 
-        // `map_or(true, …)` rather than `Option::is_none_or` — the latter is only stable since Rust
-        // 1.82, but the workspace MSRV is 1.75.
         let word_start = line[..idx]
             .chars()
             .last()
-            .map_or(true, |c| !c.is_alphanumeric() && c != '_');
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
         if !word_start {
             continue;
         }
@@ -278,12 +276,10 @@ fn table_entry_value(line: &str, key: &str) -> Option<String> {
         search = idx + key.len();
 
         // Whole-word: `myOnStyleApply = f` is not the `onStyleApply` entry.
-        // `map_or(true, …)` rather than `Option::is_none_or` — the latter is only stable since Rust
-        // 1.82, but the workspace MSRV is 1.75.
         let word_start = line[..idx]
             .chars()
             .last()
-            .map_or(true, |c| !c.is_alphanumeric() && c != '_');
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
         if !word_start {
             continue;
         }
@@ -416,7 +412,7 @@ fn starts_with_end_keyword(line: &str) -> bool {
         Some(r) => r,
         None => return false,
     };
-    rest.chars().next().map_or(true, |c| !is_ident_char(c))
+    rest.chars().next().is_none_or(|c| !is_ident_char(c))
 }
 
 /// Collect the custom property literals from an `onStyleApply` body (the slice of lines from the
@@ -600,10 +596,7 @@ fn trailing_string_literal(s: &str) -> Option<String> {
 /// identifier char) — i.e. `word` appears as a whole trailing token.
 fn ends_with_word(s: &str, word: &str) -> bool {
     match s.strip_suffix(word) {
-        Some(prefix) => prefix
-            .chars()
-            .next_back()
-            .map_or(true, |c| !is_ident_char(c)),
+        Some(prefix) => prefix.chars().next_back().is_none_or(|c| !is_ident_char(c)),
         None => false,
     }
 }
@@ -612,7 +605,7 @@ fn ends_with_word(s: &str, word: &str) -> bool {
 /// identifier char) — i.e. `word` appears as a whole leading token.
 fn starts_with_word(s: &str, word: &str) -> bool {
     match s.strip_prefix(word) {
-        Some(suffix) => suffix.chars().next().map_or(true, |c| !is_ident_char(c)),
+        Some(suffix) => suffix.chars().next().is_none_or(|c| !is_ident_char(c)),
         None => false,
     }
 }
