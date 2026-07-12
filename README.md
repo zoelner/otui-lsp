@@ -80,7 +80,9 @@ Open the project **folder** (not a single file) so the server can index the whol
 
 ## Building
 
-Requires a stable Rust toolchain.
+`rust-toolchain.toml` pins the compiler, and rustup installs it on first use — CI and local
+development are held to the same rustc and the same clippy, so a lint cannot pass in one and fail in
+the other.
 
 ```bash
 ./ci.sh          # fmt + clippy + tests (the single quality gate)
