@@ -137,6 +137,21 @@ impl Language {
     /// already (the watched-files router matched `.lua` case-sensitively while this said `.LUA` was
     /// Lua), and a mixed-case file then took the OTUI branch straight into the workspace index.
     fn from_uri(uri: &Uri) -> Self {
+        // Classify off the SAME view of the URI that the code which actually opens the file uses.
+        // `read_indexed_file` resolves through `uri_to_file_path`, which percent-**decodes**; a
+        // raw-string test does not. They disagreed, and the disagreement failed OPEN:
+        // `file:///m/mod%2Elua` carries no literal dot, so the raw test answered OTUI — while the
+        // reader decoded it, opened the real `mod.lua`, and fed it to `style_defs` and the workspace
+        // `StyleIndex`. A classifier and a reader must not disagree about which file a URI names.
+        if uri_to_file_path(uri).is_some_and(|path| {
+            path.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("lua"))
+        }) {
+            return Language::Lua;
+        }
+        // Fallback for URIs that name no filesystem path (`untitled:` and other non-`file:` schemes):
+        // the raw string, with query and fragment stripped — without that a `git:` diff-view URI ends
+        // in `lua?{...}` and reads as OTUI.
         let s = uri.as_str();
         let path = s.split(['#', '?']).next().unwrap_or(s);
         let is_lua = path
@@ -3651,30 +3666,95 @@ mod tests {
     }
 
     #[test]
-    fn the_watched_files_router_classifies_lua_the_same_way_everything_else_does() {
-        // The router used to test `ends_with(\".lua\")` itself — case-sensitive — while
-        // `Language::from_uri` said `.LUA` was Lua. Same URI, two answers, and the mixed-case one
-        // took the OTUI branch into `index_from_disk` → `style_defs` over Lua text → garbage in the
-        // workspace StyleIndex. One rule, one place.
+    fn the_language_classifier_never_fails_open_on_a_lua_uri() {
+        // Every miss here fails OPEN: the OTUI analyzer runs over Lua text and `style_defs` feeds the
+        // workspace index whatever it hallucinates out of it. `%2E` is the case that bit us — the
+        // classifier read the raw string (no literal dot ⇒ "OTUI") while the file reader
+        // percent-decoded it and opened the real Lua file.
         for s in [
             "file:///ws/mod.lua",
             "file:///ws/Mod.LUA",
             "file:///ws/mod.Lua",
+            "file:///ws/mod%2Elua",
+            "file:///ws/mod%2elua",
             "file:///ws/mod.lua#frag",
             "file:///ws/mod.lua?x=1",
         ] {
             let uri = Uri::from_str(s).expect("uri");
-            assert_eq!(
-                Language::from_uri(&uri),
-                Language::Lua,
-                "{s} must classify as Lua — every miss here fails OPEN, running the OTUI analyzer \
-                 over Lua text"
-            );
+            assert_eq!(Language::from_uri(&uri), Language::Lua, "{s} must be Lua");
         }
-        for s in ["file:///ws/win.otui", "file:///ws/a.lua/win.otui"] {
+        // The other direction fails closed (the file silently loses every LSP feature) — milder, but
+        // still a bug.
+        for s in [
+            "file:///ws/win.otui",
+            "file:///ws/a.lua/win.otui",
+            "file:///ws/WIN.OTUI",
+        ] {
             let uri = Uri::from_str(s).expect("uri");
-            assert_eq!(Language::from_uri(&uri), Language::Otui, "{s}");
+            assert_eq!(Language::from_uri(&uri), Language::Otui, "{s} must be OTUI");
         }
+    }
+
+    #[test]
+    fn a_watched_lua_file_never_reaches_the_style_index_or_disk_texts() {
+        // The end-to-end test that the previous one only pretended to be. That one carried the
+        // router's name but asserted on `Language::from_uri` — so reverting the router to its
+        // original case-sensitive `ends_with(".lua")` bug left the entire suite green. A test that
+        // passes for the wrong reason is worse than no test: it certifies what it never checks.
+        //
+        // This drives the real handler against real files and asserts on the real state. The Lua text
+        // is a wrapped expression whose second line — `x < limit)` — the OTUI grammar reads as a style
+        // header named `x`. So if any of it leaks, `style_index.lookup("x")` finds it, and from the
+        // index a rename would rewrite bytes inside that Lua file.
+        use lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let base = std::env::temp_dir().join(format!("otui-lua-router-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("create temp dir");
+        let lua_text = "local ok = check(alpha,\nx < limit)\n";
+        for name in ["mod.lua", "Mixed.LUA", "encoded.lua"] {
+            std::fs::write(base.join(name), lua_text).expect("write lua");
+        }
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let backend = Backend::new(tx, &InitializeParams::default());
+
+        let mut uris: Vec<Uri> = ["mod.lua", "Mixed.LUA"]
+            .iter()
+            .map(|n| uri_from_file_path(&base.join(n)).expect("uri"))
+            .collect();
+        // The percent-encoded spelling of the same path: legal per RFC 3986, and the shape that
+        // walked past the raw-string classifier straight into the index.
+        let encoded = uri_from_file_path(&base.join("encoded.lua")).expect("uri");
+        uris.push(
+            Uri::from_str(&encoded.as_str().replace("encoded.lua", "encoded%2Elua")).expect("uri"),
+        );
+
+        backend.did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: uris
+                .iter()
+                .map(|uri| FileEvent {
+                    uri: uri.clone(),
+                    typ: FileChangeType::CREATED,
+                })
+                .collect(),
+        });
+
+        let disk = backend.disk_texts.read().expect("disk_texts lock");
+        assert!(
+            disk.is_empty(),
+            "a Lua file must never be cached as OTUI disk text: {:?}",
+            disk.keys().collect::<Vec<_>>()
+        );
+        drop(disk);
+        let styles = backend.style_index.read().expect("style_index lock");
+        assert!(
+            styles.lookup("x").is_empty(),
+            "the OTUI parser must never have run over the Lua text"
+        );
+        drop(styles);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
