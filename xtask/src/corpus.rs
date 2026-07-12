@@ -13,7 +13,8 @@ use otui_core::lua_widgets::{scan_widgets, LuaWidgetIndex};
 use otui_core::style_index::{extract_style_defs, StyleIndex};
 use otui_core::syntax::SyntaxTree;
 use otui_lsp_server::{
-    is_asset_sentinel_value, is_runtime_variable_path, resolve_asset_candidates,
+    detect_client_roots, is_asset_sentinel_value, is_runtime_variable_path, otpkg_present_under,
+    resolve_asset_candidates,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -87,13 +88,28 @@ pub fn run(root: &Path) {
 /// but I/O-driven — not something `analyze_with_widgets` can report — so it is a separate walk
 /// here): for every path-valued property ([`document_links`]) whose value does not contain `$` (an
 /// OTML runtime variable — see the identical guard in `otui_lsp_server::missing_asset_diagnostics`)
-/// and does not resolve to an existing file via [`resolve_asset_candidates`] (root of the corpus
-/// tree standing in for the single workspace root; each file's own directory for relative paths).
+/// and does not resolve to an existing file via [`resolve_asset_candidates`], using the *detected*
+/// OTClient install root(s) ([`detect_client_roots`]) — `root` of the corpus tree standing in for
+/// the single workspace root; each file's own directory for relative paths.
+///
+/// Mirrors `missing_asset_diagnostics`'s guards exactly, not a re-guessed subset: no detected client
+/// root anywhere suppresses the whole tree (Finding 2 — there is nothing to trust as a data root),
+/// and a mounted `*.otpkg` anywhere under a detected root suppresses the whole tree too (Finding 3 —
+/// an asset shipped inside one is invisible to `is_file()`). This keeps the count from silently
+/// drifting from what the real diagnostic would report over the same tree.
 ///
 /// Returns the total count plus up to 40 `(file, raw path)` examples, so a human can spot-check
 /// what the rule actually flags rather than trusting the count alone.
 fn missing_asset_findings(otui: &[PathBuf], root: &Path) -> (usize, Vec<(PathBuf, String)>) {
     let workspace_roots = [root.to_path_buf()];
+    let client_roots = detect_client_roots(Some(root), &workspace_roots);
+    if client_roots.is_empty() {
+        return (0, Vec::new());
+    }
+    if client_roots.iter().any(|r| otpkg_present_under(r)) {
+        return (0, Vec::new());
+    }
+
     let mut count = 0usize;
     let mut examples = Vec::new();
     for f in otui {
@@ -107,7 +123,7 @@ fn missing_asset_findings(otui: &[PathBuf], root: &Path) -> (usize, Vec<(PathBuf
             if is_runtime_variable_path(&link.path) || is_asset_sentinel_value(&link.path) {
                 continue;
             }
-            let resolved = resolve_asset_candidates(&link.path, doc_dir, &workspace_roots)
+            let resolved = resolve_asset_candidates(&link.path, doc_dir, &client_roots)
                 .into_iter()
                 .any(|c| c.is_file());
             if resolved {

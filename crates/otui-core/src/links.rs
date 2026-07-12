@@ -35,11 +35,23 @@ pub struct PathRef {
 /// whose key is in [`schema::PATH_PROPERTIES`], the value token's trimmed span and raw path text are
 /// returned. Non-path properties (`id: x`, `text: y`), non-`property` nodes, and properties with an
 /// empty value are ignored. Returns an empty vector when the source cannot be parsed.
+///
+/// Parses `source` itself. A caller that already holds a [`SyntaxTree`] for the same `source` (e.g.
+/// one computed alongside diagnostics) should call [`document_links_from_tree`] instead, so the
+/// document is not parsed twice for one request.
 #[must_use]
 pub fn document_links(source: &str) -> Vec<PathRef> {
     let Some(tree) = SyntaxTree::parse(source) else {
         return Vec::new();
     };
+    document_links_from_tree(source, &tree)
+}
+
+/// Like [`document_links`], but over an already-parsed `tree` instead of parsing `source` again —
+/// for a caller that needs a second source-derived pass (asset-link extraction) over a document it
+/// has already parsed for another purpose (diagnostics), so the two passes share one parse.
+#[must_use]
+pub fn document_links_from_tree(source: &str, tree: &SyntaxTree) -> Vec<PathRef> {
     let mut out = Vec::new();
     collect(tree.root(), source, &mut out);
     out
