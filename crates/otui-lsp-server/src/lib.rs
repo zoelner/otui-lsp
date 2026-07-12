@@ -101,23 +101,40 @@ enum Language {
 }
 
 impl Language {
-    /// Classify a `didOpen` `languageId`. Only `"lua"` is special-cased to [`Language::Lua`] —
-    /// this server has never required a particular `languageId` for an OTUI buffer (a client is
-    /// free to send `"otui"`, `"otml"`, or its own convention), so anything else defaults to
-    /// [`Language::Otui`], preserving today's behavior for every existing client.
-    fn from_language_id(language_id: &str) -> Self {
-        if language_id == "lua" {
+    /// Classify an opened document from **both** signals: it is Lua if the `didOpen` `languageId`
+    /// says so **or** the URI looks like Lua.
+    ///
+    /// Belt and braces, deliberately. The client that will start sending `.lua` here is a *separate
+    /// repository*; if the guard trusted `languageId` alone, one editor sending `"plaintext"` (or
+    /// its own id) for a `.lua` file would silently switch the entire guard off — the analyzer would
+    /// run on Lua and `style_defs` would feed the workspace `StyleIndex` with garbage. A guard whose
+    /// correctness depends on a string chosen in another repo is not a guard. Either signal saying
+    /// "Lua" is enough.
+    ///
+    /// The converse stays permissive: this server has never required a particular `languageId` for an
+    /// OTUI buffer (a client may send `"otui"`, `"otml"`, or its own convention), so anything that is
+    /// neither signal defaults to [`Language::Otui`], preserving today's behavior for every existing
+    /// client.
+    fn classify(uri: &Uri, language_id: &str) -> Self {
+        if language_id.eq_ignore_ascii_case("lua") || Self::from_uri(uri) == Language::Lua {
             Language::Lua
         } else {
             Language::Otui
         }
     }
 
-    /// Fall back to the URI's file extension. Used when a request names a document this server
-    /// has no recorded `languageId` for (never opened, or a handler that answers purely from
+    /// Classify from the URI's file extension alone. Used when a request names a document this
+    /// server has no recorded `languageId` for (never opened, or a handler that answers purely from
     /// `params` without looking up the [`Document`] — see [`Backend::is_otui_document`]).
+    ///
+    /// Case-insensitive: a `.LUA` file is still Lua.
     fn from_uri(uri: &Uri) -> Self {
-        if uri.as_str().ends_with(".lua") {
+        let s = uri.as_str();
+        let is_lua = s
+            .rsplit('.')
+            .next()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("lua"));
+        if is_lua {
             Language::Lua
         } else {
             Language::Otui
@@ -328,6 +345,9 @@ impl Backend {
         let open: Vec<(Uri, String, i32)> = {
             let docs = self.documents.read().expect("documents lock poisoned");
             docs.iter()
+                // A Lua buffer has no OTUI diagnostics to go stale — republishing would just send it
+                // another empty list. Same filter the background scan's refresh loop applies.
+                .filter(|(_, doc)| doc.language == Language::Otui)
                 .map(|(uri, doc)| (uri.clone(), doc.text.clone(), doc.version))
                 .collect()
         };
@@ -536,7 +556,13 @@ fn merge_documents(
     open: &HashMap<Uri, Document>,
     disk: &HashMap<Uri, String>,
 ) -> HashMap<Uri, Document> {
-    // `disk_texts` only ever caches `.otui` files (see its docs), so every entry here is OTUI.
+    // Every entry in the result is OTUI, and that is load-bearing: the aggregators that consume this
+    // map (`collect_references`, `build_rename_edits`) run the **OTUI parser** over every document
+    // in it. `disk_texts` only ever caches `.otui` (see its docs), but the open-buffer half can hold
+    // a `.lua` document once a client is registered for Lua — so it is filtered below. Without that
+    // filter, a column-0 Lua line like `x < limit)` (a wrapped expression) parses as a `style_header`
+    // named `x`, and a rename of an OTUI style `x` would emit a `TextEdit` **rewriting bytes inside
+    // the user's open Lua file**.
     let mut merged: HashMap<Uri, Document> = disk
         .iter()
         .map(|(uri, text)| {
@@ -550,8 +576,13 @@ fn merge_documents(
             )
         })
         .collect();
-    // Open buffers override any stale on-disk entry for the same URI.
+    // Open buffers override any stale on-disk entry for the same URI — but only OTUI ones. This is
+    // the language guard at the seam: filtering here keeps every consumer correct at once, instead of
+    // asking each future aggregator to remember a check it cannot be reminded of.
     for (uri, doc) in open {
+        if doc.language != Language::Otui {
+            continue;
+        }
         merged.insert(uri.clone(), doc.clone());
     }
     merged
@@ -2688,10 +2719,10 @@ impl Backend {
         let doc = params.text_document;
         let uri = doc.uri;
         let version = doc.version;
-        // The one place a document's language is learned from the client: `didOpen`'s
-        // `languageId` (see `Language::from_language_id`), preferred over the URI-extension
-        // fallback every other call site uses.
-        let language = Language::from_language_id(&doc.language_id);
+        // The one place a document's language is learned from the client. Both signals are consulted
+        // (see `Language::classify`): a `.lua` URI is Lua even if the client labels it something
+        // else, because the guard must not hinge on a `languageId` string chosen in another repo.
+        let language = Language::classify(&uri, &doc.language_id);
         // Insert the buffer and (for an OTUI document) re-index atomically w.r.t. the background
         // scan (see `set_open_document`), so a scan in flight cannot clobber this open buffer's
         // index entry.
@@ -3520,6 +3551,79 @@ mod tests {
             hover.is_some(),
             "hover must still answer for an .otui document"
         );
+    }
+
+    #[test]
+    fn an_open_lua_buffer_never_reaches_the_otui_aggregators() {
+        // Guarding the *requesting* document is not enough. `collect_references` and
+        // `build_rename_edits` fan out over every document in `merged_documents()` and run the OTUI
+        // parser on each. And the OTUI grammar does not politely reject Lua: a column-0 line like
+        // `x < limit)` — the tail of a wrapped expression — parses as a `style_header` named `x`.
+        //
+        // So if an open `.lua` buffer reached those aggregators, renaming an OTUI style `x` would
+        // emit a `TextEdit` **rewriting bytes inside the user's open Lua file**. This test pins both
+        // halves: that the danger is real, and that the seam keeps Lua out.
+        let lua_src = "local ok = check(alpha,\nx < limit)\n";
+
+        // (a) the danger is real — the OTUI parser genuinely mistakes this Lua for a style header.
+        let svc = OtuiService::new();
+        assert!(
+            svc.style_defs(lua_src).iter().any(|def| def.name == "x"),
+            "precondition failed: if the parser no longer reads this Lua as a style header, \
+             rewrite this test around a shape that it does — do not delete it"
+        );
+
+        // (b) the seam keeps it out.
+        let lua_uri = Uri::from_str("file:///ws/mod.lua").expect("uri");
+        let otui_uri = Uri::from_str("file:///ws/mod.otui").expect("uri");
+        let mut open = HashMap::new();
+        open.insert(
+            lua_uri.clone(),
+            Document {
+                text: lua_src.to_owned(),
+                version: 1,
+                language: Language::Lua,
+            },
+        );
+        open.insert(
+            otui_uri.clone(),
+            Document {
+                text: "x < UIWidget\n".to_owned(),
+                version: 1,
+                language: Language::Otui,
+            },
+        );
+
+        let merged = merge_documents(&open, &HashMap::new());
+        assert!(
+            !merged.contains_key(&lua_uri),
+            "a Lua buffer must never enter the OTUI aggregators — rename would corrupt it"
+        );
+        assert!(
+            merged.contains_key(&otui_uri),
+            "the OTUI buffer must still be there"
+        );
+    }
+
+    #[test]
+    fn a_lua_uri_is_lua_even_when_the_client_labels_it_otherwise() {
+        // The guard must not hinge on a `languageId` string chosen in a *different repository*. A
+        // client that opens a `.lua` file as "plaintext" (or anything else) must not switch the
+        // whole guard off: either signal saying Lua is enough.
+        let lua = Uri::from_str("file:///ws/mod.lua").expect("uri");
+        let otui = Uri::from_str("file:///ws/mod.otui").expect("uri");
+        assert_eq!(Language::classify(&lua, "plaintext"), Language::Lua);
+        assert_eq!(Language::classify(&lua, ""), Language::Lua);
+        assert_eq!(Language::classify(&lua, "lua"), Language::Lua);
+        // And the languageId alone is still enough, whatever the URI looks like.
+        assert_eq!(Language::classify(&otui, "lua"), Language::Lua);
+        // An OTUI buffer stays OTUI under any of the ids clients actually send.
+        assert_eq!(Language::classify(&otui, "otui"), Language::Otui);
+        assert_eq!(Language::classify(&otui, "otml"), Language::Otui);
+        assert_eq!(Language::classify(&otui, ""), Language::Otui);
+        // Case-insensitive on the extension.
+        let upper = Uri::from_str("file:///ws/MOD.LUA").expect("uri");
+        assert_eq!(Language::classify(&upper, ""), Language::Lua);
     }
 
     #[test]
