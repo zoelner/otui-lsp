@@ -444,6 +444,12 @@ fn collect_semantic_diagnostics<'a>(
 /// this block is unreliable to classify, so we do not pile a readability hint on top of a syntax
 /// error.
 fn check_property_after_child(node: Node<'_>, out: &mut Vec<Diagnostic>) {
+    // A child widget is spelled two ways: a bare tag (`Button`, a `container`) or a tag with an
+    // inline base (`Label < UILabel`, a `style_header`). Both instantiate a child — but only inside
+    // a widget's body. At the **document root** a `style_header` is a style *declaration*
+    // (`Name < Base`, spec §2.2), not a child of anything, so it must never mark "a child was seen"
+    // there.
+    let header_is_child = node.kind() != "document";
     let mut cursor = node.walk();
     let mut seen_child = false;
     for child in node.named_children(&mut cursor) {
@@ -452,6 +458,7 @@ fn check_property_after_child(node: Node<'_>, out: &mut Vec<Diagnostic>) {
         }
         match child.kind() {
             "container" => seen_child = true,
+            "style_header" if header_is_child => seen_child = true,
             "property" if seen_child => {
                 if let Some(key) = child.child_by_field_name("key") {
                     out.push(Diagnostic {
@@ -1478,6 +1485,43 @@ Panel
   margin-bottom: 3
   Button
     id: ok
+";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != PROPERTY_AFTER_CHILD),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_child_declared_with_an_explicit_base_also_counts_as_a_child() {
+        // A child widget has two spellings: a bare tag (`Button`) and a tag with an inline base
+        // (`Label < UILabel`). The grammar gives the second one the `style_header` kind, not
+        // `container` — so an implementation that only watches for `container` silently misses
+        // every property that follows a based child. It did, until this test.
+        let src = "\
+MainWindow < UIWindow
+  Label < UILabel
+    id: title
+  margin-bottom: 3
+";
+        let diags = analyze(src);
+        let d = only(&diags, PROPERTY_AFTER_CHILD);
+        assert_eq!(d.severity, Severity::Hint);
+        assert_eq!(&src[d.span.start..d.span.end], "margin-bottom");
+    }
+
+    #[test]
+    fn a_top_level_style_declaration_is_not_a_child_widget() {
+        // The flip side of the rule above: at the document root, `Name < Base` is a style
+        // *declaration* (spec §2.2), not a child of anything. Marking it as "a child was seen"
+        // would make every subsequent top-level node look like a misordered property.
+        let src = "\
+Button < UIButton
+  color: red
+
+Label < UILabel
+  color: blue
 ";
         let diags = analyze(src);
         assert!(
