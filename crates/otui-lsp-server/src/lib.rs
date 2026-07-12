@@ -127,10 +127,19 @@ impl Language {
     /// server has no recorded `languageId` for (never opened, or a handler that answers purely from
     /// `params` without looking up the [`Document`] — see [`Backend::is_otui_document`]).
     ///
-    /// Case-insensitive: a `.LUA` file is still Lua.
+    /// Case-insensitive (a `.LUA` file is still Lua), and the URI's query and fragment are stripped
+    /// first: without that, `file:///m/mod.lua#frag` or a `git:` diff-view URI ends in `lua#frag` /
+    /// `lua?{...}` and would be classified **OTUI** — the analyzer would then run over Lua. Every
+    /// misclassification this function can make must fail *closed*, never open.
+    ///
+    /// This is the single source of truth for "is this URI Lua?". Any other place that needs the
+    /// answer must call it rather than testing the string itself — the two rules drifted apart once
+    /// already (the watched-files router matched `.lua` case-sensitively while this said `.LUA` was
+    /// Lua), and a mixed-case file then took the OTUI branch straight into the workspace index.
     fn from_uri(uri: &Uri) -> Self {
         let s = uri.as_str();
-        let is_lua = s
+        let path = s.split(['#', '?']).next().unwrap_or(s);
+        let is_lua = path
             .rsplit('.')
             .next()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("lua"));
@@ -556,15 +565,21 @@ fn merge_documents(
     open: &HashMap<Uri, Document>,
     disk: &HashMap<Uri, String>,
 ) -> HashMap<Uri, Document> {
-    // Every entry in the result is OTUI, and that is load-bearing: the aggregators that consume this
-    // map (`collect_references`, `build_rename_edits`) run the **OTUI parser** over every document
-    // in it. `disk_texts` only ever caches `.otui` (see its docs), but the open-buffer half can hold
-    // a `.lua` document once a client is registered for Lua — so it is filtered below. Without that
-    // filter, a column-0 Lua line like `x < limit)` (a wrapped expression) parses as a `style_header`
-    // named `x`, and a rename of an OTUI style `x` would emit a `TextEdit` **rewriting bytes inside
-    // the user's open Lua file**.
+    // Every entry in the result must be OTUI, and that is load-bearing: the aggregators that consume
+    // this map (`collect_references`, `build_rename_edits`) run the **OTUI parser** over every
+    // document in it, and the OTUI grammar does not reject Lua — a column-0 line like `x < limit)`
+    // (the tail of a wrapped expression) parses as a `style_header` named `x`. A Lua document reaching
+    // here therefore means `textDocument/rename` of an OTUI style `x` emits a `TextEdit` **rewriting
+    // bytes inside that file**.
+    //
+    // BOTH halves are filtered, not just the open one. The disk half is nominally all-`.otui` — but
+    // that invariant is upheld by string tests in other functions, and one of them (the watched-files
+    // router) was case-sensitive while the language classifier was not, so a `Mod.LUA` walked straight
+    // into `disk_texts`. A seam that trusts an invariant enforced somewhere else is not a seam. This
+    // one re-checks, so it holds even when an upstream writer is wrong.
     let mut merged: HashMap<Uri, Document> = disk
         .iter()
+        .filter(|(uri, _)| Language::from_uri(uri) == Language::Otui)
         .map(|(uri, text)| {
             (
                 uri.clone(),
@@ -2063,7 +2078,13 @@ impl Backend {
             let uri = change.uri;
             // A `.lua` widget module feeds the Lua index only (no open-buffer or disk-text tracking —
             // Lua is never an open OTUI document), so route it before the `.otui` logic.
-            if uri.as_str().ends_with(".lua") {
+            //
+            // Classified through `Language::from_uri`, never by testing the string here: a
+            // case-sensitive `ends_with(".lua")` sent `Mod.LUA` down the OTUI branch instead, into
+            // `index_from_disk` → `style_defs` over Lua text → garbage in the workspace `StyleIndex`
+            // and Lua text cached in `disk_texts` — from where a rename could rewrite bytes inside
+            // that file. One rule, one place.
+            if Language::from_uri(&uri) == Language::Lua {
                 self.apply_lua_watch_change(&uri, change.typ);
                 continue;
             }
@@ -3603,6 +3624,57 @@ mod tests {
             merged.contains_key(&otui_uri),
             "the OTUI buffer must still be there"
         );
+    }
+
+    #[test]
+    fn a_lua_document_never_enters_the_merge_via_the_disk_half_either() {
+        // The open half was filtered first, and that looked like enough. It was not: `disk_texts` is
+        // seeded by `index_from_disk`, whose "only `.otui` gets here" invariant is enforced by string
+        // tests in *other* functions — one of which (the watched-files router) matched `.lua`
+        // case-sensitively while `Language::from_uri` did not, so a `Mod.LUA` walked straight in.
+        // A seam that trusts an invariant enforced elsewhere is not a seam; this one re-checks.
+        let lua_uri = Uri::from_str("file:///ws/Mod.LUA").expect("uri");
+        let otui_uri = Uri::from_str("file:///ws/win.otui").expect("uri");
+        let mut disk = HashMap::new();
+        disk.insert(
+            lua_uri.clone(),
+            "local ok = check(alpha,\nx < limit)\n".to_owned(),
+        );
+        disk.insert(otui_uri.clone(), "x < UIWidget\n".to_owned());
+
+        let merged = merge_documents(&HashMap::new(), &disk);
+        assert!(
+            !merged.contains_key(&lua_uri),
+            "a Lua file must not reach the OTUI aggregators through the disk half either"
+        );
+        assert!(merged.contains_key(&otui_uri));
+    }
+
+    #[test]
+    fn the_watched_files_router_classifies_lua_the_same_way_everything_else_does() {
+        // The router used to test `ends_with(\".lua\")` itself — case-sensitive — while
+        // `Language::from_uri` said `.LUA` was Lua. Same URI, two answers, and the mixed-case one
+        // took the OTUI branch into `index_from_disk` → `style_defs` over Lua text → garbage in the
+        // workspace StyleIndex. One rule, one place.
+        for s in [
+            "file:///ws/mod.lua",
+            "file:///ws/Mod.LUA",
+            "file:///ws/mod.Lua",
+            "file:///ws/mod.lua#frag",
+            "file:///ws/mod.lua?x=1",
+        ] {
+            let uri = Uri::from_str(s).expect("uri");
+            assert_eq!(
+                Language::from_uri(&uri),
+                Language::Lua,
+                "{s} must classify as Lua — every miss here fails OPEN, running the OTUI analyzer \
+                 over Lua text"
+            );
+        }
+        for s in ["file:///ws/win.otui", "file:///ws/a.lua/win.otui"] {
+            let uri = Uri::from_str(s).expect("uri");
+            assert_eq!(Language::from_uri(&uri), Language::Otui, "{s}");
+        }
     }
 
     #[test]
