@@ -80,7 +80,7 @@ pub struct VisibleId {
 /// A widget is "instantiated" by a `style_header` (its `base`) or bare `container` (its `tag`) node,
 /// at any depth **the engine actually descends into** — not just the top-level entry: a nested widget
 /// can itself be an instance of a style declared elsewhere, and its inherited ids are visible too. See
-/// [`collect_instantiated_ids`] for the two ways that depth stops short of "every nested
+/// `collect_instantiated_ids` for the two ways that depth stops short of "every nested
 /// `container`/`style_header` in the source text": a `:`-bearing (engine-"unique") ancestor, and a
 /// line reparented onto one. Each distinct instantiated type is resolved only once, even if the
 /// document instantiates it repeatedly.
@@ -91,7 +91,7 @@ pub struct VisibleId {
 /// definition of the same name (`uimanager.cpp:508`), except that an existing style already marked
 /// `__unique` is never overwritten (`uimanager.cpp:500`). Import order — and so which definition
 /// actually wins at runtime — is a property of the engine's module load sequence, which this static
-/// index cannot know. Rather than guess, [`collect_instantiated_ids`] unions in the body ids of
+/// index cannot know. Rather than guess, `collect_instantiated_ids` unions in the body ids of
 /// **every** [`StyleDef`](crate::style_index::StyleDef) matching a given name (via
 /// [`StyleIndex::lookup`]), including ones that would have lost at runtime. This is deliberate: it
 /// favours recall for navigation (offering more than one candidate `Location` is a legal, harmless
