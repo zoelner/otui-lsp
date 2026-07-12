@@ -69,7 +69,7 @@ use otui_core::OtuiService;
 
 use crate::position::{LineIndex, PositionEncoding};
 
-/// An open document's full text plus the version it was last synced at.
+/// An open document's full text, sync version and language.
 #[derive(Debug, Clone)]
 struct Document {
     /// The full document text, served back for pull-style requests (e.g. semantic tokens) and
@@ -77,6 +77,52 @@ struct Document {
     /// received text directly.
     text: String,
     version: i32,
+    /// This document's language, recorded from `didOpen`'s `languageId` — see
+    /// [`Backend::is_otui_document`], the single guard every OTUI-only handler checks before this
+    /// text is fed to the (OTUI-only) engine.
+    language: Language,
+}
+
+/// A document's language, used to gate OTUI-only behavior away from a `.lua` buffer.
+///
+/// The server is about to be registered, by the separate VS Code extension, for `.lua` documents
+/// too — so a Lua `getChildById('closeButton')` can jump to the paired `.otui`'s `id:`. Every
+/// OTUI-only surface (the analyzer above all: it would otherwise choke on perfectly valid Lua and
+/// shower every open Lua buffer with false `syntax-error`/`tab-indentation` diagnostics) must stay
+/// a strict no-op on a Lua document — those surfaces belong to the user's `lua-language-server`,
+/// and a second server answering them would produce duplicated or garbage entries beside the good
+/// ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Language {
+    /// An OTUI/OTML style/layout document: every existing behavior applies unchanged.
+    Otui,
+    /// A Lua script: every OTUI-only surface is a no-op here.
+    Lua,
+}
+
+impl Language {
+    /// Classify a `didOpen` `languageId`. Only `"lua"` is special-cased to [`Language::Lua`] —
+    /// this server has never required a particular `languageId` for an OTUI buffer (a client is
+    /// free to send `"otui"`, `"otml"`, or its own convention), so anything else defaults to
+    /// [`Language::Otui`], preserving today's behavior for every existing client.
+    fn from_language_id(language_id: &str) -> Self {
+        if language_id == "lua" {
+            Language::Lua
+        } else {
+            Language::Otui
+        }
+    }
+
+    /// Fall back to the URI's file extension. Used when a request names a document this server
+    /// has no recorded `languageId` for (never opened, or a handler that answers purely from
+    /// `params` without looking up the [`Document`] — see [`Backend::is_otui_document`]).
+    fn from_uri(uri: &Uri) -> Self {
+        if uri.as_str().ends_with(".lua") {
+            Language::Lua
+        } else {
+            Language::Otui
+        }
+    }
 }
 
 /// The LSP backend: holds the server→client message sender, the language engine, the negotiated
@@ -238,7 +284,18 @@ impl Backend {
     /// The single-threaded loop processes `did_open`/`did_change` to completion one at a time, so
     /// the version check here is belt-and-braces: it still discards diagnostics computed for an
     /// older `version` than the one currently stored for `uri`.
+    ///
+    /// (The OTUI-only language guard.) A `.lua` document is never analyzed here: the OTUI parser
+    /// would choke on perfectly valid Lua and shower the buffer with false
+    /// `syntax-error`/`tab-indentation` diagnostics, and unknown-property hints belong to the
+    /// user's `lua-language-server`, not us. An **empty** diagnostics array is still published —
+    /// a client needs it to clear anything stale (e.g. from before the buffer's `languageId` was
+    /// known to us) — it is only the analysis that is skipped.
     fn publish(&self, uri: Uri, text: &str, version: i32) {
+        if !self.is_otui_document(&uri) {
+            self.send_diagnostics(uri, Vec::new(), Some(version));
+            return;
+        }
         // Widget-aware diagnostics: the unknown-property check consults the workspace style + Lua
         // indexes so a Lua-added property is not wrongly hinted. With the indexes still empty (scan
         // not yet complete) this is identical to the catalog-only pass. The actual compute+send is
@@ -292,8 +349,9 @@ impl Backend {
             .set_document(DocId::from(uri.to_string()), defs);
     }
 
-    /// Record `uri`'s open buffer (`text`/`version`) and re-index its styles as one atomic
-    /// critical section, held under [`reindex_guard`](Self::reindex_guard).
+    /// Record `uri`'s open buffer (`text`/`version`/`language`) and, for an OTUI document,
+    /// re-index its styles — as one atomic critical section, held under
+    /// [`reindex_guard`](Self::reindex_guard).
     ///
     /// Shared by `did_open`/`did_change`. Taking the guard across BOTH the [`documents`](Self::documents)
     /// insert and the [`style_index`](Self::style_index) write closes the race with the background
@@ -301,7 +359,13 @@ impl Backend {
     /// can never observe "not open" and then overwrite this buffer's index entry with stale disk
     /// text. The individual data locks are still taken and released one at a time (never nested), and
     /// the guard is always the outermost lock, so the ordering stays deadlock-free.
-    fn set_open_document(&self, uri: &Uri, text: &str, version: i32) {
+    ///
+    /// (The OTUI-only language guard.) A `.lua` document is never fed to `style_defs`: that is the
+    /// same OTUI-only parser the analyzer uses, and running it over Lua source has no business
+    /// writing into the workspace `StyleIndex` — even a spurious empty entry is scope creep for a
+    /// document that was never meant to be indexed this way (`lua_index`, fed only from disk, is
+    /// the real workspace-wide Lua index; see its docs).
+    fn set_open_document(&self, uri: &Uri, text: &str, version: i32, language: Language) {
         let _guard = self.reindex_guard.lock().expect("reindex_guard poisoned");
         {
             let mut docs = self.documents.write().expect("documents lock poisoned");
@@ -310,10 +374,42 @@ impl Backend {
                 Document {
                     text: text.to_owned(),
                     version,
+                    language,
                 },
             );
         }
-        self.reindex_styles(uri, text);
+        if language == Language::Otui {
+            self.reindex_styles(uri, text);
+        }
+    }
+
+    /// This document's language: the recorded `languageId` for an open buffer, else a guess from
+    /// the URI's file extension (see [`Language::from_uri`]) for a document this server has no
+    /// open-buffer record of.
+    fn document_language(&self, uri: &Uri) -> Language {
+        self.documents
+            .read()
+            .expect("documents lock poisoned")
+            .get(uri)
+            .map(|doc| doc.language)
+            .unwrap_or_else(|| Language::from_uri(uri))
+    }
+
+    /// Whether `uri` is an OTUI document — the single guard every OTUI-only handler checks before
+    /// touching a document. See [`Language`] for why this exists and what it defends against.
+    fn is_otui_document(&self, uri: &Uri) -> bool {
+        self.document_language(uri) == Language::Otui
+    }
+
+    /// The stored text for `uri`, but only for an OTUI document: `None` for an unknown document
+    /// AND for a `.lua` one (the OTUI-only language guard). This is the seam nearly every
+    /// OTUI-only handler fetches its document text through, so gating it here — rather than
+    /// leaving each handler to remember an extra check — makes the guard structural: a new
+    /// handler that fetches its text this way is safe by construction.
+    fn otui_document_text(&self, uri: &Uri) -> Option<String> {
+        let docs = self.documents.read().expect("documents lock poisoned");
+        let doc = docs.get(uri)?;
+        (doc.language == Language::Otui).then(|| doc.text.clone())
     }
 
     /// The unified text view every span→range aggregator resolves against: the OPEN buffers overlaid
@@ -440,6 +536,7 @@ fn merge_documents(
     open: &HashMap<Uri, Document>,
     disk: &HashMap<Uri, String>,
 ) -> HashMap<Uri, Document> {
+    // `disk_texts` only ever caches `.otui` files (see its docs), so every entry here is OTUI.
     let mut merged: HashMap<Uri, Document> = disk
         .iter()
         .map(|(uri, text)| {
@@ -448,6 +545,7 @@ fn merge_documents(
                 Document {
                     text: text.clone(),
                     version: 0,
+                    language: Language::Otui,
                 },
             )
         })
@@ -1889,10 +1987,14 @@ impl Backend {
                 if shutdown.load(Ordering::Relaxed) {
                     return;
                 }
+                // (The OTUI-only language guard.) A `.lua` buffer never gets diagnostics from this
+                // server — the analyzer must never run over Lua text — so it is excluded from the
+                // refresh here too, not just in `Backend::publish`.
                 let open: Vec<(Uri, String, i32)> = documents
                     .read()
                     .expect("documents lock poisoned")
                     .iter()
+                    .filter(|(_, doc)| doc.language == Language::Otui)
                     .map(|(uri, doc)| (uri.clone(), doc.text.clone(), doc.version))
                     .collect();
                 if !open.is_empty() {
@@ -1985,13 +2087,10 @@ impl Backend {
 
     fn semantic_tokens_full(&self, params: SemanticTokensParams) -> Option<SemanticTokensResult> {
         let uri = params.text_document.uri;
-        // Serve from the stored document text; nothing to highlight for an unknown document.
-        let text = self
-            .documents
-            .read()
-            .expect("documents lock poisoned")
-            .get(&uri)
-            .map(|doc| doc.text.clone())?;
+        // Serve from the stored document text; nothing to highlight for an unknown document, and
+        // (the OTUI-only language guard) nothing for a `.lua` one either — semantic tokens for Lua
+        // belong to the user's `lua-language-server`.
+        let text = self.otui_document_text(&uri)?;
 
         let core_tokens = self.service.semantic_tokens(&text);
         let data = semantic::encode(&text, &core_tokens, self.encoding());
@@ -2004,13 +2103,9 @@ impl Backend {
 
     fn document_symbol(&self, params: DocumentSymbolParams) -> Option<DocumentSymbolResponse> {
         let uri = params.text_document.uri;
-        // Serve from the stored document text; an unknown document has no outline.
-        let text = self
-            .documents
-            .read()
-            .expect("documents lock poisoned")
-            .get(&uri)
-            .map(|doc| doc.text.clone())?;
+        // Serve from the stored document text; an unknown document has no outline, and (the
+        // OTUI-only language guard) neither does a `.lua` one — `lua-language-server` owns that.
+        let text = self.otui_document_text(&uri)?;
 
         let core_syms = self.service.document_symbols(&text);
         // Honor the client's negotiated shape: hierarchical clients get the nested outline;
@@ -2034,15 +2129,10 @@ impl Backend {
 
     fn document_color(&self, params: DocumentColorParams) -> Vec<ColorInformation> {
         let uri = params.text_document.uri;
-        // Serve from the stored document text; an unknown document has no colors. The request
-        // returns a plain `Vec` (not `Option`), so an unknown document is the empty vec.
-        let Some(text) = self
-            .documents
-            .read()
-            .expect("documents lock poisoned")
-            .get(&uri)
-            .map(|doc| doc.text.clone())
-        else {
+        // Serve from the stored document text; an unknown document has no colors, and (the
+        // OTUI-only language guard) neither does a `.lua` one — `lua-language-server` owns that.
+        // The request returns a plain `Vec` (not `Option`), so either case is the empty vec.
+        let Some(text) = self.otui_document_text(&uri) else {
             return Vec::new();
         };
 
@@ -2055,13 +2145,9 @@ impl Backend {
     /// on disk, so there are no dead links.
     fn document_link(&self, params: DocumentLinkParams) -> Option<Vec<DocumentLink>> {
         let uri = params.text_document.uri;
-        // Serve from the stored document text; an unknown document has no links.
-        let text = self
-            .documents
-            .read()
-            .expect("documents lock poisoned")
-            .get(&uri)
-            .map(|doc| doc.text.clone())?;
+        // Serve from the stored document text; an unknown document has no links, and (the
+        // OTUI-only language guard) neither does a `.lua` one.
+        let text = self.otui_document_text(&uri)?;
 
         // Only `file://` documents have a directory to resolve relative paths against.
         let doc_path = uri_to_file_path(&uri)?;
@@ -2104,6 +2190,12 @@ impl Backend {
     }
 
     fn color_presentation(&self, params: ColorPresentationParams) -> Vec<ColorPresentation> {
+        // (The OTUI-only language guard.) This handler never reads the document's text — it just
+        // renders `params.color` back as text — but a `.lua` buffer must still get no color
+        // presentations from us: `lua-language-server` owns that surface.
+        if !self.is_otui_document(&params.text_document.uri) {
+            return Vec::new();
+        }
         // The picked color, as engine `Rgba`. `range` is where the new text is inserted (the token
         // being replaced) — so each presentation carries a `TextEdit` over that range.
         let color = params.color;
@@ -2128,13 +2220,9 @@ impl Backend {
 
     fn folding_range(&self, params: FoldingRangeParams) -> Option<Vec<FoldingRange>> {
         let uri = params.text_document.uri;
-        // Serve from the stored document text; an unknown document has nothing to fold.
-        let text = self
-            .documents
-            .read()
-            .expect("documents lock poisoned")
-            .get(&uri)
-            .map(|doc| doc.text.clone())?;
+        // Serve from the stored document text; an unknown document has nothing to fold, and (the
+        // OTUI-only language guard) neither does a `.lua` one.
+        let text = self.otui_document_text(&uri)?;
 
         let folds = self.service.folding_ranges(&text);
         Some(convert::folds_to_lsp(&folds))
@@ -2145,14 +2233,10 @@ impl Backend {
         let position = params.text_document_position_params.position;
         let encoding = self.encoding();
 
-        // Read the request document's text (unknown document → nothing to resolve). Cloned so the
-        // documents lock is released before we take the index lock, keeping the two locks unnested.
-        let text = self
-            .documents
-            .read()
-            .expect("documents lock poisoned")
-            .get(&uri)
-            .map(|doc| doc.text.clone())?;
+        // Read the request document's text (unknown document → nothing to resolve; the OTUI-only
+        // language guard applies the same "nothing" to a `.lua` document — go-to-definition for Lua
+        // is a later node, and belongs to `lua-language-server` until then).
+        let text = self.otui_document_text(&uri)?;
 
         // Map the cursor Position to a byte offset, then classify the token under it.
         let offset = LineIndex::new(&text).offset_at(position, encoding);
@@ -2172,14 +2256,9 @@ impl Backend {
         let position = params.text_document_position_params.position;
         let encoding = self.encoding();
 
-        // Read the request document's text (unknown document → nothing to resolve). Cloned so the
-        // documents lock is released before we take it again for aggregation.
-        let text = self
-            .documents
-            .read()
-            .expect("documents lock poisoned")
-            .get(&uri)
-            .map(|doc| doc.text.clone())?;
+        // Read the request document's text (unknown document → nothing to resolve; the OTUI-only
+        // language guard applies the same "nothing" to a `.lua` document).
+        let text = self.otui_document_text(&uri)?;
 
         // Classify the symbol under the cursor into the style name it is an instance of / declares.
         let offset = LineIndex::new(&text).offset_at(position, encoding);
@@ -2200,14 +2279,9 @@ impl Backend {
         let position = params.text_document_position_params.position;
         let encoding = self.encoding();
 
-        // Read the request document's text (unknown document → nothing to resolve). Cloned so the
-        // documents lock is released before we take it again for aggregation.
-        let text = self
-            .documents
-            .read()
-            .expect("documents lock poisoned")
-            .get(&uri)
-            .map(|doc| doc.text.clone())?;
+        // Read the request document's text (unknown document → nothing to resolve; the OTUI-only
+        // language guard applies the same "nothing" to a `.lua` document).
+        let text = self.otui_document_text(&uri)?;
 
         // Classify the style name under the cursor (a header name/base, or a widget instance treated
         // as its type); implementation lists who derives from that name.
@@ -2233,14 +2307,9 @@ impl Backend {
         let position = params.text_document_position_params.position;
         let encoding = self.encoding();
 
-        // Read the request document's text (unknown document → nothing to root on). Cloned so the
-        // documents lock is released before we take it again for aggregation.
-        let text = self
-            .documents
-            .read()
-            .expect("documents lock poisoned")
-            .get(&uri)
-            .map(|doc| doc.text.clone())?;
+        // Read the request document's text (unknown document → nothing to root on; the OTUI-only
+        // language guard applies the same "nothing" to a `.lua` document).
+        let text = self.otui_document_text(&uri)?;
 
         // Classify the symbol under the cursor into the style name it is an instance of / declares.
         let offset = LineIndex::new(&text).offset_at(position, encoding);
@@ -2282,14 +2351,9 @@ impl Backend {
         let include_declaration = params.context.include_declaration;
         let encoding = self.encoding();
 
-        // Read the request document's text (unknown document → nothing to resolve). Cloned so the
-        // documents lock is released before we take the index lock, keeping the two locks unnested.
-        let text = self
-            .documents
-            .read()
-            .expect("documents lock poisoned")
-            .get(&uri)
-            .map(|doc| doc.text.clone())?;
+        // Read the request document's text (unknown document → nothing to resolve; the OTUI-only
+        // language guard applies the same "nothing" to a `.lua` document).
+        let text = self.otui_document_text(&uri)?;
 
         // Map the cursor Position to a byte offset, then classify what it is on. A cursor on neither
         // a style name nor an id has no references.
@@ -2319,14 +2383,10 @@ impl Backend {
         let position = params.text_document_position_params.position;
         let encoding = self.encoding();
 
-        // Read the request document's text (unknown document → nothing to highlight). Highlights are
+        // Read the request document's text (unknown document → nothing to highlight; the OTUI-only
+        // language guard applies the same "nothing" to a `.lua` document). Highlights are
         // document-local, so only this buffer's text is ever needed — no merged view, no index.
-        let text = self
-            .documents
-            .read()
-            .expect("documents lock poisoned")
-            .get(&uri)
-            .map(|doc| doc.text.clone())?;
+        let text = self.otui_document_text(&uri)?;
 
         // Map the cursor Position to a byte offset, then classify what it is on (the SAME classifier
         // references/rename use, so the three features agree on what a symbol is). A cursor on neither
@@ -2347,14 +2407,9 @@ impl Backend {
         let position = params.position;
         let encoding = self.encoding();
 
-        // Read the request document's text (unknown document → not renameable). Cloned so the
-        // documents lock is released before we take the index lock, keeping the two locks unnested.
-        let text = self
-            .documents
-            .read()
-            .expect("documents lock poisoned")
-            .get(&uri)
-            .map(|doc| doc.text.clone())?;
+        // Read the request document's text (unknown document → not renameable; the OTUI-only
+        // language guard applies the same "not renameable" to a `.lua` document).
+        let text = self.otui_document_text(&uri)?;
 
         // Map the cursor Position to a byte offset, then classify the token under it. A cursor on
         // neither a style name nor an id is not renameable here → `None`.
@@ -2382,15 +2437,9 @@ impl Backend {
         let new_name = params.new_name;
         let encoding = self.encoding();
 
-        // Read the request document's text (unknown document → nothing to rename). Cloned so the
-        // documents lock is released before we take the index lock, keeping the two locks unnested.
-        let Some(text) = self
-            .documents
-            .read()
-            .expect("documents lock poisoned")
-            .get(&uri)
-            .map(|doc| doc.text.clone())
-        else {
+        // Read the request document's text (unknown document → nothing to rename; the OTUI-only
+        // language guard applies the same "nothing" to a `.lua` document).
+        let Some(text) = self.otui_document_text(&uri) else {
             return Ok(None);
         };
 
@@ -2432,14 +2481,9 @@ impl Backend {
         let position = params.text_document_position_params.position;
         let encoding = self.encoding();
 
-        // Read the request document's text (unknown document → nothing to hover). Cloned so the
-        // documents lock is released before we take the index lock, keeping the two locks unnested.
-        let text = self
-            .documents
-            .read()
-            .expect("documents lock poisoned")
-            .get(&uri)
-            .map(|doc| doc.text.clone())?;
+        // Read the request document's text (unknown document → nothing to hover; the OTUI-only
+        // language guard applies the same "nothing" to a `.lua` document).
+        let text = self.otui_document_text(&uri)?;
 
         // Map the cursor Position to a byte offset, then let the engine describe the token under it,
         // resolving against the workspace index. Only the current doc's LineIndex is needed to map
@@ -2462,13 +2506,9 @@ impl Backend {
         let position = params.text_document_position.position;
         let encoding = self.encoding();
 
-        // Serve from the stored document text; an unknown document has nothing to complete.
-        let text = self
-            .documents
-            .read()
-            .expect("documents lock poisoned")
-            .get(&uri)
-            .map(|doc| doc.text.clone())?;
+        // Serve from the stored document text; an unknown document has nothing to complete, and
+        // (the OTUI-only language guard) neither does a `.lua` one.
+        let text = self.otui_document_text(&uri)?;
 
         // Map the cursor Position to a byte offset, then ask the engine (widget-aware, so a `UITable`
         // offers its Lua-added `column-style` etc.) for the set that applies. An empty list is a
@@ -2492,13 +2532,9 @@ impl Backend {
         let uri = params.text_document.uri;
         let encoding = self.encoding();
 
-        // Serve from the stored document text; an unknown document has nothing to fix.
-        let text = self
-            .documents
-            .read()
-            .expect("documents lock poisoned")
-            .get(&uri)
-            .map(|doc| doc.text.clone())?;
+        // Serve from the stored document text; an unknown document has nothing to fix, and (the
+        // OTUI-only language guard) neither does a `.lua` one.
+        let text = self.otui_document_text(&uri)?;
 
         // Map the requested LSP range to a byte span, then let the engine compute the fixes that
         // overlap it. An empty list is a valid answer (nothing fixable here); return it as such.
@@ -2522,13 +2558,10 @@ impl Backend {
         let uri = params.text_document.uri;
         let encoding = self.encoding();
 
-        // Serve from the stored document text; an unknown document has nothing to format.
-        let text = self
-            .documents
-            .read()
-            .expect("documents lock poisoned")
-            .get(&uri)
-            .map(|doc| doc.text.clone())?;
+        // Serve from the stored document text; an unknown document has nothing to format, and
+        // (the OTUI-only language guard) neither does a `.lua` one — `lua-language-server` owns
+        // that surface.
+        let text = self.otui_document_text(&uri)?;
 
         // Ask the engine to format. `None` means the document does not parse cleanly (parse error /
         // `ERROR`/`MISSING` node); per the safety gate we then return no edits. Otherwise reply with
@@ -2543,13 +2576,9 @@ impl Backend {
         let uri = params.text_document.uri;
         let encoding = self.encoding();
 
-        // Serve from the stored document text; an unknown document has nothing to format.
-        let text = self
-            .documents
-            .read()
-            .expect("documents lock poisoned")
-            .get(&uri)
-            .map(|doc| doc.text.clone())?;
+        // Serve from the stored document text; an unknown document has nothing to format, and
+        // (the OTUI-only language guard) neither does a `.lua` one.
+        let text = self.otui_document_text(&uri)?;
 
         // LSP ranges are END-EXCLUSIVE, but `format_line_edits` takes an INCLUSIVE end line. A
         // selection that ends at `{ line: M, character: 0 }` (the shape editors produce when the
@@ -2617,13 +2646,9 @@ impl Backend {
         let encoding = self.encoding();
 
         // Serve from the stored document text; an unknown (not open) document has nothing to
-        // format, matching every other formatting handler.
-        let text = self
-            .documents
-            .read()
-            .expect("documents lock poisoned")
-            .get(&uri)
-            .map(|doc| doc.text.clone())?;
+        // format, matching every other formatting handler — and (the OTUI-only language guard)
+        // neither does a `.lua` one.
+        let text = self.otui_document_text(&uri)?;
 
         let line = params.text_document_position.position.line;
 
@@ -2663,9 +2688,14 @@ impl Backend {
         let doc = params.text_document;
         let uri = doc.uri;
         let version = doc.version;
-        // Insert the buffer and re-index atomically w.r.t. the background scan (see
-        // `set_open_document`), so a scan in flight cannot clobber this open buffer's index entry.
-        self.set_open_document(&uri, &doc.text, version);
+        // The one place a document's language is learned from the client: `didOpen`'s
+        // `languageId` (see `Language::from_language_id`), preferred over the URI-extension
+        // fallback every other call site uses.
+        let language = Language::from_language_id(&doc.language_id);
+        // Insert the buffer and (for an OTUI document) re-index atomically w.r.t. the background
+        // scan (see `set_open_document`), so a scan in flight cannot clobber this open buffer's
+        // index entry.
+        self.set_open_document(&uri, &doc.text, version, language);
         self.publish(uri, &doc.text, version);
     }
 
@@ -2677,17 +2707,34 @@ impl Backend {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
         let text = change.text;
+        // `didChange` carries no `languageId`, so keep whatever `didOpen` recorded for this URI
+        // (falling back to the URI extension if, somehow, we never saw an open for it).
+        let language = self.document_language(&uri);
         // Same atomic buffer-insert + re-index as `did_open` (see `set_open_document`).
-        self.set_open_document(&uri, &text, version);
+        self.set_open_document(&uri, &text, version, language);
         self.publish(uri, &text, version);
     }
 
     fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
-        {
+        let language = {
             let mut docs = self.documents.write().expect("documents lock poisoned");
-            docs.remove(&uri);
+            docs.remove(&uri)
+                .map(|doc| doc.language)
+                .unwrap_or_else(|| Language::from_uri(&uri))
+        };
+        // Clear diagnostics for the closed document either way — a client needs it to clear
+        // anything stale, whatever the language.
+        self.send_diagnostics(uri.clone(), Vec::new(), None);
+
+        // (The OTUI-only language guard.) A `.lua` document was never fed into the OTUI
+        // `StyleIndex` on open (`set_open_document` skips it), so there is nothing OTUI-specific
+        // to re-sync from disk here either — closing it is a pure no-op beyond the diagnostics
+        // clear above.
+        if language != Language::Otui {
+            return;
         }
+
         // Semantics change (workspace index): closing a file no longer drops it from the index.
         // Under open-only indexing that was correct; now a closed `.otui` still lives on disk and
         // must stay indexed as a closed file. Re-read it from disk (inline — the single-threaded loop
@@ -2702,8 +2749,6 @@ impl Backend {
             Some(text) => self.index_from_disk(&uri, text),
             None => self.deindex(&uri),
         }
-        // Clear diagnostics for the closed document.
-        self.send_diagnostics(uri, Vec::new(), None);
     }
 }
 
@@ -2986,6 +3031,7 @@ mod tests {
             Document {
                 text: text.to_owned(),
                 version: 0,
+                language: Language::Otui,
             },
         );
         let response = backend
@@ -3008,6 +3054,7 @@ mod tests {
             Document {
                 text: text.to_owned(),
                 version: 0,
+                language: Language::Otui,
             },
         );
         let response = backend
@@ -3038,6 +3085,7 @@ mod tests {
                 Document {
                     text: (*text).to_owned(),
                     version: 1,
+                    language: Language::Otui,
                 },
             );
         }
@@ -3068,6 +3116,7 @@ mod tests {
             Document {
                 text: "Buffer < UIWidget\n".to_owned(),
                 version: 7,
+                language: Language::Otui,
             },
         );
         let mut disk = HashMap::new();
@@ -3103,6 +3152,7 @@ mod tests {
             Document {
                 text: "Open < UIWidget\n".to_owned(),
                 version: 1,
+                language: Language::Otui,
             },
         );
         let mut disk = HashMap::new();
@@ -3126,6 +3176,7 @@ mod tests {
             Document {
                 text: "Child < MyPanel\n".to_owned(),
                 version: 1,
+                language: Language::Otui,
             },
         );
         let documents = merge_documents(&open, &disk);
@@ -3170,6 +3221,7 @@ mod tests {
             Document {
                 text: "Child < MyPanel\n".to_owned(),
                 version: 1,
+                language: Language::Otui,
             },
         );
         let documents = merge_documents(&open, &disk);
@@ -3209,6 +3261,7 @@ mod tests {
             Document {
                 text: "New < UIWidget\n".to_owned(),
                 version: 2,
+                language: Language::Otui,
             },
         );
         // The index reflects the open buffer (as did_open would have re-indexed it).
@@ -3226,6 +3279,246 @@ mod tests {
         );
         assert!(
             resolve_base_definition(&index, &documents, "Old", PositionEncoding::Utf16).is_none()
+        );
+    }
+
+    /// Build the `DidOpenTextDocumentParams` for `uri`/`text` with the given `languageId`.
+    fn did_open_params(uri: &Uri, language_id: &str, text: &str) -> DidOpenTextDocumentParams {
+        use lsp_types::TextDocumentItem;
+        DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.clone(),
+                language_id: language_id.to_owned(),
+                version: 1,
+                text: text.to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn opening_a_lua_document_publishes_empty_diagnostics_never_running_the_otui_analyzer() {
+        // Real Lua the OTUI analyzer would flag hard if it (wrongly) ran over it: tab
+        // indentation is a hard error (`tab-indentation`) per spec, and the shape isn't valid
+        // OTUI either.
+        let text = "local x = 1\n\tif x then\n\t\tprint('hi')\n\tend\n";
+        // Sanity check on the fixture itself (not the guard): prove the OTUI analyzer really
+        // would flag this text if it ever ran over it, so the assertion below is not vacuous.
+        let sanity_diags = OtuiService::new().diagnostics(text);
+        assert!(
+            sanity_diags.iter().any(|d| d.code == "tab-indentation"),
+            "fixture must trip the OTUI analyzer directly: {sanity_diags:?}"
+        );
+
+        let uri = Uri::from_str("file:///ws/widget.lua").expect("uri");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let backend = Backend::new(tx, &InitializeParams::default());
+        backend.did_open(did_open_params(&uri, "lua", text));
+
+        // A `publishDiagnostics` notification must still have gone out (a client needs it to
+        // clear anything stale) — but with an empty diagnostics array, never the OTUI codes the
+        // fixture would trip.
+        let mut published = None;
+        while let Ok(msg) = rx.try_recv() {
+            if let Message::Notification(note) = msg {
+                if note.method == "textDocument/publishDiagnostics" {
+                    let params: PublishDiagnosticsParams =
+                        serde_json::from_value(note.params).expect("diagnostics params");
+                    if params.uri == uri {
+                        published = Some(params.diagnostics);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            published,
+            Some(Vec::new()),
+            "a .lua document must still get an (empty) publishDiagnostics"
+        );
+    }
+
+    #[test]
+    fn every_otui_only_handler_is_a_no_op_for_a_lua_document() {
+        use lsp_types::{
+            CodeActionContext, Color, ColorPresentationParams, FormattingOptions,
+            PartialResultParams, Position, Range, ReferenceContext, TextDocumentIdentifier,
+            TextDocumentPositionParams, WorkDoneProgressParams,
+        };
+
+        let uri = Uri::from_str("file:///ws/widget.lua").expect("uri");
+        let text = "local x = 1\nfunction f() end\n";
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let backend = Backend::new(tx, &InitializeParams::default());
+        backend.did_open(did_open_params(&uri, "lua", text));
+
+        let position = Position::new(0, 0);
+        let text_document = TextDocumentIdentifier { uri: uri.clone() };
+        let text_document_position = TextDocumentPositionParams {
+            text_document: text_document.clone(),
+            position,
+        };
+        let range = Range {
+            start: position,
+            end: position,
+        };
+
+        assert!(backend
+            .semantic_tokens_full(SemanticTokensParams {
+                text_document: text_document.clone(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .is_none());
+        assert!(backend
+            .document_symbol(DocumentSymbolParams {
+                text_document: text_document.clone(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .is_none());
+        assert!(backend
+            .document_color(DocumentColorParams {
+                text_document: text_document.clone(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .is_empty());
+        assert!(backend.document_link(link_params(&uri)).is_none());
+        assert!(backend
+            .color_presentation(ColorPresentationParams {
+                text_document: text_document.clone(),
+                color: Color {
+                    red: 1.0,
+                    green: 1.0,
+                    blue: 1.0,
+                    alpha: 1.0,
+                },
+                range,
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .is_empty());
+        assert!(backend
+            .folding_range(FoldingRangeParams {
+                text_document: text_document.clone(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .is_none());
+        assert!(backend
+            .goto_definition(GotoDefinitionParams {
+                text_document_position_params: text_document_position.clone(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .is_none());
+        assert!(backend
+            .goto_type_definition(GotoTypeDefinitionParams {
+                text_document_position_params: text_document_position.clone(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .is_none());
+        assert!(backend
+            .goto_implementation(GotoImplementationParams {
+                text_document_position_params: text_document_position.clone(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .is_none());
+        assert!(backend
+            .prepare_type_hierarchy(TypeHierarchyPrepareParams {
+                text_document_position_params: text_document_position.clone(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .is_none());
+        assert!(backend
+            .references(ReferenceParams {
+                text_document_position: text_document_position.clone(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+                context: ReferenceContext {
+                    include_declaration: true,
+                },
+            })
+            .is_none());
+        assert!(backend
+            .document_highlight(DocumentHighlightParams {
+                text_document_position_params: text_document_position.clone(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .is_none());
+        assert!(backend
+            .prepare_rename(text_document_position.clone())
+            .is_none());
+        assert_eq!(
+            backend.rename(RenameParams {
+                text_document_position: text_document_position.clone(),
+                new_name: "Renamed".to_owned(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            }),
+            Ok(None)
+        );
+        assert!(backend
+            .hover(HoverParams {
+                text_document_position_params: text_document_position.clone(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .is_none());
+        assert!(backend
+            .completion(completion_params(&uri, position))
+            .is_none());
+        assert!(backend
+            .code_action(CodeActionParams {
+                text_document: text_document.clone(),
+                range,
+                context: CodeActionContext::default(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .is_none());
+        assert!(backend
+            .formatting(DocumentFormattingParams {
+                text_document: text_document.clone(),
+                options: FormattingOptions::default(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .is_none());
+        assert!(backend
+            .range_formatting(range_formatting_params(&uri, range))
+            .is_none());
+        assert!(backend
+            .on_type_formatting(on_type_formatting_params(&uri, position, "\n"))
+            .is_none());
+    }
+
+    #[test]
+    fn an_otui_document_is_unaffected_by_the_language_guard() {
+        // The `didOpen`-carried `languageId` for an ordinary `.otui` document must not change
+        // any existing behavior: diagnostics still get computed and published, and a handler
+        // (hover, here) still answers normally.
+        let uri = Uri::from_str("file:///ws/win.otui").expect("uri");
+        let text = "Panel\n\twidth: 10\n"; // tab indentation: a real, expected diagnostic
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let backend = Backend::new(tx, &InitializeParams::default());
+        backend.did_open(did_open_params(&uri, "otui", text));
+
+        let codes = drain_diagnostic_codes(&rx, &uri);
+        assert!(
+            codes.contains(&"tab-indentation".to_owned()),
+            "an .otui document must still be analyzed: {codes:?}"
+        );
+
+        let hover = backend.hover(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                position: Position::new(0, 2),
+            },
+            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+        });
+        assert!(
+            hover.is_some(),
+            "hover must still answer for an .otui document"
         );
     }
 
@@ -3390,6 +3683,7 @@ end
             Document {
                 text: text.to_owned(),
                 version: 1,
+                language: Language::Otui,
             },
         );
 
@@ -3468,6 +3762,7 @@ end
             Document {
                 text: "Table < UITable\n  column-style: SomeColumn\n".to_owned(),
                 version: 1,
+                language: Language::Otui,
             },
         );
 
@@ -4860,6 +5155,7 @@ end
             Document {
                 text: text.to_owned(),
                 version: 0,
+                language: Language::Otui,
             },
         );
         backend
