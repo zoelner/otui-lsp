@@ -21,7 +21,12 @@
 //!    value-validating properties of spec §2.10: `border`, `display`, `layout`, `anchors.*`), and an
 //!    unknown ordinary property name ([`UNKNOWN_PROPERTY`], a *hint* — the engine silently *ignores*
 //!    a tag it does not recognize, so a misspelled/unknown property never errors, it just has no
-//!    effect).
+//!    effect). The same pass also flags a purely **structural** ordering mistake that needs no
+//!    schema lookup at all: a plain property declared after a child widget in the same body
+//!    ([`PROPERTY_AFTER_CHILD`], a *hint* — `UIManager::createWidgetFromOTML` applies every property
+//!    of a node before creating any of its children, so the textual order is semantically
+//!    irrelevant to the engine; a `$state` selector block is exempt, since it idiomatically reads
+//!    last).
 //! 4. A **style-resolution** pass over the top-level nodes only ([`UNKNOWN_BASE`], a *warning*, and
 //!    [`UNKNOWN_ROOT_STYLE`], an *error*). This one is **workspace-aware**: it needs the
 //!    [`WidgetContext`] and therefore fires only under [`analyze_with_widgets`] — plain [`analyze`]
@@ -55,6 +60,15 @@ pub const UNKNOWN_STATE: &str = "unknown-state";
 /// of the six anchor edges (spec §2.4). Severity [`Severity::Error`]: `anchors.*` is one of the
 /// four *value-validating* properties (spec §2.10), so the engine throws on a bad edge.
 pub const INVALID_ANCHOR_EDGE: &str = "invalid-anchor-edge";
+
+/// Diagnostic code: an ordinary property declared textually *after* a child widget within the same
+/// body. Severity [`Severity::Hint`]: in `UIManager::createWidgetFromOTML` (`uimanager.cpp:706`) the
+/// widget applies **every** property of its own style node (`widget->setStyleFromNode`) before it
+/// creates any of its children — the property's position relative to a child widget changes nothing
+/// at runtime, so this is a readability rule, not something the engine cares about. A `$state`
+/// selector block (`$on:`, `$hover:`, …) is exempt: it is a conditional override that idiomatically
+/// reads last, so it never triggers this hint no matter where it sits.
+pub const PROPERTY_AFTER_CHILD: &str = "property-after-child";
 
 /// An `anchors.*` on a widget whose parent explicitly uses a non-anchor layout
 /// (`layout: horizontalBox` / `verticalBox` / `grid`).
@@ -354,6 +368,10 @@ fn collect_semantic_diagnostics<'a>(
     ctx: Option<&WidgetContext>,
     out: &mut Vec<Diagnostic>,
 ) {
+    // Purely structural, needs no schema/catalog lookup, so it runs unconditionally over every
+    // node's own immediate children before the kind-specific checks below. See
+    // `check_property_after_child` for the ordering rule.
+    check_property_after_child(node, out);
     match node.kind() {
         "state_selector" => check_state_selector(node, source, out),
         "anchor_property" => check_anchor_property(node, source, out),
@@ -400,6 +418,85 @@ fn collect_semantic_diagnostics<'a>(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_semantic_diagnostics(child, source, child_enclosing, ctx, out);
+    }
+}
+
+/// Flag every plain `property` sibling that follows a `container` (child widget) among `node`'s own
+/// **direct** named children — the ordering mistake of spec's readability rule, see
+/// [`PROPERTY_AFTER_CHILD`].
+///
+/// The grammar's `_block` is a hidden rule, so a widget body's statements (properties, child
+/// widgets, `$state` blocks, …) are direct children of the owning `container` / `style_header` node
+/// — and likewise for any other node that owns a block (a `state_selector`, or a `property` with a
+/// nested block such as `layout:`). Calling this once per node, over that node's own children only,
+/// therefore covers every block in the tree exactly once: "reset per block" falls out naturally from
+/// each call starting its own fresh `seen_child`, independent of its caller's.
+///
+/// Only the `property` kind is flagged, and the rule only runs inside a widget body (a `container` or
+/// a `style_header`) — see the allowlist in the body for the three places a bare tag is *not* a child
+/// widget.
+///
+/// Two deliberate exemptions, both of which would otherwise be noisy false positives:
+///
+/// * A `state_selector` (`$state` block) is a distinct node kind and is never flagged even when it
+///   textually follows a child — a `$state` block is a conditional override that idiomatically reads
+///   last (spec §2.8), and it is 14 of the 18 occurrences in the engine corpus.
+/// * An `id_property`, `anchor_property`, `event_property`, `alias_property` or `expr_property`
+///   (`id:`, `anchors.*`, `@event`, `&alias`, `!expr`) after a child is **also** not flagged: each is
+///   its own grammar kind, not `property`. This is a deliberate under-approximation — it occurs zero
+///   times in the engine corpus, so it costs no real coverage, and widening the rule is only worth
+///   doing if a real case ever turns up.
+///
+/// Scanning **stops** at the first `ERROR`/`MISSING` sibling. A malformed line (already reported by
+/// [`collect_structural_errors`] as its own [`SYNTAX_ERROR`]) can throw the parser into error
+/// recovery, which sometimes synthesizes a bogus `container` node out of the wreckage of the
+/// following text — that recovery artifact is not a real child widget, and everything after it in
+/// this block is unreliable to classify, so we do not pile a readability hint on top of a syntax
+/// error.
+fn check_property_after_child(node: Node<'_>, out: &mut Vec<Diagnostic>) {
+    // Only a **widget's own body** can contain "a property after a child widget". A widget is spelled
+    // two ways — a bare tag (`Button`, a `container`) or a tag with an inline base
+    // (`Label < UILabel`, a `style_header`) — and those two kinds are the only blocks whose bare-tag
+    // children the engine actually instantiates. Everywhere else, a bare tag means something else
+    // entirely and this rule does not apply:
+    //
+    // * the **document root**, which has no widget body: a `Name < Base` there is a style
+    //   *declaration* (spec §2.2), and a stray root-level property is a different error altogether;
+    // * a **`$state` block** (`$on:`): the line carries a `:`, so `OTMLParser` marks the node
+    //   *unique* (`otmlparser.cpp:435`), and `createWidgetFromOTML`'s `if (!childNode->isUnique())`
+    //   child loop never descends into it — a tag in there instantiates nothing;
+    // * a **data block** (`options:` with bare-tag entries), whose children are values read from Lua
+    //   via `pairs(styleNode.options)`, not widgets.
+    //
+    // Emitting the hint in any of those would state something false ("the engine applies all
+    // properties before creating any children") about nodes that are not children at all. So this is
+    // an allowlist, never a denylist.
+    if !matches!(node.kind(), "container" | "style_header") {
+        return;
+    }
+    let mut cursor = node.walk();
+    let mut seen_child = false;
+    for child in node.named_children(&mut cursor) {
+        if child.is_error() || child.is_missing() {
+            break;
+        }
+        match child.kind() {
+            "container" | "style_header" => seen_child = true,
+            "property" if seen_child => {
+                if let Some(key) = child.child_by_field_name("key") {
+                    out.push(Diagnostic {
+                        severity: Severity::Hint,
+                        code: PROPERTY_AFTER_CHILD,
+                        message: "property declared after a child widget: the engine applies all \
+                                  of a widget's properties before creating any of its children, so \
+                                  this has no effect on behavior — purely a readability issue"
+                            .to_owned(),
+                        span: SyntaxTree::span_of(key),
+                    });
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1386,6 +1483,190 @@ Panel
         // style parser, so neither is in the base catalog — but both are perfectly valid.
         assert!(analyze("SpinBox < TextEdit\n  __class: UISpinBox\n").is_empty());
         assert!(analyze("Win < UIWindow\n  __unique: true\n").is_empty());
+    }
+
+    // --- semantic pass: property after child (hint) --------------------------------------------
+
+    #[test]
+    fn property_after_a_child_widget_is_a_hint_on_the_key() {
+        let src = "\
+Panel
+  Button
+    id: ok
+  margin-bottom: 3
+";
+        let diags = analyze(src);
+        let d = only(&diags, PROPERTY_AFTER_CHILD);
+        assert_eq!(d.severity, Severity::Hint);
+        assert_eq!(&src[d.span.start..d.span.end], "margin-bottom");
+    }
+
+    #[test]
+    fn property_before_a_child_widget_is_silent() {
+        let src = "\
+Panel
+  margin-bottom: 3
+  Button
+    id: ok
+";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != PROPERTY_AFTER_CHILD),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_bare_tag_at_the_document_root_is_not_a_child_widget() {
+        // The document root has no widget body. A root-level `container` is the file's main widget
+        // instance, not somebody's child, and a stray root-level property is a different mistake
+        // entirely. Emitting the ordering hint here would assert something false about the engine.
+        let src = "\
+MainWindow
+  id: x
+stray: value
+";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != PROPERTY_AFTER_CHILD),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_tag_inside_a_state_block_is_not_a_child_widget() {
+        // `$on:` carries a `:`, so `OTMLParser` marks the node unique (otmlparser.cpp:435) and
+        // `createWidgetFromOTML`'s `if (!childNode->isUnique())` loop never descends into it — a tag
+        // in there instantiates no widget at all. So a property following it is not "after a child",
+        // and the hint's message ("the engine applies all properties before creating any children")
+        // would be a false statement about nodes that are not children.
+        let src = "\
+Panel
+  $on:
+    Button
+    color: red
+";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != PROPERTY_AFTER_CHILD),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_child_declared_with_an_explicit_base_also_counts_as_a_child() {
+        // A child widget has two spellings: a bare tag (`Button`) and a tag with an inline base
+        // (`Label < UILabel`). The grammar gives the second one the `style_header` kind, not
+        // `container` — so an implementation that only watches for `container` silently misses
+        // every property that follows a based child. It did, until this test.
+        let src = "\
+MainWindow < UIWindow
+  Label < UILabel
+    id: title
+  margin-bottom: 3
+";
+        let diags = analyze(src);
+        let d = only(&diags, PROPERTY_AFTER_CHILD);
+        assert_eq!(d.severity, Severity::Hint);
+        assert_eq!(&src[d.span.start..d.span.end], "margin-bottom");
+    }
+
+    #[test]
+    fn a_top_level_style_declaration_is_not_a_child_widget() {
+        // The flip side of the rule above: at the document root, `Name < Base` is a style
+        // *declaration* (spec §2.2), not a child of anything. Marking it as "a child was seen"
+        // would make every subsequent top-level node look like a misordered property.
+        let src = "\
+Button < UIButton
+  color: red
+
+Label < UILabel
+  color: blue
+";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != PROPERTY_AFTER_CHILD),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_state_block_after_a_child_widget_is_silent() {
+        // The important case: a `$state` selector block is a conditional override that
+        // idiomatically reads last, not a readability mistake — it must never trigger the hint,
+        // even though it textually follows the child (this is 14/18 of the corpus occurrences).
+        let src = "\
+Panel
+  Button
+    id: ok
+  $on:
+    color: red
+";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != PROPERTY_AFTER_CHILD),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn nested_blocks_reset_the_seen_child_flag_independently() {
+        // Both the outer widget (Panel) and the inner one (Button) have a property after their own
+        // child — each block tracks its own "seen a child" state, so both fire independently.
+        let src = "\
+Panel
+  Button
+    id: ok
+    Label
+    icon-color: red
+  margin-bottom: 3
+";
+        let diags = analyze(src);
+        let flagged: Vec<&str> = diags
+            .iter()
+            .filter(|d| d.code == PROPERTY_AFTER_CHILD)
+            .map(|d| &src[d.span.start..d.span.end])
+            .collect();
+        assert_eq!(flagged, vec!["icon-color", "margin-bottom"], "{diags:?}");
+    }
+
+    #[test]
+    fn a_widget_with_no_children_is_silent() {
+        let src = "\
+Panel
+  id: main
+  margin-bottom: 3
+";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != PROPERTY_AFTER_CHILD),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_line_never_synthesizes_a_bogus_child_widget() {
+        // Regression, found on the real corpus (`data/styles/30-calendar.otui`): a colon typo
+        // (`anchors:top:` instead of `anchors.top:`) throws the parser into error recovery, which
+        // can synthesize a bogus `container` node out of the wreckage of the rest of the line. That
+        // recovery artifact is not a real child widget — every property after it in this block must
+        // stay silent, on top of the syntax-error already reported for the malformed line itself.
+        let src = "\
+Label
+  id: day
+  anchors:top: parent.top
+  height: 15
+  text-align: topleft
+";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != PROPERTY_AFTER_CHILD),
+            "{diags:?}"
+        );
+        assert!(
+            diags.iter().any(|d| d.code == SYNTAX_ERROR),
+            "the malformed line itself must still be a syntax error: {diags:?}"
+        );
     }
 
     // --- semantic pass: anchor vs the parent's layout ------------------------------------------
