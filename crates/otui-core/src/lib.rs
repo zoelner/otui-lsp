@@ -9,8 +9,9 @@
 //! `docs/otui-language-service-spec.md`. The [`syntax`] tree-sitter substrate underpins every
 //! feature module: [`diagnostics`], [`completion`], [`hover`], [`property_hover`], [`symbols`],
 //! [`navigation`], [`references`], [`hierarchy`], [`format`], [`indent`], [`folding`], [`semantic`],
-//! [`colors`], [`links`], [`fixes`], plus the workspace-index building blocks ([`style_index`], [`lua_widgets`],
-//! [`widget_resolve`]) and the engine data ([`schema`], [`catalog`]). The [`LanguageService`] trait
+//! [`colors`], [`links`], [`fixes`], plus the workspace-index building blocks ([`style_index`],
+//! [`lua_widgets`], [`lua_refs`], [`widget_resolve`]) and the engine data ([`schema`], [`catalog`]).
+//! The [`LanguageService`] trait
 //! and the inherent [`OtuiService`] methods below are the entry points the server drives.
 
 pub mod catalog;
@@ -24,6 +25,7 @@ pub mod hierarchy;
 pub mod hover;
 pub mod indent;
 pub mod links;
+pub mod lua_refs;
 pub mod lua_widgets;
 pub mod navigation;
 pub mod property_hover;
@@ -41,6 +43,7 @@ use hover::StyleHover;
 use lang_api::{
     ByteSpan, CompletionItem, Diagnostic, DocumentSymbol, LanguageService, SemanticToken,
 };
+use lua_refs::{LuaIdDef, LuaIdRef};
 use lua_widgets::{LuaWidgetDef, LuaWidgetIndex};
 use navigation::{BaseRef, IdRef, StyleHeaderRef};
 use references::{IdOccurrences, StyleNameOccurrences};
@@ -82,6 +85,27 @@ impl OtuiService {
     #[must_use]
     pub fn lua_widgets(&self, source: &str) -> Vec<LuaWidgetDef> {
         lua_widgets::scan_widgets(source)
+    }
+
+    /// Find every place a single **Lua** module refers to a widget `id:` (spec §2.3): the two
+    /// `getChildById`/`recursiveGetChildById` call forms and the best-effort `.ui.<id>` dot-chain
+    /// form (see [`lua_refs`]). The per-file half of the workspace Lua-refs index: the server calls
+    /// it on each `*.lua` it scans and feeds the result into a [`lua_refs::LuaRefIndex`] keyed by
+    /// URI, exactly as [`lua_widgets`](Self::lua_widgets) feeds the [`LuaWidgetIndex`].
+    ///
+    /// Inherent (not on the [`LanguageService`] trait): the multi-document index is server-owned.
+    #[must_use]
+    pub fn lua_id_refs(&self, source: &str) -> Vec<LuaIdRef> {
+        lua_refs::scan_id_refs(source)
+    }
+
+    /// Find every place a single **Lua** module defines a widget id at runtime via
+    /// `setId("literal")` (spec §2.3) — a widget that may never appear in any `.otui` file, so Lua
+    /// is its only definition site. Pure text scan; unlike [`lua_id_refs`](Self::lua_id_refs) there
+    /// is (yet) no workspace index for defs — the server can call this directly per file.
+    #[must_use]
+    pub fn lua_id_defs(&self, source: &str) -> Vec<LuaIdDef> {
+        lua_refs::scan_id_defs(source)
     }
 
     /// Compute parse-level diagnostics for `source`, **widget-aware**: a property unknown to the C++
