@@ -692,6 +692,79 @@ fn hover_sprite_preview_fences_a_backtick_in_the_path_value() {
     shutdown_and_exit(&client, server_thread, 3);
 }
 
+/// Hover Blocker 2, blank-line variant: a Markdown code span cannot contain a blank line — the fence
+/// is left open and everything after the blank line renders as a live paragraph. Backtick fencing
+/// does not close this; only flattening the value to a single line does. A block-scalar value (`|`)
+/// is how a blank line reaches `path_ref.path` from attacker-controlled document content, and the
+/// cursor must be in the block *body* (not the `|` header line) for the value to be read.
+#[test]
+fn hover_sprite_preview_flattens_a_blank_line_in_a_block_scalar_path_value() {
+    let uri = Uri::from_str("file:///scratch/blankline.otui").expect("uri");
+    // The `|` block value carries its indented body — including the blank line — into the raw path
+    // text. Without flattening, the hover markdown would contain `\n\n`, orphaning the code fence and
+    // rendering `<b>PWN</b> [click](https://evil.example)` as a live paragraph.
+    let source =
+        "Panel < UIWidget\n  image-source: |\n    x\n\n    <b>PWN</b> [click](https://evil.example)\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: source.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+    let _ = recv_diagnostics(&client, &uri);
+
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(2),
+            "textDocument/hover".to_owned(),
+            HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    // Cursor in the block body, where `asset_ref_at` reads the multi-line value.
+                    position: position_of(source, "    x"),
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            },
+        )))
+        .expect("send hover");
+    let hover_resp = recv_response(&client, &RequestId::from(2));
+    assert!(hover_resp.error.is_none(), "hover errored: {hover_resp:?}");
+    let value = hover_markdown(&hover_resp);
+
+    // The payload must be present (proof the value was read, not a vacuous pass) and the whole hover
+    // must stay on a single paragraph: a blank line means the fence broke and the tail escaped into
+    // live Markdown. This is the load-bearing assertion.
+    assert!(
+        value.contains("PWN"),
+        "the block-scalar value must reach the hover: {value:?}"
+    );
+    assert!(
+        !value.contains("\n\n"),
+        "a blank line in the fenced value orphans the code span: {value:?}"
+    );
+    assert_eq!(
+        value.matches("[click](https://evil.example)").count(),
+        1,
+        "the payload must appear exactly once, fenced, not escaped: {value:?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 3);
+}
+
 /// The Markdown string of a hover [`Response`]'s `contents.value` (panics on any other shape —
 /// every hover the server emits is `MarkupContent`).
 fn hover_markdown(resp: &Response) -> String {

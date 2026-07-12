@@ -1836,7 +1836,16 @@ fn render_asset_hover(
 /// HTML in the hover. A leading/trailing space is always added around the content, which CommonMark
 /// requires when the content itself starts or ends with a backtick (or is empty) and is otherwise
 /// harmless (CommonMark trims exactly one such space back off on render).
+///
+/// Newlines are collapsed to spaces first. A block-scalar value (`image-source: |`) can carry a
+/// blank line into `path_ref.path`, and a code span cannot span a blank line — the fence would be
+/// left open and everything after the blank line would render as a live paragraph. Backtick fencing
+/// alone does not close that hole; flattening to a single line does.
 fn code_span(text: &str) -> String {
+    let text: String = text
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
     let longest_backtick_run = text
         .as_bytes()
         .split(|&b| b != b'`')
