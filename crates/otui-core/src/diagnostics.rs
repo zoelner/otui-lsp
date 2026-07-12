@@ -432,10 +432,20 @@ fn collect_semantic_diagnostics<'a>(
 /// therefore covers every block in the tree exactly once: "reset per block" falls out naturally from
 /// each call starting its own fresh `seen_child`, independent of its caller's.
 ///
-/// Only the `property` kind is flagged. A `state_selector` ($state block) is a distinct node kind and
-/// is never matched here even when it textually follows a child — that is deliberate: a `$state`
-/// block is a conditional override that idiomatically reads last (spec §2.8), not a readability
-/// mistake, and flagging it would be exactly the noisy false-positive this rule must avoid.
+/// Only the `property` kind is flagged, and the rule only runs inside a widget body (a `container` or
+/// a `style_header`) — see the allowlist in the body for the three places a bare tag is *not* a child
+/// widget.
+///
+/// Two deliberate exemptions, both of which would otherwise be noisy false positives:
+///
+/// * A `state_selector` (`$state` block) is a distinct node kind and is never flagged even when it
+///   textually follows a child — a `$state` block is a conditional override that idiomatically reads
+///   last (spec §2.8), and it is 14 of the 18 occurrences in the engine corpus.
+/// * An `id_property`, `anchor_property`, `event_property`, `alias_property` or `expr_property`
+///   (`id:`, `anchors.*`, `@event`, `&alias`, `!expr`) after a child is **also** not flagged: each is
+///   its own grammar kind, not `property`. This is a deliberate under-approximation — it occurs zero
+///   times in the engine corpus, so it costs no real coverage, and widening the rule is only worth
+///   doing if a real case ever turns up.
 ///
 /// Scanning **stops** at the first `ERROR`/`MISSING` sibling. A malformed line (already reported by
 /// [`collect_structural_errors`] as its own [`SYNTAX_ERROR`]) can throw the parser into error
@@ -444,12 +454,26 @@ fn collect_semantic_diagnostics<'a>(
 /// this block is unreliable to classify, so we do not pile a readability hint on top of a syntax
 /// error.
 fn check_property_after_child(node: Node<'_>, out: &mut Vec<Diagnostic>) {
-    // A child widget is spelled two ways: a bare tag (`Button`, a `container`) or a tag with an
-    // inline base (`Label < UILabel`, a `style_header`). Both instantiate a child — but only inside
-    // a widget's body. At the **document root** a `style_header` is a style *declaration*
-    // (`Name < Base`, spec §2.2), not a child of anything, so it must never mark "a child was seen"
-    // there.
-    let header_is_child = node.kind() != "document";
+    // Only a **widget's own body** can contain "a property after a child widget". A widget is spelled
+    // two ways — a bare tag (`Button`, a `container`) or a tag with an inline base
+    // (`Label < UILabel`, a `style_header`) — and those two kinds are the only blocks whose bare-tag
+    // children the engine actually instantiates. Everywhere else, a bare tag means something else
+    // entirely and this rule does not apply:
+    //
+    // * the **document root**, which has no widget body: a `Name < Base` there is a style
+    //   *declaration* (spec §2.2), and a stray root-level property is a different error altogether;
+    // * a **`$state` block** (`$on:`): the line carries a `:`, so `OTMLParser` marks the node
+    //   *unique* (`otmlparser.cpp:435`), and `createWidgetFromOTML`'s `if (!childNode->isUnique())`
+    //   child loop never descends into it — a tag in there instantiates nothing;
+    // * a **data block** (`options:` with bare-tag entries), whose children are values read from Lua
+    //   via `pairs(styleNode.options)`, not widgets.
+    //
+    // Emitting the hint in any of those would state something false ("the engine applies all
+    // properties before creating any children") about nodes that are not children at all. So this is
+    // an allowlist, never a denylist.
+    if !matches!(node.kind(), "container" | "style_header") {
+        return;
+    }
     let mut cursor = node.walk();
     let mut seen_child = false;
     for child in node.named_children(&mut cursor) {
@@ -457,8 +481,7 @@ fn check_property_after_child(node: Node<'_>, out: &mut Vec<Diagnostic>) {
             break;
         }
         match child.kind() {
-            "container" => seen_child = true,
-            "style_header" if header_is_child => seen_child = true,
+            "container" | "style_header" => seen_child = true,
             "property" if seen_child => {
                 if let Some(key) = child.child_by_field_name("key") {
                     out.push(Diagnostic {
@@ -1485,6 +1508,43 @@ Panel
   margin-bottom: 3
   Button
     id: ok
+";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != PROPERTY_AFTER_CHILD),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_bare_tag_at_the_document_root_is_not_a_child_widget() {
+        // The document root has no widget body. A root-level `container` is the file's main widget
+        // instance, not somebody's child, and a stray root-level property is a different mistake
+        // entirely. Emitting the ordering hint here would assert something false about the engine.
+        let src = "\
+MainWindow
+  id: x
+stray: value
+";
+        let diags = analyze(src);
+        assert!(
+            diags.iter().all(|d| d.code != PROPERTY_AFTER_CHILD),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_tag_inside_a_state_block_is_not_a_child_widget() {
+        // `$on:` carries a `:`, so `OTMLParser` marks the node unique (otmlparser.cpp:435) and
+        // `createWidgetFromOTML`'s `if (!childNode->isUnique())` loop never descends into it — a tag
+        // in there instantiates no widget at all. So a property following it is not "after a child",
+        // and the hint's message ("the engine applies all properties before creating any children")
+        // would be a false statement about nodes that are not children.
+        let src = "\
+Panel
+  $on:
+    Button
+    color: red
 ";
         let diags = analyze(src);
         assert!(
