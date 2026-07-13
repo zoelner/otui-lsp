@@ -10,7 +10,8 @@
 //! feature module: [`diagnostics`], [`completion`], [`hover`], [`property_hover`], [`symbols`],
 //! [`navigation`], [`references`], [`hierarchy`], [`format`], [`indent`], [`folding`], [`semantic`],
 //! [`colors`], [`links`], [`fixes`], plus the workspace-index building blocks ([`style_index`],
-//! [`lua_widgets`], [`lua_refs`], [`widget_resolve`]) and the engine data ([`schema`], [`catalog`]).
+//! [`lua_widgets`], [`lua_refs`], [`widget_resolve`], [`ids`]) and the engine data ([`schema`],
+//! [`catalog`]).
 //! The [`LanguageService`] trait
 //! and the inherent [`OtuiService`] methods below are the entry points the server drives.
 
@@ -23,11 +24,13 @@ pub mod folding;
 pub mod format;
 pub mod hierarchy;
 pub mod hover;
+pub mod ids;
 pub mod indent;
 pub mod links;
 pub mod lua_refs;
 pub mod lua_widgets;
 pub mod navigation;
+mod otml_reparent;
 pub mod property_hover;
 pub mod references;
 pub mod schema;

@@ -20,16 +20,26 @@
 //!
 //! ## Fidelity notes
 //!
-//! * **Duplicate style names are allowed.** The engine registers styles into a flat map where the
-//!   last registration wins at runtime; authoring the same `Name` in two files is legal. The index
-//!   therefore stores and returns **every** matching def (never dedupes/overwrites across docs) and
-//!   leaves any "which one wins" decision to later nodes.
+//! * **Duplicate style names are allowed, and the engine is last-wins.** `importStyleFromOTML` does
+//!   `m_styles[name] = style` (`uimanager.cpp:508`), which fully **replaces** any earlier definition
+//!   of the same name — not a union of the two — with one exception: an existing style already
+//!   flagged `__unique` (a `#Name < Base` freeze) is never overwritten (`uimanager.cpp:500`). Which
+//!   definition wins is therefore a property of the engine's *module load order*, something a static
+//!   index has no way to know. So the index does not try: it stores and returns **every** matching
+//!   def (never dedupes/overwrites across docs) and leaves any "which one wins" decision to later
+//!   nodes — see [`crate::ids`]'s module docs for the concrete consequence (an over-approximation
+//!   that is safe for "might this id exist" and unsafe for "this id does not exist").
 //! * **Only top-level declarations are styles.** A `Name < Base` nested inside a widget's block is
 //!   a widget *instance*, not a style definition, so only the direct children of the document root
-//!   are indexed — nested nodes are never walked as styles.
+//!   are indexed — nested nodes are never walked as styles. If the engine ever tried to instantiate
+//!   one, it would call `getStyle("Name < Base")`, which is undefined and **throws**
+//!   (`uimanager.cpp:708-710`: `if (!originalStyleNode) throw Exception(...)`) — so this is not
+//!   merely an indexing simplification, it mirrors a real engine failure mode. Styles are imported
+//!   only from a document's **root** nodes (`uimanager.cpp:438-444`).
 //!
 //! Everything here is byte-offset based. No I/O, no `lsp-types`.
 
+use crate::otml_reparent::is_reparented_onto_a_unique_sibling;
 use crate::syntax::SyntaxTree;
 use lang_api::ByteSpan;
 use std::collections::HashMap;
@@ -55,12 +65,35 @@ pub struct StyleDef {
     /// `UISpinBox` (a Lua widget declaring `minimum` / `maximum` / `step`) wearing a `TextEdit`'s
     /// look — so the style chain alone would miss every property `UISpinBox` adds.
     pub lua_class: Option<String>,
+    /// Every `id:` declared within the style's **body** that the engine actually creates a widget
+    /// for — at any depth the engine descends into, which is *not* the same as "at any depth in the
+    /// source text" (spec §2.3). See `body_ids_of` for why this walks the subtree rather than
+    /// just the header's direct children, for the two ways a nested `id:` is deliberately excluded
+    /// (a unique ancestor line, or a line reparented onto one), and for why a widget block that
+    /// writes `id:` more than once contributes only the *last* one (the engine's own per-widget
+    /// merge is last-wins; see `collect_body_ids`). [`crate::ids`] is the module that turns this
+    /// into "ids visible from a document that merely instantiates this style".
+    pub body_ids: Vec<StyleBodyId>,
     /// The span of the declared name identifier — the go-to-definition **target** for later nodes.
     pub name_span: ByteSpan,
     /// The span of the whole `style_header` node. For a bare declaration this is just the
     /// `Name < Base` line; when the style carries an indented body, the node — and so this span —
     /// extends over that block too (mirroring the document-symbol span semantics).
     pub header_span: ByteSpan,
+}
+
+/// A single `id:` declared somewhere in a [`StyleDef`]'s body — the ids a document inherits merely
+/// by instantiating that style (spec §2.3), the substrate for resolving a Lua `getChildById`
+/// reference into an inherited style file rather than the document's own tree (see [`crate::ids`]).
+///
+/// `span` is a byte span into the **declaring** document (the one the [`StyleDef`] itself came
+/// from) — a caller can turn it directly into a go-to-definition `Location` in that file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StyleBodyId {
+    /// The declared id text.
+    pub id: String,
+    /// The byte span of the `id:` value token, in the declaring document.
+    pub span: ByteSpan,
 }
 
 /// Extract every top-level style definition declared in `tree`.
@@ -96,8 +129,108 @@ fn build_def(node: Node<'_>, source: &str) -> StyleDef {
         name,
         base,
         lua_class: lua_class_of(node, source),
+        body_ids: body_ids_of(node, source),
         name_span,
         header_span: SyntaxTree::span_of(node),
+    }
+}
+
+/// Every `id:` declared anywhere within `node`'s subtree that the engine actually turns into a
+/// widget — **not necessarily every `id:` written in the source text**: see below for the two ways
+/// this walk stops short of that.
+///
+/// Unlike [`lua_class_of`], which reads only a leaf `__class:` property directly on `node`, an
+/// `id:` typically sits several levels deep inside the style's block: `MiniWindow < UIMiniWindow`
+/// declares `id: contentsPanel` on a nested `MiniWindowContents` child, not on the header itself.
+/// So this walks descendants, not just `node`'s direct children — but **only** through `container`
+/// and `style_header` nodes, the two grammar kinds a bare-tag or `Name < Base` line without a `:`
+/// parses to. Every other kind's line carries a `:` (`state_selector`'s `$state:`, `property`'s
+/// `key:`, `event_property`'s `@tag:`, …), which `OTMLParser::parseNode` marks **unique**
+/// (`otmlparser.cpp:435`: `node->setUnique(... || dotsPos != std::string::npos)`), and
+/// `UIManager::createWidgetFromOTML`'s child loop skips a unique node outright
+/// (`uimanager.cpp:735`: `if (!childNode->isUnique()) createWidgetFromOTML(childNode, widget);`).
+/// So a widget nested under `$pressed:`, under `layout:`, or under `visible: false` is never
+/// created — walking into it would harvest an `id:` for a widget that does not exist at runtime.
+/// This mirrors the `check_property_after_child` diagnostic's allowlist
+/// (`crate::diagnostics`), which faced the identical problem for the identical reason.
+/// `styleNode->get("id")` (`uiwidget.cpp:1918`) is also a direct-child lookup
+/// (`otmlnode.cpp:53-59`), so the id this returns for a given `container`/`style_header` is always
+/// the one declared directly inside it, never one found by searching past a unique descendant —
+/// and, when that widget's block writes `id:` more than once, the *last* one: see
+/// [`collect_body_ids`] for why the engine's own merge (`OTMLNode::addChild`) makes that the only
+/// one that can ever survive.
+///
+/// A second, narrower case: `id_property`, `anchor_property` and `list_item` cannot carry an
+/// indented block **in the grammar** (see [`crate::otml_reparent`]), so a line written
+/// over-indented under one of them parses as a plain sibling in the enclosing block rather than a
+/// genuine child — even though the real engine parents it onto that preceding line
+/// (`otmlparser.cpp:314`) and, if that line is unique, never creates it either. Each child is
+/// checked against [`is_reparented_onto_a_unique_sibling`] before being walked, so that case is
+/// excluded too — see that module for why the check is based on the preceding line's raw text
+/// (does it contain a `:`) rather than another hand-picked node-kind list.
+fn body_ids_of(node: Node<'_>, source: &str) -> Vec<StyleBodyId> {
+    let mut out = Vec::new();
+    collect_body_ids(node, source, &mut out);
+    out
+}
+
+/// Among `node`'s **own** direct children, only the *last* `id_property` is real — the engine's
+/// per-widget merge is last-wins, not "collect every value". Every OTML line becomes a node via
+/// `OTMLNode::create`, and `id:`'s line always carries a `:`, so it is always marked **unique**
+/// (`otmlparser.cpp:435`). Lines are added to their parent one at a time, in source order, via
+/// `currentParent->addChild(node)` (`otmlparser.cpp:454-456`), and `OTMLNode::addChild` **replaces**
+/// (not appends) an existing same-tag child whenever either side is unique
+/// (`otmlnode.cpp:86-116`: `if (node->tag() == newChild->tag() && (node->isUnique() ||
+/// newChild->isUnique())) { ... replaceChild(node, newChild); ... }`). So a widget block with two
+/// `id:` lines never ends up with two `id` children at runtime — the second `addChild` call
+/// replaces the first — and `styleNode->get("id")` (`uiwidget.cpp:1918`), a direct-child lookup
+/// that returns the first (and, after replacement, *only*) match (`otmlnode.cpp:53-59`), can only
+/// ever read the last one written. Emitting the earlier duplicate as a body id would offer
+/// navigation to a value the runtime never sets.
+///
+/// This last-wins rule is **per parent**, not global: a nested `container`/`style_header`
+/// (recursed into separately below) is a different OTML node with its own children, so its own
+/// `id:` does not compete with — and is not replaced by — one written directly on `node`.
+///
+/// A *cross-style* version of this question — does a derived style's own child widget suppress an
+/// inherited one with the same tag from its base? — does not arise here: a bare widget tag like
+/// `Button` carries no `:`, so `OTMLParser::parseNode` never marks it unique
+/// (`otmlparser.cpp:435`), and `OTMLNode::addChild`'s replace path only fires when *some* side is
+/// unique. Two `Button` children — one merged in from a base style, one written locally — are
+/// therefore not the same merge identity to the engine at all: `merge` (`otmlnode.cpp:152-157`)
+/// appends both as siblings via `addChild`, and `UIManager::createWidgetFromOTML`'s child loop
+/// (`uimanager.cpp:734-738`) instantiates every non-unique child — both `Button`s become real
+/// widgets, both contributing their own ids. Suppressing one would drop an id the engine actually
+/// creates, the one direction of error this index must never introduce (see the module docs on the
+/// deliberate ids-visibility over-approximation). So only the within-widget scalar case above is
+/// implemented; cross-style widget-identity merging is not, because the engine does not do it
+/// either.
+fn collect_body_ids(node: Node<'_>, source: &str, out: &mut Vec<StyleBodyId>) {
+    let mut cursor = node.walk();
+    let mut last_own_id = None;
+    for child in node.children(&mut cursor) {
+        if is_reparented_onto_a_unique_sibling(child, source) {
+            continue;
+        }
+        if child.kind() == "id_property" {
+            if let Some(value) = child.child_by_field_name("value") {
+                last_own_id = Some(StyleBodyId {
+                    id: slice(source, value).to_owned(),
+                    span: SyntaxTree::span_of(value),
+                });
+            }
+        }
+    }
+    out.extend(last_own_id);
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if is_reparented_onto_a_unique_sibling(child, source) {
+            continue;
+        }
+        if matches!(child.kind(), "container" | "style_header") {
+            collect_body_ids(child, source, out);
+        }
     }
 }
 
@@ -286,6 +419,169 @@ mod tests {
         let header = &src[def.header_span.start..def.header_span.end];
         assert!(header.starts_with("MainWindow < UIWindow"));
         assert!(header.contains("id: main"));
+    }
+
+    #[test]
+    fn body_ids_include_a_direct_id_property_on_the_header() {
+        let src = "MainWindow < UIWindow\n  id: main\n";
+        let defs = defs_of(src);
+        assert_eq!(defs[0].body_ids.len(), 1);
+        let body_id = &defs[0].body_ids[0];
+        assert_eq!(body_id.id, "main");
+        assert_eq!(&src[body_id.span.start..body_id.span.end], "main");
+    }
+
+    #[test]
+    fn body_ids_are_found_at_any_depth_inside_nested_widgets() {
+        // The real shape: MiniWindow's own `id:` values sit on nested child widgets, not on the
+        // style header itself.
+        let src = "MiniWindow < UIMiniWindow\n  MiniWindowContents\n    id: contentsPanel\n  \
+                    Button\n    id: closeButton\n";
+        let defs = defs_of(src);
+        assert_eq!(defs.len(), 1);
+        let ids: Vec<&str> = defs[0].body_ids.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(ids, ["contentsPanel", "closeButton"]);
+    }
+
+    #[test]
+    fn body_ids_are_empty_for_a_bare_declaration_with_no_block() {
+        let defs = defs_of("MainWindow < UIWindow\n");
+        assert!(defs[0].body_ids.is_empty());
+    }
+
+    #[test]
+    fn two_id_properties_directly_on_the_header_collapse_to_the_last_one() {
+        // `id:` is always unique (its line has a `:`, `otmlparser.cpp:435`), and
+        // `OTMLNode::addChild` replaces (not appends) an existing same-tag child whenever either
+        // side is unique (`otmlnode.cpp:86-116`) -- so parsing "id: first" then "id: second" on the
+        // same widget leaves only "second" as the `id` child. Emitting "first" too would be a
+        // phantom: an id the runtime never sets.
+        let src = "MainWindow < UIWindow\n  id: first\n  id: second\n";
+        let defs = defs_of(src);
+        assert_eq!(defs.len(), 1);
+        let ids: Vec<&str> = defs[0].body_ids.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["second"],
+            "only the last id: on the widget must survive: {:?}",
+            defs[0].body_ids
+        );
+    }
+
+    #[test]
+    fn two_id_properties_on_a_nested_widget_collapse_to_the_last_one() {
+        // The same last-wins rule applies at any depth, not just the header: it is a property of
+        // the widget the `id:` lines belong to, not of being the top-level style_header.
+        let src = "MiniWindow < UIMiniWindow\n  Button\n    id: first\n    id: second\n";
+        let defs = defs_of(src);
+        assert_eq!(defs.len(), 1);
+        let ids: Vec<&str> = defs[0].body_ids.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(ids, ["second"]);
+    }
+
+    #[test]
+    fn a_duplicate_id_does_not_suppress_an_unrelated_sibling_widgets_id() {
+        // Last-wins is scoped to the widget the duplicate `id:` lines are written directly on --
+        // it must not reach across to a different, unrelated widget's own single `id:`.
+        let src =
+            "MiniWindow < UIMiniWindow\n  Header\n    id: first\n    id: second\n  Footer\n    \
+                    id: footerId\n";
+        let defs = defs_of(src);
+        let ids: Vec<&str> = defs[0].body_ids.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(ids, ["second", "footerId"]);
+    }
+
+    #[test]
+    fn two_widgets_sharing_a_tag_each_contribute_their_own_id_not_a_last_wins_override() {
+        // A bare widget tag like `Button` carries no `:`, so `OTMLParser::parseNode` never marks it
+        // unique (`otmlparser.cpp:435`), and `OTMLNode::addChild`'s replace-on-same-tag path
+        // (`otmlnode.cpp:86-116`) only fires when *some* side is unique. Two `Button` children are
+        // therefore never the same merge identity to the engine -- both are appended
+        // (`otmlnode.cpp:152-157`) and both are instantiated
+        // (`uimanager.cpp:734-738`: `if (!childNode->isUnique()) createWidgetFromOTML(...)`).
+        // Collapsing same-tag widgets the way scalar `id:` properties collapse would drop an id the
+        // engine actually creates -- the opposite of what this index must guarantee.
+        let src =
+            "Outer < UIWidget\n  Button\n    id: firstButton\n  Button\n    id: secondButton\n";
+        let defs = defs_of(src);
+        let ids: Vec<&str> = defs[0].body_ids.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["firstButton", "secondButton"],
+            "both same-tag widgets must contribute their own id, not just the last: {:?}",
+            defs[0].body_ids
+        );
+    }
+
+    #[test]
+    fn an_id_nested_inside_a_state_block_is_not_a_body_id() {
+        // `$pressed:` (and any `$state:`) is a `state_selector` node — its line carries a `:`, so
+        // the engine marks it unique and its child loop (`uimanager.cpp:735`) never turns a unique
+        // node's children into widgets. A `VerticalScrollBar` written under `$pressed:` therefore
+        // never exists at runtime, and its `id:` must not be reported as a body id.
+        let src = "MiniWindow < UIMiniWindow\n  $pressed:\n    VerticalScrollBar\n      \
+                    id: phantom\n";
+        let defs = defs_of(src);
+        assert_eq!(defs.len(), 1);
+        assert!(
+            defs[0].body_ids.is_empty(),
+            "an id under $state must not surface as a body id: {:?}",
+            defs[0].body_ids
+        );
+    }
+
+    #[test]
+    fn an_id_nested_under_a_plain_property_block_is_not_a_body_id() {
+        // The real-world corpus bug (character.otui:1860 in the OTClient engine): a widget
+        // over-indented under a plain `key:` property (e.g. `visible: false`) parents to a
+        // `property` node, which is unique for the same reason as a `$state:` block — its line has
+        // a `:` — so the engine never creates it.
+        let src = "CharacterTitles < UIWidget\n  visible: false\n    VerticalScrollBar\n      \
+                    id: ListScrollbar\n";
+        let defs = defs_of(src);
+        assert_eq!(defs.len(), 1);
+        assert!(
+            defs[0].body_ids.is_empty(),
+            "an id nested under a property block must not surface as a body id: {:?}",
+            defs[0].body_ids
+        );
+    }
+
+    #[test]
+    fn a_widget_over_indented_under_a_plain_id_is_reparented_not_nested() {
+        // `id:` is one of the three block-less grammar rules (`id_property`, `anchor_property`,
+        // `list_item` — see `crate::otml_reparent`): it cannot carry an indented child in the
+        // grammar, so a `Button` written deeper-indented under `id: a` does not nest inside the
+        // `id_property` the way it would under a `property`/`state_selector` — tree-sitter instead
+        // attaches it as a plain sibling of `id: a` in the enclosing block. The engine parents it
+        // onto the *preceding line* instead (`otmlparser.cpp:314`), and `id: a`'s line is unique, so
+        // `Button` (and its own nested `id: phantomUnderId`) is never created
+        // (`uimanager.cpp:735`).
+        let src = "MainWindow < UIWindow\n  id: a\n    Button\n      id: phantomUnderId\n";
+        let defs = defs_of(src);
+        assert_eq!(defs.len(), 1);
+        let ids: Vec<&str> = defs[0].body_ids.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["a"],
+            "the over-indented Button must not contribute a body id: {:?}",
+            defs[0].body_ids
+        );
+    }
+
+    #[test]
+    fn a_widget_over_indented_under_an_anchor_property_is_reparented_not_nested() {
+        // Same gap as above, reached through `anchor_property` (the other block-less rule besides
+        // `id_property`/`list_item`) instead of `id_property`.
+        let src = "MainWindow < UIWindow\n  anchors.left: parent.left\n    Button\n      \
+                    id: phantomUnderAnchor\n";
+        let defs = defs_of(src);
+        assert_eq!(defs.len(), 1);
+        assert!(
+            defs[0].body_ids.is_empty(),
+            "the over-indented Button must not contribute a body id: {:?}",
+            defs[0].body_ids
+        );
     }
 
     #[test]
