@@ -309,10 +309,10 @@ fn widget_names(styles: &StyleIndex, lua: &LuaWidgetIndex) -> Vec<(String, &'sta
         std::collections::BTreeMap::new();
     for (_, def) in styles.iter() {
         named.entry(def.name.clone()).or_insert("style");
-        if let Some(base) = def.base.as_deref() {
-            if is_native_base(base) {
-                named.entry(base.to_owned()).or_insert("native widget");
-            }
+        if let Some(base) = def.base.as_deref()
+            && is_native_base(base)
+        {
+            named.entry(base.to_owned()).or_insert("native widget");
         }
     }
     for def in lua.iter() {
@@ -322,10 +322,10 @@ fn widget_names(styles: &StyleIndex, lua: &LuaWidgetIndex) -> Vec<(String, &'sta
         // hardcoded, fork-specific list: they are the parents the scanned corelib/gamelib widgets
         // derive from, captured dynamically. (A `UI*` base referenced by an `.otui` style is likewise
         // captured above.)
-        if let Some(parent) = def.lua_parent.as_deref() {
-            if is_native_base(parent) {
-                named.entry(parent.to_owned()).or_insert("native widget");
-            }
+        if let Some(parent) = def.lua_parent.as_deref()
+            && is_native_base(parent)
+        {
+            named.entry(parent.to_owned()).or_insert("native widget");
         }
     }
     named.into_iter().collect()
@@ -655,10 +655,10 @@ fn scope_anchor_ids(source: &str, offset: usize) -> Vec<String> {
     scope.sort_by_key(Node::start_byte);
     let mut ids = Vec::new();
     for widget in scope {
-        if let Some(id) = widget_id(widget, source) {
-            if !ids.contains(&id) {
-                ids.push(id);
-            }
+        if let Some(id) = widget_id(widget, source)
+            && !ids.contains(&id)
+        {
+            ids.push(id);
         }
     }
     ids
@@ -783,9 +783,11 @@ mod tests {
         let mut expected: Vec<&str> = schema::ANCHOR_EDGES.to_vec();
         expected.extend_from_slice(schema::SHORTHAND_ANCHORS);
         assert_eq!(labels(&complete_at(src, offset)), expected);
-        assert!(complete_at(src, offset)
-            .iter()
-            .all(|i| i.kind == CompletionKind::EnumMember));
+        assert!(
+            complete_at(src, offset)
+                .iter()
+                .all(|i| i.kind == CompletionKind::EnumMember)
+        );
     }
 
     #[test]
@@ -856,9 +858,11 @@ mod tests {
         assert!(items.iter().all(|i| i.kind == CompletionKind::Value));
         // A different color property (background-color) also offers colors.
         let src2 = "Widget\n  background-color: wh\n";
-        assert!(complete_at(src2, at(src2, "wh") + 2)
-            .iter()
-            .any(|i| i.label == "white"));
+        assert!(
+            complete_at(src2, at(src2, "wh") + 2)
+                .iter()
+                .any(|i| i.label == "white")
+        );
     }
 
     #[test]
@@ -1040,9 +1044,11 @@ Panel
         let items = complete_at(src, at(src, "wid") + "wid".len());
         assert_eq!(labels(&items), catalog::PROPERTIES);
         assert!(items.iter().all(|i| i.kind == CompletionKind::Keyword));
-        assert!(items
-            .iter()
-            .all(|i| i.detail.as_deref() == Some("property")));
+        assert!(
+            items
+                .iter()
+                .all(|i| i.detail.as_deref() == Some("property"))
+        );
     }
 
     #[test]
@@ -1298,9 +1304,11 @@ Window < UIWindow
         let lua = lua(&[("uitable.lua", UITABLE_LUA)]);
         let src = "Button < UIButton\n  col\n";
         let items = complete_at_with_widgets(src, at(src, "col") + "col".len(), &styles, &lua);
-        assert!(!items
-            .iter()
-            .any(|i| i.label == "column-style" && i.detail.as_deref() == Some("lua property")));
+        assert!(
+            !items
+                .iter()
+                .any(|i| i.label == "column-style" && i.detail.as_deref() == Some("lua property"))
+        );
         assert!(items.iter().any(|i| i.label == "width"));
     }
 
@@ -1495,28 +1503,36 @@ Window < UIWindow
         // have no natural "what comes next" — they stay plain-label insertion (no snippet).
         let src = "Widget\n  anchors.top: parent.\n";
         let items = complete_at(src, at(src, "parent.") + "parent.".len());
-        assert!(items
-            .iter()
-            .all(|i| i.insert_text.is_none() && i.insert_format == InsertFormat::Plain));
+        assert!(
+            items
+                .iter()
+                .all(|i| i.insert_text.is_none() && i.insert_format == InsertFormat::Plain)
+        );
 
         let src = "Button\n  $\n";
         let items = complete_at(src, at(src, "$") + 1);
-        assert!(items
-            .iter()
-            .all(|i| i.insert_text.is_none() && i.insert_format == InsertFormat::Plain));
+        assert!(
+            items
+                .iter()
+                .all(|i| i.insert_text.is_none() && i.insert_format == InsertFormat::Plain)
+        );
 
         let src = "Widget\n  display: fl\n";
         let items = complete_at(src, at(src, "fl") + 2);
-        assert!(items
-            .iter()
-            .all(|i| i.insert_text.is_none() && i.insert_format == InsertFormat::Plain));
+        assert!(
+            items
+                .iter()
+                .all(|i| i.insert_text.is_none() && i.insert_format == InsertFormat::Plain)
+        );
 
         // Anchor targets (magic keywords / widget ids) are also plain.
         let src = "Widget\n  anchors.top: \n";
         let items = complete_at(src, at(src, "anchors.top: ") + "anchors.top: ".len());
-        assert!(items
-            .iter()
-            .all(|i| i.insert_text.is_none() && i.insert_format == InsertFormat::Plain));
+        assert!(
+            items
+                .iter()
+                .all(|i| i.insert_text.is_none() && i.insert_format == InsertFormat::Plain)
+        );
     }
 
     #[test]

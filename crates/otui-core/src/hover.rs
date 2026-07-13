@@ -12,7 +12,7 @@
 //! No I/O, no `lsp-types`.
 
 use crate::navigation::style_header_at;
-use crate::style_index::{is_native_base, StyleIndex};
+use crate::style_index::{StyleIndex, is_native_base};
 use lang_api::ByteSpan;
 
 /// The base a style inherits from, resolved for hover display.
@@ -80,13 +80,14 @@ pub fn style_hover_at(source: &str, offset: usize, index: &StyleIndex) -> Option
     let header = style_header_at(source, offset)?;
 
     // Base branch: the cursor is within the base token — describe the base.
-    if let (Some(base), Some(base_span)) = (header.base.as_deref(), header.base_span) {
-        if base_span.start <= offset && offset < base_span.end {
-            return Some(StyleHover {
-                span: base_span,
-                kind: classify_base(base, index),
-            });
-        }
+    if let (Some(base), Some(base_span)) = (header.base.as_deref(), header.base_span)
+        && base_span.start <= offset
+        && offset < base_span.end
+    {
+        return Some(StyleHover {
+            span: base_span,
+            kind: classify_base(base, index),
+        });
     }
 
     // Name branch: describe this style and, if present, what it inherits from.
@@ -143,7 +144,7 @@ fn inheritance_of(base: &str) -> Inheritance {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::style_index::{extract_style_defs, DocId, StyleIndex};
+    use crate::style_index::{DocId, StyleIndex, extract_style_defs};
     use crate::syntax::SyntaxTree;
 
     /// Build a workspace index from `(doc_id, source)` entries, indexing each document's style defs.

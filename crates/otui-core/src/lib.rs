@@ -460,9 +460,10 @@ mod tests {
     #[test]
     fn clean_source_produces_no_diagnostics() {
         let svc = OtuiService::new();
-        assert!(svc
-            .diagnostics("MainWindow < UIWindow\n  id: main\n")
-            .is_empty());
+        assert!(
+            svc.diagnostics("MainWindow < UIWindow\n  id: main\n")
+                .is_empty()
+        );
     }
 
     #[test]

@@ -17,7 +17,7 @@ use lsp_types::{
     TextDocumentPositionParams, Uri, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
     WorkspaceFolder,
 };
-use otui_lsp_server::{serve, Backend, Termination};
+use otui_lsp_server::{Backend, Termination, serve};
 
 /// Build a `file:` [`Uri`] from a filesystem path via the `url` crate's percent-encoding — never by
 /// hand-formatting `format!("file://{}", path.display())`, which leaves reserved characters (a
@@ -894,8 +894,7 @@ fn hover_sprite_preview_flattens_a_blank_line_in_a_block_scalar_path_value() {
     // The `|` block value carries its indented body — including the blank line — into the raw path
     // text. Without flattening, the hover markdown would contain `\n\n`, orphaning the code fence and
     // rendering `<b>PWN</b> [click](https://evil.example)` as a live paragraph.
-    let source =
-        "Panel < UIWidget\n  image-source: |\n    x\n\n    <b>PWN</b> [click](https://evil.example)\n";
+    let source = "Panel < UIWidget\n  image-source: |\n    x\n\n    <b>PWN</b> [click](https://evil.example)\n";
 
     let (server, client) = Connection::memory();
     let server_thread = thread::spawn(move || run_server(server));
@@ -1106,8 +1105,7 @@ fn otui_lua_bridge_resolves_both_directions_via_the_disk_scan() {
     let login_otui_path = login_dir.join("login.otui");
     std::fs::write(&login_otui_path, login_otui_src).expect("write login.otui");
 
-    let login_lua_src =
-        "function onCreate(rootWidget)\n  local btn = rootWidget:getChildById('closeButton')\n  \
+    let login_lua_src = "function onCreate(rootWidget)\n  local btn = rootWidget:getChildById('closeButton')\n  \
          btn:hide()\nend\n";
     let login_lua_path = login_dir.join("login.lua");
     std::fs::write(&login_lua_path, login_lua_src).expect("write login.lua");
@@ -1116,8 +1114,7 @@ fn otui_lua_bridge_resolves_both_directions_via_the_disk_scan() {
     // reference the very same id string. Its location must never leak into either direction.
     let other_dir = base.join("modules").join("other");
     std::fs::create_dir_all(&other_dir).expect("mkdir other");
-    let other_lua_src =
-        "function onCreate(rootWidget)\n  local btn = rootWidget:getChildById('closeButton')\nend\n";
+    let other_lua_src = "function onCreate(rootWidget)\n  local btn = rootWidget:getChildById('closeButton')\nend\n";
     let other_lua_path = other_dir.join("other.lua");
     std::fs::write(&other_lua_path, other_lua_src).expect("write other.lua");
 
@@ -1578,8 +1575,7 @@ fn reverse_references_resolve_an_id_inherited_from_a_base_style() {
     let mod_otui_path = mod_dir.join("mod.otui");
     std::fs::write(&mod_otui_path, mod_otui_src).expect("write mod.otui");
 
-    let mod_lua_src =
-        "function onCreate(rootWidget)\n  local btn = rootWidget:getChildById('closeButton')\nend\n";
+    let mod_lua_src = "function onCreate(rootWidget)\n  local btn = rootWidget:getChildById('closeButton')\nend\n";
     let mod_lua_path = mod_dir.join("mod.lua");
     std::fs::write(&mod_lua_path, mod_lua_src).expect("write mod.lua");
 

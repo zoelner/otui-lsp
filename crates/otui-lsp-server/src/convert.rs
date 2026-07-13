@@ -140,7 +140,7 @@ pub fn symbols_to_lsp(
 /// symbol's `location` uses its full span, and every symbol at every depth is emitted (depth-first,
 /// source order).
 #[allow(deprecated)] // `SymbolInformation` (and its `deprecated` field) are deprecated but are the
-                     // only shape a non-hierarchical client accepts.
+// only shape a non-hierarchical client accepts.
 pub fn symbols_to_flat(
     uri: &Uri,
     text: &str,
@@ -568,9 +568,10 @@ mod tests {
         // Every state name comes back, as ENUM_MEMBER, in schema order.
         let labels: Vec<&str> = lsp.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels, otui_core::schema::STATES);
-        assert!(lsp
-            .iter()
-            .all(|i| i.kind == Some(LspCompletionItemKind::ENUM_MEMBER)));
+        assert!(
+            lsp.iter()
+                .all(|i| i.kind == Some(LspCompletionItemKind::ENUM_MEMBER))
+        );
     }
 
     #[test]

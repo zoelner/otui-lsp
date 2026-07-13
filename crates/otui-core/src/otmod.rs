@@ -77,13 +77,12 @@ pub fn otmod_scripts(source: &str) -> Vec<String> {
 /// (there is no reason to expect more than one `scripts:` in a well-formed manifest, but nothing
 /// here assumes it — the grammar tree is small and walking all of it costs nothing measurable).
 fn find_scripts_property(node: Node<'_>, source: &str, out: &mut Vec<String>) {
-    if node.kind() == "property" {
-        if let Some(key) = node.child_by_field_name("key") {
-            if node_text(key, source) == SCRIPTS_KEY {
-                collect_scripts_value(node, source, out);
-                return;
-            }
-        }
+    if node.kind() == "property"
+        && let Some(key) = node.child_by_field_name("key")
+        && node_text(key, source) == SCRIPTS_KEY
+    {
+        collect_scripts_value(node, source, out);
+        return;
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -107,12 +106,11 @@ fn collect_scripts_value(property: Node<'_>, source: &str, out: &mut Vec<String>
     }
     let mut cursor = property.walk();
     for child in property.named_children(&mut cursor) {
-        if child.kind() == "list_item" {
-            if let Some(value) = child.child_by_field_name("value") {
-                if let Some(name) = normalize_entry(value, source) {
-                    out.push(name);
-                }
-            }
+        if child.kind() == "list_item"
+            && let Some(value) = child.child_by_field_name("value")
+            && let Some(name) = normalize_entry(value, source)
+        {
+            out.push(name);
         }
     }
 }
