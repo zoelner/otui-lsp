@@ -2880,10 +2880,11 @@ fn client_supports_snippets(params: &InitializeParams) -> bool {
 }
 
 /// Whether the client can render Markdown in a completion item's `documentation`. Per LSP 3.17, a
-/// client lists its preferred formats (in order) via
-/// `textDocument.completion.completionItem.documentationFormat`; this is `true` when `Markdown`
-/// appears anywhere in that list. When the capability is absent the default is plain text — see
-/// [`convert::completion_item_to_lsp`] for where this is enforced.
+/// client lists its preferred formats via `textDocument.completion.completionItem.documentationFormat`
+/// **in preference order** (first = most preferred), so this gates on the *first* entry being
+/// `Markdown` — a client that lists `[PlainText, Markdown]` prefers plain text and must get it, even
+/// though Markdown is technically supported further down its list. When the capability is absent the
+/// default is plain text — see [`convert::completion_item_to_lsp`] for where this is enforced.
 fn client_supports_markdown_docs(params: &InitializeParams) -> bool {
     params
         .capabilities
@@ -2892,7 +2893,7 @@ fn client_supports_markdown_docs(params: &InitializeParams) -> bool {
         .and_then(|td| td.completion.as_ref())
         .and_then(|c| c.completion_item.as_ref())
         .and_then(|ci| ci.documentation_format.as_ref())
-        .is_some_and(|formats| formats.contains(&MarkupKind::Markdown))
+        .is_some_and(|formats| formats.first() == Some(&MarkupKind::Markdown))
 }
 
 /// Whether the client can be asked to refresh its code lenses via a server-initiated
@@ -4917,12 +4918,23 @@ mod tests {
     }
 
     #[test]
-    fn markdown_docs_true_only_when_markdown_is_in_the_advertised_list() {
+    fn markdown_docs_true_only_when_markdown_is_the_clients_first_preference() {
+        // A single-entry list naming Markdown.
         assert!(client_supports_markdown_docs(
             &params_with_documentation_format(Some(vec![MarkupKind::Markdown]))
         ));
-        // Markdown anywhere in the list (not necessarily first) still counts.
+        // Markdown listed first (most preferred), plain text as a fallback further down: still
+        // Markdown.
         assert!(client_supports_markdown_docs(
+            &params_with_documentation_format(Some(vec![
+                MarkupKind::Markdown,
+                MarkupKind::PlainText
+            ]))
+        ));
+        // Plain text listed FIRST (most preferred), Markdown merely supported further down: the
+        // client's stated preference is plain text, so this must NOT count as Markdown support —
+        // sending Markdown here would ignore the client's own preference order (LSP 3.17).
+        assert!(!client_supports_markdown_docs(
             &params_with_documentation_format(Some(vec![
                 MarkupKind::PlainText,
                 MarkupKind::Markdown
