@@ -812,6 +812,18 @@ fn uri_from_file_path(path: &Path) -> Option<Uri> {
 /// that indexes it (`read_indexed_file`) would open — the two must never disagree about which file a
 /// URI names (see [`Language::from_uri`]'s doc comment for the class of bug that causes). `None` for
 /// a non-`file:` URI or one with no representable sibling path.
+///
+/// **Coverage.** This is exactly the pairing rule spec §2.3 specifies, and it is correct wherever a
+/// sibling exists — but not every controller has one. Measured on the real engine corpus (`otclient`):
+/// of the `.lua` files that call `getChildById`/`recursiveGetChildById` at all, only *roughly half*
+/// have a same-directory/same-stem `.otui` to pair with here. The rest keep their UI elsewhere — a
+/// `styles/` subdirectory (e.g. `game_rewardwall/game_rewardwall.lua` ↔
+/// `game_rewardwall/styles/style.otui`) or an altogether different filename/module layout (e.g.
+/// `game_wheel/classes/*`) — and for those the bridge is silently a no-op in **both** directions:
+/// [`Backend::lua_forward_references`]/[`Backend::lua_references`] simply find no paired document,
+/// same as any other file with no sibling. That is a real gap, not a bug in this rule: associating
+/// such a controller via its `.otmod`/`g_ui.displayUI(...)`/`importStyle(...)` declaration instead is
+/// a legitimate, larger follow-up, deliberately left out of this bridge.
 fn paired_uri(uri: &Uri, target_ext: &str) -> Option<Uri> {
     let path = uri_to_file_path(uri)?;
     uri_from_file_path(&path.with_extension(target_ext))

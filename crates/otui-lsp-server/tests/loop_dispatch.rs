@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
-    DiagnosticSeverity, DidChangeTextDocumentParams, DidOpenTextDocumentParams, HoverParams,
+    DiagnosticSeverity, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, FileChangeType, FileEvent, HoverParams,
     InitializeParams, InitializedParams, Location, NumberOrString, PartialResultParams, Position,
     PublishDiagnosticsParams, ReferenceContext, ReferenceParams, TextDocumentContentChangeEvent,
     TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Uri,
@@ -1297,6 +1298,395 @@ fn forward_references_see_an_unsaved_lua_buffer_edit() {
         "the unsaved edit must be reflected immediately, without a save: {after:#?}"
     );
     assert_eq!(in_lua[0].range, range_of(edited_lua, "closeButton"));
+
+    shutdown_and_exit(&client, server_thread, 4);
+}
+
+/// The reverse bridge must resolve an id that is **not** declared anywhere in the paired `.otui`
+/// itself, but only in the body of a style it instantiates (spec §2.3, `IdOrigin::InheritedStyle` —
+/// see `otui_core::ids`'s module docs: "a quarter of all Lua→OTUI id references resolve into an
+/// inherited style rather than the paired file").
+///
+/// Three files, all found purely through the background workspace scan (nothing but the module
+/// `.otui` is ever opened, mirroring `otui_lua_bridge_resolves_both_directions_via_the_disk_scan`
+/// above):
+///
+/// * `styles/base.otui` declares style `MiniWindow`, whose body declares `id: closeButton`.
+/// * `mod/mod.otui` instantiates it (`X < MiniWindow`) and declares no id of its own.
+/// * `mod/mod.lua` — `mod.otui`'s pair — calls `getChildById('closeButton')`.
+///
+/// `textDocument/references` on that call must resolve to the `id:` declaration inside
+/// `styles/base.otui` — the file that actually declares it — not `mod.otui` (which has no such
+/// declaration to point at).
+#[test]
+fn reverse_references_resolve_an_id_inherited_from_a_base_style() {
+    let base = std::env::temp_dir().join(format!(
+        "otui-lua-bridge-inherited-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _cleanup = TempDirGuard(base.clone());
+
+    let styles_dir = base.join("styles");
+    std::fs::create_dir_all(&styles_dir).expect("mkdir styles");
+    let base_otui_src = "MiniWindow < UIWidget\n  Button\n    id: closeButton\n";
+    let base_otui_path = styles_dir.join("base.otui");
+    std::fs::write(&base_otui_path, base_otui_src).expect("write base.otui");
+
+    let mod_dir = base.join("mod");
+    std::fs::create_dir_all(&mod_dir).expect("mkdir mod");
+    let mod_otui_src = "X < MiniWindow\n";
+    let mod_otui_path = mod_dir.join("mod.otui");
+    std::fs::write(&mod_otui_path, mod_otui_src).expect("write mod.otui");
+
+    let mod_lua_src =
+        "function onCreate(rootWidget)\n  local btn = rootWidget:getChildById('closeButton')\nend\n";
+    let mod_lua_path = mod_dir.join("mod.lua");
+    std::fs::write(&mod_lua_path, mod_lua_src).expect("write mod.lua");
+
+    let base_otui_uri = file_uri(&base_otui_path);
+    let mod_otui_uri = file_uri(&mod_otui_path);
+    let mod_lua_uri = file_uri(&mod_lua_path);
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+
+    #[allow(deprecated)]
+    client_handshake_with_params(
+        &client,
+        InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: file_uri(&base),
+                name: "ws".to_owned(),
+            }]),
+            ..InitializeParams::default()
+        },
+    );
+
+    // Open only mod.otui — never base.otui, never mod.lua — so both the ancestry resolution
+    // (base.otui's style def) and the getChildById call (mod.lua) can only have come from the scan.
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: mod_otui_uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: mod_otui_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+
+    // Wait for the scan's completion refresh (see `wait_for_nth_diagnostics`'s doc comment): only
+    // then are `style_index` (base.otui's `MiniWindow` def) and `lua_ref_index`/`lua_texts` (mod.lua's
+    // getChildById call) guaranteed populated.
+    let _ = wait_for_nth_diagnostics(&client, &mod_otui_uri, 2);
+
+    let reverse = send_references(
+        &client,
+        2,
+        &mod_lua_uri,
+        position_of(mod_lua_src, "closeButton"),
+        true,
+    )
+    .expect("reverse references present");
+
+    assert_eq!(
+        reverse.len(),
+        1,
+        "exactly one declaration site, in the base style file: {reverse:#?}"
+    );
+    assert_eq!(
+        reverse[0].uri, base_otui_uri,
+        "the id is declared in the INHERITED style's body, not the instantiating module: {reverse:#?}"
+    );
+    assert_ne!(
+        reverse[0].uri, mod_otui_uri,
+        "mod.otui declares no id of its own; it must never be the resolved location"
+    );
+    assert_eq!(
+        reverse[0].range,
+        range_of(base_otui_src, "closeButton"),
+        "the range must land on the id: value inside base.otui: {reverse:#?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 3);
+}
+
+/// `did_close` on a `.lua` buffer must re-sync `lua_ref_index` from **disk**, discarding whatever the
+/// (possibly unsaved) buffer held — never leaving the closed-over edit's entries in place, and never
+/// dropping the file outright (it still exists on disk).
+///
+/// Sequence: disk holds `getChildById('idAaa')`; open the buffer and edit it in place to
+/// `getChildById('idBbb')` (forward references for `idBbb` must reflect the live edit); close the
+/// buffer; forward references must then reflect `idAaa` again (disk) and no longer find `idBbb` (the
+/// edit is gone, and was never saved).
+#[test]
+fn did_close_reverts_lua_ref_index_to_disk_content() {
+    let base = std::env::temp_dir().join(format!(
+        "otui-lua-bridge-close-revert-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    std::fs::create_dir_all(&base).expect("mkdir base");
+    let _cleanup = TempDirGuard(base.clone());
+
+    let panel_otui_src = "Panel < UIWidget\n  Button\n    id: idAaa\n  Button\n    id: idBbb\n";
+    let panel_otui_path = base.join("panel.otui");
+    std::fs::write(&panel_otui_path, panel_otui_src).expect("write panel.otui");
+
+    let disk_lua_src = "function onCreate(rootWidget)\n  rootWidget:getChildById('idAaa')\nend\n";
+    let panel_lua_path = base.join("panel.lua");
+    std::fs::write(&panel_lua_path, disk_lua_src).expect("write panel.lua");
+
+    let panel_otui_uri = file_uri(&panel_otui_path);
+    let panel_lua_uri = file_uri(&panel_lua_path);
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    // Open panel.otui.
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: panel_otui_uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: panel_otui_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen otui");
+    let _ = recv_diagnostics(&client, &panel_otui_uri);
+
+    // Open panel.lua with exactly the on-disk content.
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: panel_lua_uri.clone(),
+                    language_id: "lua".to_owned(),
+                    version: 1,
+                    text: disk_lua_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen lua");
+    let _ = recv_diagnostics(&client, &panel_lua_uri);
+
+    // Baseline: the open buffer (== disk content) resolves 'a', not 'b'.
+    let baseline_a = send_references(
+        &client,
+        2,
+        &panel_otui_uri,
+        position_of(panel_otui_src, "idAaa"),
+        false,
+    )
+    .expect("references present");
+    assert!(
+        baseline_a.iter().any(|l| l.uri == panel_lua_uri),
+        "the disk-matching open buffer must resolve 'a': {baseline_a:#?}"
+    );
+
+    // Edit the (unsaved) buffer: 'a' -> 'b'. Disk is untouched.
+    let edited_lua = "function onCreate(rootWidget)\n  rootWidget:getChildById('idBbb')\nend\n";
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didChange".to_owned(),
+            DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: panel_lua_uri.clone(),
+                    version: 2,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: edited_lua.to_owned(),
+                }],
+            },
+        )))
+        .expect("send didChange lua");
+    let _ = recv_diagnostics(&client, &panel_lua_uri);
+
+    // While the edit is live (still unsaved), forward references must reflect 'b', not 'a'.
+    let after_edit_b = send_references(
+        &client,
+        3,
+        &panel_otui_uri,
+        position_of(panel_otui_src, "idBbb"),
+        false,
+    )
+    .expect("references present");
+    assert!(
+        after_edit_b.iter().any(|l| l.uri == panel_lua_uri),
+        "the live unsaved edit must be reflected immediately: {after_edit_b:#?}"
+    );
+    let after_edit_a = send_references(
+        &client,
+        4,
+        &panel_otui_uri,
+        position_of(panel_otui_src, "idAaa"),
+        false,
+    )
+    .expect("references present");
+    assert!(
+        after_edit_a.iter().all(|l| l.uri != panel_lua_uri),
+        "'a' no longer appears in the edited buffer: {after_edit_a:#?}"
+    );
+
+    // Close the buffer WITHOUT saving. did_close must re-sync from disk: 'a' comes back, 'b' — which
+    // was never written to disk — must disappear again.
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didClose".to_owned(),
+            DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier {
+                    uri: panel_lua_uri.clone(),
+                },
+            },
+        )))
+        .expect("send didClose lua");
+    let _ = recv_diagnostics(&client, &panel_lua_uri);
+
+    let after_close_a = send_references(
+        &client,
+        5,
+        &panel_otui_uri,
+        position_of(panel_otui_src, "idAaa"),
+        false,
+    )
+    .expect("references present");
+    assert!(
+        after_close_a.iter().any(|l| l.uri == panel_lua_uri),
+        "closing must re-sync from disk, reviving 'a' — the file was never dropped from the index: \
+         {after_close_a:#?}"
+    );
+    let after_close_b = send_references(
+        &client,
+        6,
+        &panel_otui_uri,
+        position_of(panel_otui_src, "idBbb"),
+        false,
+    )
+    .expect("references present");
+    assert!(
+        after_close_b.iter().all(|l| l.uri != panel_lua_uri),
+        "'b' was only ever an unsaved edit; closing must discard it, not persist it: \
+         {after_close_b:#?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 7);
+}
+
+/// A watched-file `DELETE` for a `.lua` module must drop its entries from `lua_ref_index` entirely —
+/// not leave a stale, now-unresolvable entry behind. Exercises `apply_lua_watch_change`'s `DELETED`
+/// arm ([`Backend::deindex_lua_refs`]) via `workspace/didChangeWatchedFiles`, independent of the
+/// initial scan or any open buffer.
+#[test]
+fn watched_delete_drops_the_lua_ref_index_entry() {
+    let base = std::env::temp_dir().join(format!(
+        "otui-lua-bridge-watch-delete-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    std::fs::create_dir_all(&base).expect("mkdir base");
+    let _cleanup = TempDirGuard(base.clone());
+
+    let foo_otui_src = "Foo < UIWidget\n  Button\n    id: target\n";
+    let foo_otui_path = base.join("foo.otui");
+    std::fs::write(&foo_otui_path, foo_otui_src).expect("write foo.otui");
+
+    let foo_lua_src = "function onCreate(rootWidget)\n  rootWidget:getChildById('target')\nend\n";
+    let foo_lua_path = base.join("foo.lua");
+    std::fs::write(&foo_lua_path, foo_lua_src).expect("write foo.lua");
+
+    let foo_otui_uri = file_uri(&foo_otui_path);
+    let foo_lua_uri = file_uri(&foo_lua_path);
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: foo_otui_uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: foo_otui_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen otui");
+    let _ = recv_diagnostics(&client, &foo_otui_uri);
+
+    // Index foo.lua purely via a watched-file CREATED event — no scan, no open buffer.
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "workspace/didChangeWatchedFiles".to_owned(),
+            DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: foo_lua_uri.clone(),
+                    typ: FileChangeType::CREATED,
+                }],
+            },
+        )))
+        .expect("send didChangeWatchedFiles created");
+
+    let before = send_references(
+        &client,
+        2,
+        &foo_otui_uri,
+        position_of(foo_otui_src, "target"),
+        false,
+    )
+    .expect("references present");
+    assert!(
+        before.iter().any(|l| l.uri == foo_lua_uri),
+        "the watched CREATED event must index foo.lua's reference: {before:#?}"
+    );
+
+    // Now fire a DELETE for the same file.
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "workspace/didChangeWatchedFiles".to_owned(),
+            DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: foo_lua_uri.clone(),
+                    typ: FileChangeType::DELETED,
+                }],
+            },
+        )))
+        .expect("send didChangeWatchedFiles deleted");
+
+    let after = send_references(
+        &client,
+        3,
+        &foo_otui_uri,
+        position_of(foo_otui_src, "target"),
+        false,
+    )
+    .expect("references present");
+    assert!(
+        after.iter().all(|l| l.uri != foo_lua_uri),
+        "the DELETE must drop foo.lua's entry from lua_ref_index, not leave it stale: {after:#?}"
+    );
 
     shutdown_and_exit(&client, server_thread, 4);
 }
