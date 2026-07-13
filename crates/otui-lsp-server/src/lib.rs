@@ -59,9 +59,17 @@ use lsp_types::{
     TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri, WorkDoneProgressOptions,
     WorkspaceEdit, WorkspaceSymbolParams,
 };
+// Code lens / inlay hint types (node `lens-hints`), appended separately to keep the merge with
+// concurrent nodes touching the block above localized to this new `use`.
+use lsp_types::{
+    CodeLens, CodeLensOptions, CodeLensParams, Command, InlayHint, InlayHintKind, InlayHintLabel,
+    InlayHintParams,
+};
 use otui_core::fixes::Fix;
 use otui_core::hover::{Inheritance, StyleHover, StyleHoverKind};
 use otui_core::ids::{visible_ids, IdOrigin};
+use otui_core::inlay::ancestor_hints;
+use otui_core::lenses::style_lenses;
 use otui_core::links::{
     is_asset_sentinel_value, is_runtime_variable_path, resolve_asset_candidates, PathRef,
 };
@@ -192,6 +200,18 @@ pub struct Backend {
     /// the plain label — see [`convert::completion_item_to_lsp`]. Defaults to `false` (the LSP
     /// default when the capability is absent). Guarded like [`encoding`].
     snippet_support: Mutex<bool>,
+    /// Whether the client advertised `workspace.codeLens.refreshSupport` during `initialize`;
+    /// gates whether a workspace-index mutation (a watched-file change, or the initial scan's
+    /// completion — see [`republish_open_documents`](Self::republish_open_documents) and
+    /// `run_initialized`'s scan thread) ever sends a `workspace/codeLens/refresh` request. A client
+    /// that never opted in is not asking to be told; sending it the request anyway would just be
+    /// noise it has to shrug off. Defaults to `false` (the LSP default when the capability is
+    /// absent). Guarded like [`encoding`].
+    code_lens_refresh_support: Mutex<bool>,
+    /// Whether the client advertised `workspace.inlayHint.refreshSupport` during `initialize`; the
+    /// `workspace/inlayHint/refresh` analogue of [`code_lens_refresh_support`](Self::code_lens_refresh_support) —
+    /// same gate, same call sites, same default.
+    inlay_hint_refresh_support: Mutex<bool>,
     /// Open documents by URL, full text (text document sync = FULL) plus sync version. An open
     /// buffer is authoritative for its URI — it may carry unsaved edits — so it always wins over the
     /// on-disk copy cached in [`disk_texts`](Self::disk_texts). Wrapped in an [`Arc`] so the
@@ -293,6 +313,8 @@ impl Backend {
             encoding: Mutex::new(negotiate_encoding(params)),
             hierarchical_symbols: Mutex::new(client_supports_hierarchical_symbols(params)),
             snippet_support: Mutex::new(client_supports_snippets(params)),
+            code_lens_refresh_support: Mutex::new(client_supports_code_lens_refresh(params)),
+            inlay_hint_refresh_support: Mutex::new(client_supports_inlay_hint_refresh(params)),
             documents: Arc::new(RwLock::new(HashMap::new())),
             style_index: Arc::new(RwLock::new(StyleIndex::new())),
             lua_index: Arc::new(RwLock::new(LuaWidgetIndex::new())),
@@ -361,6 +383,20 @@ impl Backend {
             .snippet_support
             .lock()
             .expect("snippet_support mutex poisoned")
+    }
+
+    fn code_lens_refresh_support(&self) -> bool {
+        *self
+            .code_lens_refresh_support
+            .lock()
+            .expect("code_lens_refresh_support mutex poisoned")
+    }
+
+    fn inlay_hint_refresh_support(&self) -> bool {
+        *self
+            .inlay_hint_refresh_support
+            .lock()
+            .expect("inlay_hint_refresh_support mutex poisoned")
     }
 
     /// Send a `window/logMessage` notification to the client (the sync replacement for the old
@@ -725,6 +761,46 @@ fn compute_and_send_diagnostics(
         "textDocument/publishDiagnostics".to_owned(),
         params,
     )));
+}
+
+/// Ask the client to re-request its currently-shown code lenses and/or inlay hints — fire-and-forget
+/// server→client requests, like [`Backend::register_capability`] (the client's ack, if any, arrives
+/// as a `Message::Response` the main loop ignores; we do not track it). Each of the two requests is
+/// gated independently on whether the client advertised refresh support for it
+/// ([`client_supports_code_lens_refresh`] / [`client_supports_inlay_hint_refresh`]).
+///
+/// A free function, not a `Backend` method, for the same reason [`compute_and_send_diagnostics`] is:
+/// the background workspace-scan thread only holds cloned pieces of `Backend` (never `&Backend`), so
+/// every dependency — here, just the sender and the two booleans, copied out before the thread spawns
+/// — is passed explicitly.
+///
+/// Called wherever a workspace index mutation (a watched `.otui`/`.lua` file change, or the initial
+/// scan's completion) could have made an already-computed code lens ("N widgets inherit this style")
+/// or inlay hint (a cross-file-resolved native ancestor) in ANOTHER open document stale. The lens/hint
+/// for the document that was itself just edited is not this function's concern — a client re-invokes
+/// `textDocument/codeLens`/`textDocument/inlayHint` for a buffer on every edit to it regardless, since
+/// its content (and so its `Range`s) changed; it is every *other* open document, whose text never
+/// changed but whose already-computed lenses/hints now read stale data, that has no other trigger to
+/// re-ask.
+fn send_workspace_refresh(
+    sender: &Sender<Message>,
+    code_lens_refresh_support: bool,
+    inlay_hint_refresh_support: bool,
+) {
+    if code_lens_refresh_support {
+        let _ = sender.send(Message::Request(Request::new(
+            RequestId::from("otui-code-lens-refresh".to_owned()),
+            "workspace/codeLens/refresh".to_owned(),
+            (),
+        )));
+    }
+    if inlay_hint_refresh_support {
+        let _ = sender.send(Message::Request(Request::new(
+            RequestId::from("otui-inlay-hint-refresh".to_owned()),
+            "workspace/inlayHint/refresh".to_owned(),
+            (),
+        )));
+    }
 }
 
 /// Merge the open buffers over the on-disk cache into a single `URI → Document` view for one
@@ -2013,6 +2089,32 @@ fn client_supports_snippets(params: &InitializeParams) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the client can be asked to refresh its code lenses via a server-initiated
+/// `workspace/codeLens/refresh` request. Per LSP 3.17, a client signals this via
+/// `workspace.codeLens.refreshSupport`; when the capability is absent the default is `false` — a
+/// client that never opted in gets no such request (see [`Backend::code_lens_refresh_support`]).
+fn client_supports_code_lens_refresh(params: &InitializeParams) -> bool {
+    params
+        .capabilities
+        .workspace
+        .as_ref()
+        .and_then(|w| w.code_lens.as_ref())
+        .and_then(|c| c.refresh_support)
+        .unwrap_or(false)
+}
+
+/// The `workspace/inlayHint/refresh` analogue of [`client_supports_code_lens_refresh`]: reads
+/// `workspace.inlayHint.refreshSupport`, same default.
+fn client_supports_inlay_hint_refresh(params: &InitializeParams) -> bool {
+    params
+        .capabilities
+        .workspace
+        .as_ref()
+        .and_then(|w| w.inlay_hint.as_ref())
+        .and_then(|c| c.refresh_support)
+        .unwrap_or(false)
+}
+
 /// Build a JSON-RPC [`Response`] for a request whose handler returns a serializable value.
 ///
 /// Extracts the typed params (the `$method` string was already matched, so only a JSON shape
@@ -2139,6 +2241,16 @@ impl Backend {
                 reply!(req, "textDocument/documentLink", DocumentLinkParams, |p| {
                     self.document_link(p)
                 })
+            }
+            // Code lens / inlay hint (node `lens-hints`), grouped together here to keep the merge
+            // with concurrent nodes touching this `match` localized to these two arms.
+            "textDocument/codeLens" => {
+                reply!(req, "textDocument/codeLens", CodeLensParams, |p| self
+                    .code_lens(p))
+            }
+            "textDocument/inlayHint" => {
+                reply!(req, "textDocument/inlayHint", InlayHintParams, |p| self
+                    .inlay_hint(p))
             }
             "textDocument/prepareRename" => reply!(
                 req,
@@ -2330,6 +2442,16 @@ impl Backend {
                     resolve_provider: Some(false),
                     work_done_progress_options: WorkDoneProgressOptions::default(),
                 }),
+                // Code lens: "N widgets inherit this style" on a top-level style's declared name
+                // (only when N >= 1). Computed eagerly per request, so `resolve_provider` is
+                // `false` — there is no `codeLens/resolve`.
+                code_lens_provider: Some(CodeLensOptions {
+                    resolve_provider: Some(false),
+                }),
+                // Inlay hints: the resolved native `UI*` ancestor after a based widget/style's
+                // `Base` token (`Foo < SomeStyle →UIButton`). A plain boolean provider — hints are
+                // computed on demand per requested viewport range.
+                inlay_hint_provider: Some(OneOf::Left(true)),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -2412,6 +2534,10 @@ impl Backend {
             let otpkg_cache = Arc::clone(&self.otpkg_cache);
             let sender = self.sender.clone();
             let encoding = self.encoding();
+            // Copied out (plain `bool`s, not the `Mutex`) so the scan thread can gate its own
+            // completion refresh without holding `&Backend` — see `send_workspace_refresh`.
+            let code_lens_refresh_support = self.code_lens_refresh_support();
+            let inlay_hint_refresh_support = self.inlay_hint_refresh_support();
             // The scan thread holds a `Sender` clone solely to refresh open documents once the
             // indexes are complete (see the completion refresh below) — otherwise a document opened
             // mid-scan would keep a stale widget-aware diagnostic until its next edit. To keep
@@ -2558,6 +2684,18 @@ impl Backend {
                         );
                     }
                 }
+                // The scan just populated the style/Lua indexes from scratch — every code lens or
+                // inlay hint an open document computed before this point (e.g. against an empty or
+                // partial index) may now be stale, not only that document's diagnostics above. Skip
+                // the request entirely if the scan found nothing to index (nothing could have
+                // changed a lens/hint's answer).
+                if indexed > 0 || lua_indexed > 0 {
+                    send_workspace_refresh(
+                        &sender,
+                        code_lens_refresh_support,
+                        inlay_hint_refresh_support,
+                    );
+                }
             });
         }
 
@@ -2622,6 +2760,14 @@ impl Backend {
         // A watched change mutated the style and/or Lua index; refresh open buffers so their
         // widget-aware diagnostics reflect it instead of going stale until the next edit.
         self.republish_open_documents();
+        // The same index mutation can also stale a code lens/inlay hint in an open document OTHER
+        // than the one that was just watched (e.g. a subtype added in file B leaves file A's "N
+        // widgets inherit this style" lens under-counting) — ask the client to re-request them.
+        send_workspace_refresh(
+            &self.sender,
+            self.code_lens_refresh_support(),
+            self.inlay_hint_refresh_support(),
+        );
     }
 
     /// Apply one watched-file change for a `.lua` module to both [`lua_index`](Self::lua_index)
@@ -2759,6 +2905,110 @@ impl Backend {
             });
         }
         Some(links)
+    }
+
+    /// `textDocument/codeLens`: "N widget(s) inherit this style" on a top-level style's declared
+    /// name, shown only when at least one style derives from it directly (spec §5.2's
+    /// `Name < Base` namespace is global, so a style's derivations can live in other documents).
+    ///
+    /// Eager, not lazy: `resolve_provider` is advertised `false`, so every `CodeLens` carries its
+    /// final `Command` up front.
+    ///
+    /// There is no portable, editor-agnostic LSP command for "show these locations" — VS Code's
+    /// built-in `editor.action.showReferences(uri, position, locations)` was considered and
+    /// rejected, not overlooked: `Command.arguments` are forwarded to the client verbatim, as the
+    /// raw LSP-JSON this handler serializes (`vscode-languageclient`'s `asCommand` copies
+    /// `item.arguments` through unconverted), but `editor.action.showReferences` expects real
+    /// `vscode.Uri`/`vscode.Position`/`vscode.Location` *class instances*, not their JSON shapes.
+    /// Every existing caller of it (e.g. rust-analyzer) gets there by registering an
+    /// extension-side command that does that JSON→API conversion before forwarding to the built-in
+    /// one.
+    ///
+    /// So this server follows that same pattern: it emits its own namespaced command id,
+    /// `otui.showSubtypes`, with plain-JSON `arguments: [uri, position]` (the style declaration's
+    /// document and the lens's position). The companion VS Code extension registers
+    /// `otui.showSubtypes` and, on click, re-runs `textDocument/implementation` at that position
+    /// (which this server already answers from `subtypes`) and peeks the results — so the N
+    /// derivations are never collected server-side here, only recomputed on demand by the
+    /// extension. A client that has not registered the command renders the lens title and no-ops
+    /// on click: harmless, same as an inert lens, but forward-compatible once the extension half
+    /// ships.
+    fn code_lens(&self, params: CodeLensParams) -> Option<Vec<CodeLens>> {
+        let uri = params.text_document.uri;
+        // Serve from the stored document text; an unknown document has no lenses, and (the
+        // OTUI-only language guard) neither does a `.lua` one.
+        let text = self.otui_document_text(&uri)?;
+
+        let encoding = self.encoding();
+        let index = LineIndex::new(&text);
+        let styles = self.style_index.read().expect("style_index lock poisoned");
+        let lenses = style_lenses(&text, &styles)
+            .into_iter()
+            .map(|lens| {
+                let n = lens.derived_count;
+                let title = if n == 1 {
+                    "1 widget inherits this style".to_owned()
+                } else {
+                    format!("{n} widgets inherit this style")
+                };
+                let range = index.range(lens.name_span.start, lens.name_span.end, encoding);
+                CodeLens {
+                    range,
+                    command: Some(Command {
+                        title,
+                        command: "otui.showSubtypes".to_owned(),
+                        arguments: Some(vec![
+                            serde_json::to_value(&uri).expect("Uri serializes"),
+                            serde_json::to_value(range.start).expect("Position serializes"),
+                        ]),
+                    }),
+                    data: None,
+                }
+            })
+            .collect();
+        Some(lenses)
+    }
+
+    /// `textDocument/inlayHint`: the resolved native `UI*` ancestor after a based widget/style's
+    /// `Base` token (`Foo < SomeStyle →UIButton`), so the reader sees what `Foo` ultimately *is*
+    /// without hand-walking the `Name < Base` chain. Filtered to the requested `params.range`
+    /// (the client's visible viewport), so a large document is never asked to hint off-screen.
+    fn inlay_hint(&self, params: InlayHintParams) -> Option<Vec<InlayHint>> {
+        let uri = params.text_document.uri;
+        // Serve from the stored document text; an unknown document has no hints, and (the
+        // OTUI-only language guard) neither does a `.lua` one.
+        let text = self.otui_document_text(&uri)?;
+
+        let encoding = self.encoding();
+        let index = LineIndex::new(&text);
+        // Convert the viewport once to a byte range, so filtering each hint is a plain offset
+        // comparison rather than a per-hint Position conversion.
+        let range_start = index.offset_at(params.range.start, encoding);
+        let range_end = index.offset_at(params.range.end, encoding);
+
+        let hints = {
+            let styles = self.style_index.read().expect("style_index lock poisoned");
+            let lua = self.lua_index.read().expect("lua_index lock poisoned");
+            ancestor_hints(&text, &styles, &lua)
+        };
+
+        let out = hints
+            .into_iter()
+            // LSP ranges are end-exclusive: a hint anchored exactly at `range_end` lies just past
+            // the requested viewport, not inside it.
+            .filter(|hint| range_start <= hint.anchor && hint.anchor < range_end)
+            .map(|hint| InlayHint {
+                position: index.position(hint.anchor, encoding),
+                label: InlayHintLabel::from(format!("→ {}", hint.native)),
+                kind: Some(InlayHintKind::TYPE),
+                text_edits: None,
+                tooltip: None,
+                padding_left: Some(true),
+                padding_right: None,
+                data: None,
+            })
+            .collect();
+        Some(out)
     }
 
     fn color_presentation(&self, params: ColorPresentationParams) -> Vec<ColorPresentation> {
@@ -3705,6 +3955,203 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let backend = Backend::new(tx, &InitializeParams::default());
         assert!(!backend.snippet_support());
+    }
+
+    fn params_with_refresh_support(
+        code_lens: Option<bool>,
+        inlay_hint: Option<bool>,
+    ) -> InitializeParams {
+        use lsp_types::{
+            CodeLensWorkspaceClientCapabilities, InlayHintWorkspaceClientCapabilities,
+            WorkspaceClientCapabilities,
+        };
+        InitializeParams {
+            capabilities: ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    code_lens: Some(CodeLensWorkspaceClientCapabilities {
+                        refresh_support: code_lens,
+                    }),
+                    inlay_hint: Some(InlayHintWorkspaceClientCapabilities {
+                        refresh_support: inlay_hint,
+                    }),
+                    ..WorkspaceClientCapabilities::default()
+                }),
+                ..ClientCapabilities::default()
+            },
+            ..InitializeParams::default()
+        }
+    }
+
+    #[test]
+    fn refresh_support_default_false_when_client_is_silent() {
+        // No workspace capabilities at all → the LSP default (no refresh requests) applies.
+        assert!(!client_supports_code_lens_refresh(
+            &InitializeParams::default()
+        ));
+        assert!(!client_supports_inlay_hint_refresh(
+            &InitializeParams::default()
+        ));
+        // The workspace/codeLens/inlayHint capability objects present but the flag omitted → still
+        // the default.
+        assert!(!client_supports_code_lens_refresh(
+            &params_with_refresh_support(None, None)
+        ));
+        assert!(!client_supports_inlay_hint_refresh(
+            &params_with_refresh_support(None, None)
+        ));
+    }
+
+    #[test]
+    fn refresh_support_true_only_when_client_opts_in_per_kind() {
+        // Each kind is read independently — a client that opts into one but not the other must not
+        // get both, or neither, conflated.
+        assert!(client_supports_code_lens_refresh(
+            &params_with_refresh_support(Some(true), Some(false))
+        ));
+        assert!(!client_supports_inlay_hint_refresh(
+            &params_with_refresh_support(Some(true), Some(false))
+        ));
+        assert!(!client_supports_code_lens_refresh(
+            &params_with_refresh_support(Some(false), Some(true))
+        ));
+        assert!(client_supports_inlay_hint_refresh(
+            &params_with_refresh_support(Some(false), Some(true))
+        ));
+    }
+
+    #[test]
+    fn backend_new_reads_refresh_support_from_init_params() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let backend = Backend::new(tx, &params_with_refresh_support(Some(true), Some(true)));
+        assert!(backend.code_lens_refresh_support());
+        assert!(backend.inlay_hint_refresh_support());
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let backend = Backend::new(tx, &InitializeParams::default());
+        assert!(!backend.code_lens_refresh_support());
+        assert!(!backend.inlay_hint_refresh_support());
+    }
+
+    /// Drain pending messages on `rx` and report whether a `Message::Request` for `method` (a
+    /// server→client `workspace/codeLens/refresh` or `workspace/inlayHint/refresh`) was among them.
+    fn drain_has_refresh_request(rx: &crossbeam_channel::Receiver<Message>, method: &str) -> bool {
+        let mut found = false;
+        while let Ok(msg) = rx.try_recv() {
+            if let Message::Request(req) = msg {
+                if req.method == method {
+                    found = true;
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn watched_file_change_sends_refresh_requests_only_when_the_client_opted_in() {
+        use lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        // A client that advertised both refresh capabilities gets both requests after a watched
+        // change mutates the index.
+        let base = std::env::temp_dir().join(format!("otui-refresh-watch-{}", std::process::id()));
+        std::fs::create_dir_all(&base).expect("mkdir");
+        let otui_path = base.join("styles.otui");
+        std::fs::write(&otui_path, "Panel < UIWidget\n").expect("write otui");
+        let otui_uri = uri_from_file_path(&otui_path).expect("uri");
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let backend = Backend::new(tx, &params_with_refresh_support(Some(true), Some(true)));
+        backend.did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: vec![FileEvent {
+                uri: otui_uri.clone(),
+                typ: FileChangeType::CREATED,
+            }],
+        });
+        assert!(
+            drain_has_refresh_request(&rx, "workspace/codeLens/refresh"),
+            "an opted-in client must get a codeLens/refresh after a watched-file index mutation"
+        );
+
+        // Re-run the drain against a fresh receiver (the previous drain consumed the channel) to
+        // check the inlayHint side independently.
+        let (tx2, rx2) = crossbeam_channel::unbounded();
+        let backend2 = Backend::new(tx2, &params_with_refresh_support(Some(true), Some(true)));
+        backend2.did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: vec![FileEvent {
+                uri: otui_uri.clone(),
+                typ: FileChangeType::CREATED,
+            }],
+        });
+        assert!(
+            drain_has_refresh_request(&rx2, "workspace/inlayHint/refresh"),
+            "an opted-in client must get an inlayHint/refresh after a watched-file index mutation"
+        );
+
+        // A client that never advertised either capability gets neither request — only the ignored
+        // (unrelated) diagnostics republish.
+        let (tx3, rx3) = crossbeam_channel::unbounded();
+        let backend3 = Backend::new(tx3, &InitializeParams::default());
+        backend3.did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: vec![FileEvent {
+                uri: otui_uri,
+                typ: FileChangeType::CREATED,
+            }],
+        });
+        assert!(
+            !drain_has_refresh_request(&rx3, "workspace/codeLens/refresh"),
+            "a client that never opted in must not receive a codeLens/refresh request"
+        );
+        assert!(
+            !drain_has_refresh_request(&rx3, "workspace/inlayHint/refresh"),
+            "a client that never opted in must not receive an inlayHint/refresh request"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn initial_scan_completion_sends_refresh_requests_when_the_client_opted_in() {
+        use std::time::Duration;
+
+        let base = std::env::temp_dir().join(format!("otui-refresh-scan-{}", std::process::id()));
+        std::fs::create_dir_all(&base).expect("mkdir");
+        std::fs::write(base.join("styles.otui"), "Panel < UIWidget\n").expect("write otui");
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let backend = Backend::new(tx, &params_with_refresh_support(Some(true), Some(true)));
+        *backend.roots.lock().expect("roots") = vec![uri_from_file_path(&base).expect("root")];
+
+        backend.run_initialized();
+
+        // Wait (bounded) for a `workspace/codeLens/refresh` request; the scan runs on a background
+        // thread, so this is not necessarily the first message on the channel.
+        let mut got_code_lens_refresh = false;
+        let mut got_inlay_hint_refresh = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline
+            && !(got_code_lens_refresh && got_inlay_hint_refresh)
+        {
+            let Ok(msg) = rx.recv_timeout(Duration::from_secs(5)) else {
+                break;
+            };
+            if let Message::Request(req) = msg {
+                match req.method.as_str() {
+                    "workspace/codeLens/refresh" => got_code_lens_refresh = true,
+                    "workspace/inlayHint/refresh" => got_inlay_hint_refresh = true,
+                    _ => {}
+                }
+            }
+        }
+        backend.signal_shutdown();
+        assert!(
+            got_code_lens_refresh,
+            "the initial scan's completion should send workspace/codeLens/refresh"
+        );
+        assert!(
+            got_inlay_hint_refresh,
+            "the initial scan's completion should send workspace/inlayHint/refresh"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// Build the `CompletionParams` for a cursor `position` in `uri`.

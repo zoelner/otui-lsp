@@ -11,10 +11,11 @@ use lsp_server::{Connection, Message, Notification, Request, RequestId, Response
 use lsp_types::{
     DiagnosticSeverity, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, FileChangeType, FileEvent, HoverParams,
-    InitializeParams, InitializedParams, Location, NumberOrString, PartialResultParams, Position,
-    PublishDiagnosticsParams, ReferenceContext, ReferenceParams, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Uri,
-    VersionedTextDocumentIdentifier, WorkDoneProgressParams, WorkspaceFolder,
+    InitializeParams, InitializedParams, InlayHintParams, Location, NumberOrString,
+    PartialResultParams, Position, PublishDiagnosticsParams, ReferenceContext, ReferenceParams,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, Uri, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
+    WorkspaceFolder,
 };
 use otui_lsp_server::{serve, Backend, Termination};
 
@@ -2002,4 +2003,249 @@ fn watched_delete_does_not_clobber_an_open_lua_buffer() {
     );
 
     shutdown_and_exit(&client, server_thread, 3);
+}
+
+/// The end-of-token [`Position`] of `needle` on line `line` (0-based) of `text` — ASCII-only test
+/// helper, distinct from [`position_of`] (which finds the *start* of the first whole-document
+/// occurrence): several fixtures below use base names that are themselves substrings of other
+/// tokens on the same line (e.g. `UIWidget` contains `Widget`), so this scopes the search to one
+/// line and returns the position right after the match.
+fn base_end_position(text: &str, line: u32, needle: &str) -> Position {
+    let line_text = text
+        .lines()
+        .nth(line as usize)
+        .unwrap_or_else(|| panic!("line {line} exists in {text:?}"));
+    let col = line_text
+        .find(needle)
+        .unwrap_or_else(|| panic!("{needle:?} present on line {line}: {line_text:?}"))
+        + needle.len();
+    Position::new(line, col as u32)
+}
+
+/// `textDocument/codeLens`, end-to-end: a style with direct derivations gets exactly one lens on
+/// its declared name, carrying the exact derived count; a style with none gets no lens at all.
+#[test]
+fn code_lens_reports_the_derived_count_on_the_style_name() {
+    let uri = Uri::from_str("file:///scratch/lens.otui").expect("uri");
+    // `Widget` has two direct derivations (`Foo`, `Bar`); neither of those has any derivation of
+    // its own, so only `Widget` should get a lens.
+    let source = "Widget < UIWidget\nFoo < Widget\nBar < Widget\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: source.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+    let _ = recv_diagnostics(&client, &uri);
+
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(2),
+            "textDocument/codeLens".to_owned(),
+            lsp_types::CodeLensParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: lsp_types::PartialResultParams::default(),
+            },
+        )))
+        .expect("send codeLens");
+    let resp = recv_response(&client, &RequestId::from(2));
+    assert!(resp.error.is_none(), "codeLens errored: {resp:?}");
+    let lenses: Vec<lsp_types::CodeLens> =
+        serde_json::from_value(resp.result.expect("codeLens result present"))
+            .expect("deserialize Vec<CodeLens>");
+
+    assert_eq!(
+        lenses.len(),
+        1,
+        "only Widget (which has derivations) should get a lens: {lenses:#?}"
+    );
+    let lens = &lenses[0];
+    // The lens is anchored on the declared name ("Widget", columns 0..6 on line 0).
+    assert_eq!(
+        lens.range,
+        lsp_types::Range::new(Position::new(0, 0), Position::new(0, 6))
+    );
+    let command = lens.command.as_ref().expect("lens carries a command");
+    assert!(
+        command.title.contains('2'),
+        "title must report the exact derived count: {:?}",
+        command.title
+    );
+    // The command id is handled by the companion VS Code extension: see `Backend::code_lens`'s
+    // doc comment for why this isn't the built-in `editor.action.showReferences`. Pinned here so
+    // an accidental rename/regression back to an empty id fails a test instead of shipping
+    // silently.
+    assert_eq!(
+        command.command, "otui.showSubtypes",
+        "the lens command must be the namespaced id the extension registers"
+    );
+    let arguments = command
+        .arguments
+        .as_ref()
+        .expect("otui.showSubtypes carries [uri, position] arguments");
+    assert_eq!(
+        *arguments,
+        vec![
+            serde_json::to_value(&uri).expect("Uri serializes"),
+            serde_json::to_value(Position::new(0, 0)).expect("Position serializes"),
+        ],
+        "arguments must be the style declaration's document URI and the lens position"
+    );
+
+    shutdown_and_exit(&client, server_thread, 3);
+}
+
+/// `textDocument/inlayHint`, end-to-end: a based style whose resolved native ancestor differs from
+/// the literal base token gets a `→ Native` hint right after that token; a base that already *is*
+/// the resolved native gets none (no-op echo); and a hint outside the requested viewport range is
+/// filtered out.
+#[test]
+fn inlay_hint_shows_the_native_ancestor_and_filters_to_the_requested_range() {
+    let uri = Uri::from_str("file:///scratch/inlay.otui").expect("uri");
+    // Widget < UIWidget: base already is the native class -> no hint.
+    // Foo < Widget, Bar < Widget: both resolve to native UIWidget, which differs from the literal
+    // "Widget" written -> both get a hint.
+    let source = "Widget < UIWidget\nFoo < Widget\nBar < Widget\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: source.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+    let _ = recv_diagnostics(&client, &uri);
+
+    // First: the whole-document viewport must surface both Foo's and Bar's hints (and never one
+    // for Widget's own already-native base).
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(2),
+            "textDocument/inlayHint".to_owned(),
+            InlayHintParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                range: lsp_types::Range::new(Position::new(0, 0), Position::new(3, 0)),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            },
+        )))
+        .expect("send inlayHint (whole document)");
+    let resp = recv_response(&client, &RequestId::from(2));
+    assert!(resp.error.is_none(), "inlayHint errored: {resp:?}");
+    let hints: Vec<lsp_types::InlayHint> =
+        serde_json::from_value(resp.result.expect("inlayHint result present"))
+            .expect("deserialize Vec<InlayHint>");
+
+    let foo_pos = base_end_position(source, 1, "Widget");
+    let bar_pos = base_end_position(source, 2, "Widget");
+    assert_eq!(
+        hints.len(),
+        2,
+        "Widget's own (already-native) base must not get a hint: {hints:#?}"
+    );
+    assert!(
+        hints.iter().any(|h| h.position == foo_pos),
+        "Foo's hint missing at {foo_pos:?}: {hints:#?}"
+    );
+    assert!(
+        hints.iter().any(|h| h.position == bar_pos),
+        "Bar's hint missing at {bar_pos:?}: {hints:#?}"
+    );
+    for hint in &hints {
+        let label = match &hint.label {
+            lsp_types::InlayHintLabel::String(s) => s.clone(),
+            lsp_types::InlayHintLabel::LabelParts(_) => panic!("expected a string label"),
+        };
+        assert!(
+            label.contains("UIWidget"),
+            "label must name the resolved native ancestor: {label:?}"
+        );
+    }
+
+    // Second: a viewport scoped to just Foo's line (line 1) must filter Bar's hint out. The end
+    // is line 2 column 0 (the start of Bar's line), well clear of `foo_pos` — not clamped to it —
+    // so this exercises the "Bar is outside the viewport" filter, not the end-exclusive boundary
+    // (that is covered separately below).
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(3),
+            "textDocument/inlayHint".to_owned(),
+            InlayHintParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                range: lsp_types::Range::new(Position::new(1, 0), Position::new(2, 0)),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            },
+        )))
+        .expect("send inlayHint (line 1 only)");
+    let resp = recv_response(&client, &RequestId::from(3));
+    assert!(resp.error.is_none(), "inlayHint errored: {resp:?}");
+    let scoped_hints: Vec<lsp_types::InlayHint> =
+        serde_json::from_value(resp.result.expect("inlayHint result present"))
+            .expect("deserialize Vec<InlayHint>");
+
+    assert_eq!(
+        scoped_hints.len(),
+        1,
+        "only Foo's hint (line 1) should survive the range filter: {scoped_hints:#?}"
+    );
+    assert_eq!(scoped_hints[0].position, foo_pos);
+    assert!(
+        !scoped_hints.iter().any(|h| h.position == bar_pos),
+        "Bar's hint (line 2) is outside the requested range and must be filtered out: \
+         {scoped_hints:#?}"
+    );
+
+    // Third: LSP ranges are end-exclusive, so a viewport whose end sits exactly at Bar's hint
+    // anchor must NOT include it — that anchor is one past the requested range, not inside it.
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(4),
+            "textDocument/inlayHint".to_owned(),
+            InlayHintParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                range: lsp_types::Range::new(Position::new(2, 0), bar_pos),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            },
+        )))
+        .expect("send inlayHint (range ending exactly at Bar's hint)");
+    let resp = recv_response(&client, &RequestId::from(4));
+    assert!(resp.error.is_none(), "inlayHint errored: {resp:?}");
+    let boundary_hints: Vec<lsp_types::InlayHint> =
+        serde_json::from_value(resp.result.expect("inlayHint result present"))
+            .expect("deserialize Vec<InlayHint>");
+    assert!(
+        boundary_hints.is_empty(),
+        "a hint anchored exactly at the range's (exclusive) end must be excluded: \
+         {boundary_hints:#?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 5);
 }
