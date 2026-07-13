@@ -12,12 +12,18 @@
 //! * `display` / `layout` → one of a fixed value set ([`schema::DISPLAY_VALUES`] /
 //!   [`schema::LAYOUT_TYPES`]);
 //! * `border` → the width-and-color shorthand;
-//! * any other **known** catalog property → a plain "OTUI style property" note.
+//! * any other **known**, uncurated, `Plain`-valued catalog property → nothing extra (there is
+//!   genuinely nothing beyond "this is a recognized property" to say).
 //!
 //! An **unknown** key yields `None` (no hover): the `unknown-property` diagnostic already tells the
 //! author it has no effect, and the widget-aware Lua-added properties are a separate concern (a later
 //! slice can describe them via the workspace indexes, mirroring `completion`). Pure: byte offsets in,
 //! a structured [`PropertyHover`] out — the server formats it into Markdown.
+//!
+//! [`documentation_body`] is the single shared formatter for "what does this property mean" markdown
+//! *body* text (everything but a `**\`name\`**` header): both the completion module (a global
+//! property-key item's `documentation`) and the server's property-key hover render call it, so the
+//! two surfaces can never drift apart on wording.
 
 use crate::catalog;
 use crate::schema;
@@ -250,6 +256,87 @@ pub fn classify_value(name: &str) -> PropertyValueKind {
     }
 }
 
+/// The shared Markdown documentation **body** for `name` — everything worth saying about it except
+/// a `**\`name\`**` header, which every caller prepends itself. The single source both the completion
+/// module (a global property-key item's `documentation`) and the server's property-key hover render
+/// build on, so the two surfaces never diverge.
+///
+/// `name` may be either:
+/// * a global catalog **property** key ([`schema::is_known_property`]) — the curated one-line
+///   behavior ([`property_doc`]) when present, else a plain sentence derived from its value kind
+///   ([`classify_value`]): `Color` → "Takes a color.", `AssetPath` → "Takes a texture path (extension
+///   optional).", `Border` → the width-and-color shorthand note, `Plain` → nothing (this branch
+///   returns `None` outright — there is genuinely nothing beyond the curated doc to add). An
+///   **enum**-valued property (`display`, `layout`) additionally gets a trailing `"One of: `a`,
+///   `b`, …"` line, unconditionally — even when a curated sentence already precedes it — mirroring
+///   the original hover render.
+/// * an `anchors.<edge>` **edge** key or shorthand key ([`schema::is_anchor_edge`] /
+///   [`schema::is_shorthand_anchor`], e.g. `top`, `fill`) — these are a distinct grammar node (not a
+///   `property_key`), so they bypass the catalog entirely and get their own short explanation. Used
+///   today by the completion module's `anchors.<edge>`/shorthand key items; `property_hover_at` does
+///   not (yet) resolve a hover on an anchor-edge token, so this branch is exercised only through
+///   completion for now.
+///
+/// `None` when `name` is neither of the above, or a known catalog property with no curated doc and a
+/// `Plain` value kind — genuinely nothing to say.
+#[must_use]
+pub fn documentation_body(name: &str) -> Option<String> {
+    if schema::is_anchor_edge(name) || schema::is_shorthand_anchor(name) {
+        return Some(anchor_edge_body(name));
+    }
+    if !schema::is_known_property(name) {
+        return None;
+    }
+    let value = classify_value(name);
+    let mut body = match property_doc(name) {
+        Some(doc) => doc.to_owned(),
+        None => match &value {
+            PropertyValueKind::Color => "Takes a color.".to_owned(),
+            PropertyValueKind::AssetPath => "Takes a texture path (extension optional).".to_owned(),
+            PropertyValueKind::Border => {
+                "A border shorthand: a width and a color (or `none`).".to_owned()
+            }
+            // An enum's own contribution is the "One of:" line appended below; there is no separate
+            // fallback sentence (every enum property today is also curated, so this is a defensive
+            // fallback, not a live path).
+            PropertyValueKind::Enum { .. } => String::new(),
+            // Nothing extra to say for an uncurated, plainly-typed property.
+            PropertyValueKind::Plain => return None,
+        },
+    };
+    if let PropertyValueKind::Enum { values } = &value {
+        if !body.is_empty() {
+            body.push_str("\n\n");
+        }
+        let list = values
+            .iter()
+            .map(|v| format!("`{v}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        body.push_str(&format!("One of: {list}"));
+    }
+    Some(body)
+}
+
+/// The documentation body for an `anchors.<edge>` edge key or shorthand key — `edge` is the bare
+/// spelling completion offers (`top`, `fill`, …), not the dotted `anchors.top` form. The two
+/// shorthands ([`schema::SHORTHAND_ANCHORS`]) get their own wording (they anchor more than one edge
+/// at once); every other name reaching here is a genuine [`schema::ANCHOR_EDGES`] member.
+fn anchor_edge_body(edge: &str) -> String {
+    match edge {
+        "fill" => "Anchors shorthand: anchors all four edges to the target widget, filling it \
+                   (`anchors.fill: <target>`)."
+            .to_owned(),
+        "centerIn" => "Anchors shorthand: anchors this widget's center to the target widget's \
+                       center (`anchors.centerIn: <target>`)."
+            .to_owned(),
+        _ => format!(
+            "Anchors this widget's `{edge}` edge to a target widget's edge, or a magic target \
+             (`parent`, `next`, `prev`) — `anchors.{edge}: <target>`."
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +464,62 @@ mod tests {
     fn a_non_property_token_has_no_hover() {
         // The style header name / base is a style hover, not a property hover.
         assert!(property_hover_at("Panel < UIWidget\n", 2).is_none());
+    }
+
+    // --- documentation_body: the shared completion/hover formatter -------------------------------
+
+    #[test]
+    fn documentation_body_uses_the_curated_doc_for_a_canonical_property() {
+        let body = documentation_body("width").expect("width has a doc");
+        assert!(body.contains("dimension"), "{body}");
+    }
+
+    #[test]
+    fn documentation_body_appends_one_of_for_an_enum_property() {
+        let body = documentation_body("display").expect("display has a doc");
+        assert!(body.contains("One of:"), "{body}");
+        for value in schema::DISPLAY_VALUES {
+            assert!(body.contains(&format!("`{value}`")), "{body}");
+        }
+    }
+
+    #[test]
+    fn documentation_body_covers_the_border_shorthand() {
+        let body = documentation_body("border").expect("border has a doc");
+        assert!(body.to_lowercase().contains("shorthand"), "{body}");
+    }
+
+    #[test]
+    fn documentation_body_falls_back_to_the_color_sentence_when_uncurated() {
+        // `border-color-bottom` is color-typed but has no curated one-liner.
+        let body =
+            documentation_body("border-color-bottom").expect("border-color-bottom has a doc");
+        assert_eq!(body, "Takes a color.");
+    }
+
+    #[test]
+    fn documentation_body_is_none_for_an_uncurated_plain_property() {
+        // `min-width` is known but Plain-valued and uncurated: genuinely nothing extra to say.
+        assert_eq!(documentation_body("min-width"), None);
+    }
+
+    #[test]
+    fn documentation_body_is_none_for_an_unknown_name() {
+        assert_eq!(documentation_body("not-a-real-property"), None);
+    }
+
+    #[test]
+    fn documentation_body_describes_an_anchor_edge_key() {
+        let body = documentation_body("top").expect("anchor edge has a doc");
+        assert!(body.contains("edge"), "{body}");
+        assert!(body.contains("anchors.top"), "{body}");
+    }
+
+    #[test]
+    fn documentation_body_describes_the_anchor_shorthands() {
+        let fill = documentation_body("fill").expect("fill has a doc");
+        assert!(fill.to_lowercase().contains("all four edges"), "{fill}");
+        let center_in = documentation_body("centerIn").expect("centerIn has a doc");
+        assert!(center_in.to_lowercase().contains("center"), "{center_in}");
     }
 }

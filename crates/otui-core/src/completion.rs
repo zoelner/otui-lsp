@@ -255,7 +255,7 @@ fn indented_slot_items(
             "property",
             '1',
             insert,
-            property_key_documentation(prop),
+            property_hover::documentation_body(prop),
         );
     }
     // 3. Child-widget names in scope across the workspace. Each carries a snippet: the widget name
@@ -267,37 +267,6 @@ fn indented_slot_items(
         push(name, CompletionKind::Class, detail, '2', insert, None);
     }
     items
-}
-
-/// The Markdown documentation for a global property **key** completion item: the curated one-line
-/// behavior note ([`property_hover::property_doc`]), with a trailing "One of: `a`, `b`, …" line
-/// appended when the property's value is a fixed enum ([`property_hover::classify_value`]) —
-/// mirroring how the server's property-key hover renders the same data (spec §5.5). `None` when the
-/// property has no curated doc and no enum value (a plain known property with nothing to add).
-fn property_key_documentation(name: &str) -> Option<String> {
-    let doc = property_hover::property_doc(name);
-    let enum_values = match property_hover::classify_value(name) {
-        property_hover::PropertyValueKind::Enum { values } => Some(values),
-        _ => None,
-    };
-    match (doc, enum_values) {
-        (None, None) => None,
-        (doc, values) => {
-            let mut text = doc.unwrap_or_default().to_owned();
-            if let Some(values) = values {
-                if !text.is_empty() {
-                    text.push_str("\n\n");
-                }
-                let list = values
-                    .iter()
-                    .map(|v| format!("`{v}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                text.push_str(&format!("One of: {list}"));
-            }
-            Some(text)
-        }
-    }
 }
 
 /// The snippet body for completing a property **key**: the key, a colon-space, and a final tab-stop
@@ -757,6 +726,10 @@ fn set_items(set: &[&str], kind: CompletionKind, detail: &str) -> Vec<Completion
 /// Like [`set_items`], but each item's insert text continues straight into the value slot the key
 /// always opens onto: `{label}: $0`. Used for the `@event` and `anchors.<edge>` closed sets, whose
 /// grammar shape (`key: value`) is fixed the moment the key is chosen.
+///
+/// Each item's `documentation` comes from the shared [`property_hover::documentation_body`]: this is
+/// `Some` for an anchor edge/shorthand label (`top`, `fill`, …) and `None` for an `@event` name (no
+/// curated note exists for those; see the module docs).
 fn key_snippet_items(set: &[&str], kind: CompletionKind, detail: &str) -> Vec<CompletionItem> {
     set.iter()
         .map(|&label| CompletionItem {
@@ -766,7 +739,7 @@ fn key_snippet_items(set: &[&str], kind: CompletionKind, detail: &str) -> Vec<Co
             sort_text: None,
             insert_text: Some(property_key_snippet(label)),
             insert_format: InsertFormat::Snippet,
-            documentation: None,
+            documentation: property_hover::documentation_body(label),
         })
         .collect()
 }
@@ -1608,6 +1581,34 @@ Window < UIWindow
                 Some(format!("{shorthand}: $0")).as_deref()
             );
         }
+    }
+
+    #[test]
+    fn anchor_edge_and_shorthand_completions_carry_documentation() {
+        // Anchor edges/shorthands are not catalog properties, but they get their own documentation
+        // from the shared `property_hover::documentation_body` formatter (Finding A: previously
+        // `None`).
+        let src = "Widget\n  anchors.\n";
+        let items = complete_at(src, at(src, "anchors.") + "anchors.".len());
+        let top = items.iter().find(|i| i.label == "top").expect("top edge");
+        let top_doc = top.documentation.as_deref().expect("top has a doc");
+        assert!(top_doc.contains("edge"), "{top_doc}");
+
+        let fill = items.iter().find(|i| i.label == "fill").expect("fill");
+        let fill_doc = fill.documentation.as_deref().expect("fill has a doc");
+        assert!(
+            fill_doc.to_lowercase().contains("all four edges"),
+            "{fill_doc}"
+        );
+
+        // An `@event` name gets no documentation — no curated note exists for those.
+        let src = "Button\n  @onCl\n";
+        let items = complete_at(src, at(src, "@onCl") + "@onCl".len());
+        let on_click = items
+            .iter()
+            .find(|i| i.label == "onClick")
+            .expect("onClick");
+        assert_eq!(on_click.documentation, None);
     }
 
     #[test]

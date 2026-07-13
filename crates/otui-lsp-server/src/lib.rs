@@ -81,7 +81,7 @@ use otui_core::lua_ui_loads::scan_ui_loads;
 use otui_core::lua_widgets::LuaWidgetIndex;
 use otui_core::manifest::{analyze_font_manifest, analyze_manifest};
 use otui_core::otmod::otmod_scripts;
-use otui_core::property_hover::{PropertyHover, PropertyValueKind};
+use otui_core::property_hover::PropertyHover;
 use otui_core::style_index::{DocId, StyleDef, StyleIndex, is_native_base};
 
 use crate::position::{LineIndex, PositionEncoding};
@@ -2567,40 +2567,19 @@ fn render_hover(desc: &StyleHover, line_index: &LineIndex, encoding: PositionEnc
 }
 
 /// Format a [`PropertyHover`] (a property-key description from the engine) into an LSP Markdown
-/// [`Hover`]. Pure presentation: [`otui_core`] decided the property's value kind from its catalog +
-/// schema metadata; here we only word it and map the key span to a range.
+/// [`Hover`]. Pure presentation: the body markdown itself comes from
+/// [`otui_core::property_hover::documentation_body`] — the single formatter also used for a global
+/// property-key completion item's `documentation`, so the two surfaces never diverge; this only
+/// prepends the `**\`name\`**` header and maps the key span to a range.
 fn render_property_hover(
     desc: &PropertyHover,
     line_index: &LineIndex,
     encoding: PositionEncoding,
 ) -> Hover {
     let name = &desc.name;
-    // Prefer the curated behavior sentence; fall back to a value-kind description when the property
-    // is known but outside the curated canonical set.
-    let title = match desc.doc {
-        Some(doc) => format!("**`{name}`** — {doc}"),
-        None => {
-            let body = match &desc.value {
-                PropertyValueKind::Color => "a color value",
-                PropertyValueKind::AssetPath => {
-                    "an asset path (a texture) — the `.png` extension is optional"
-                }
-                PropertyValueKind::Enum { .. } => "one of a fixed value set (see below)",
-                PropertyValueKind::Border => "a border shorthand: a width and a color (or `none`)",
-                PropertyValueKind::Plain => "an OTUI style property",
-            };
-            format!("**`{name}`** — {body}")
-        }
-    };
-    let mut value = title;
-    // For a fixed-value-set property (display, layout), always append the full accepted list.
-    if let PropertyValueKind::Enum { values } = &desc.value {
-        let list = values
-            .iter()
-            .map(|v| format!("`{v}`"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        value.push_str(&format!("\n\nOne of: {list}"));
+    let mut value = format!("**`{name}`**");
+    if let Some(body) = otui_core::property_hover::documentation_body(name) {
+        value.push_str(&format!(" — {body}"));
     }
     Hover {
         contents: HoverContents::Markup(MarkupContent {
@@ -7364,15 +7343,17 @@ end
 
     #[test]
     fn hover_on_a_known_uncurated_property_uses_the_value_kind_fallback() {
-        // `min-width` is a real catalog property with no curated doc → the plain value-kind fallback.
+        // `min-width` is a real catalog property, no curated doc, Plain-valued: per
+        // `documentation_body`'s "Plain -> nothing extra" rule there is genuinely nothing beyond the
+        // bare name to say, so the header shows alone (no dangling " — ").
         let t = property_hover_text("Panel\n  min-width: 10\n", "min-width");
-        assert!(
-            t.contains("**`min-width`**") && t.contains("OTUI style property"),
-            "{t}"
-        );
+        assert_eq!(t, "**`min-width`**");
         // `border-color-bottom` is a color property with no curated doc → the color-value fallback.
         let t2 = property_hover_text("Panel\n  border-color-bottom: red\n", "border-color-bottom");
-        assert!(t2.contains("a color value"), "{t2}");
+        assert!(
+            t2.contains("**`border-color-bottom`**") && t2.contains("Takes a color."),
+            "{t2}"
+        );
     }
 
     /// The [`CodeAction`] inside a [`CodeActionOrCommand`] (panics if it is a bare command).
