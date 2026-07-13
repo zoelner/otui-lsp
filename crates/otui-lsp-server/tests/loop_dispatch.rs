@@ -9,9 +9,11 @@ use std::time::Duration;
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
-    DiagnosticSeverity, DidOpenTextDocumentParams, HoverParams, InitializeParams,
-    InitializedParams, NumberOrString, Position, PublishDiagnosticsParams, TextDocumentIdentifier,
-    TextDocumentItem, TextDocumentPositionParams, Uri, WorkDoneProgressParams, WorkspaceFolder,
+    DiagnosticSeverity, DidChangeTextDocumentParams, DidOpenTextDocumentParams, HoverParams,
+    InitializeParams, InitializedParams, Location, NumberOrString, PartialResultParams, Position,
+    PublishDiagnosticsParams, ReferenceContext, ReferenceParams, TextDocumentContentChangeEvent,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Uri,
+    VersionedTextDocumentIdentifier, WorkDoneProgressParams, WorkspaceFolder,
 };
 use otui_lsp_server::{serve, Backend, Termination};
 
@@ -962,4 +964,339 @@ fn hover_markdown(resp: &Response) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or_else(|| panic!("expected markup hover contents, got {result}"))
         .to_owned()
+}
+
+/// Send a `textDocument/references` request for `uri`/`position` and decode the response into
+/// `Option<Vec<Location>>` (the LSP-null vs. empty-array distinction collapses to `None` vs.
+/// `Some(vec![])`, matching what `serde_json` gives back for a JSON `null` result either way).
+fn send_references(
+    client: &Connection,
+    id: i32,
+    uri: &Uri,
+    position: Position,
+    include_declaration: bool,
+) -> Option<Vec<Location>> {
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(id),
+            "textDocument/references".to_owned(),
+            ReferenceParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position,
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+                context: ReferenceContext {
+                    include_declaration,
+                },
+            },
+        )))
+        .expect("send references");
+    let resp = recv_response(client, &RequestId::from(id));
+    assert!(resp.error.is_none(), "references errored: {resp:?}");
+    resp.result
+        .filter(|v| !v.is_null())
+        .map(|v| serde_json::from_value(v).expect("Vec<Location>"))
+}
+
+/// Read from the client end until the `n`th `textDocument/publishDiagnostics` notification for
+/// `uri` has arrived (1-based), skipping everything else in between. Used to detect "the background
+/// workspace scan's completion refresh has run": `did_open` always sends the FIRST diagnostics push
+/// synchronously, so waiting for a SECOND one for the same `uri` is a deterministic (non-sleeping)
+/// signal that the scan — which republishes diagnostics for every open document once it finishes —
+/// has completed, and so has whatever it indexes (here, `lua_ref_index`).
+///
+/// Bounded by [`RECV_TIMEOUT`] for the same reason as [`recv_diagnostics`].
+fn wait_for_nth_diagnostics(client: &Connection, uri: &Uri, n: usize) -> PublishDiagnosticsParams {
+    let mut count = 0usize;
+    loop {
+        match client.receiver.recv_timeout(RECV_TIMEOUT) {
+            Ok(Message::Notification(note)) if note.method == "textDocument/publishDiagnostics" => {
+                let params: PublishDiagnosticsParams = serde_json::from_value(note.params)
+                    .expect("deserialize PublishDiagnosticsParams");
+                if &params.uri == uri {
+                    count += 1;
+                    if count == n {
+                        return params;
+                    }
+                }
+            }
+            Ok(_) => continue,
+            Err(e) => panic!(
+                "timed out after {RECV_TIMEOUT:?} waiting for publishDiagnostics #{n} for {uri:?} \
+                 (server channel: {e})"
+            ),
+        }
+    }
+}
+
+/// The `[start, start + needle.len())` LSP [`lsp_types::Range`] of the first occurrence of `needle`
+/// in `text` — pairs with [`position_of`] (same ASCII-only assumption) to assert a `Location`'s exact
+/// range, not just its containing document.
+fn range_of(text: &str, needle: &str) -> lsp_types::Range {
+    let start = position_of(text, needle);
+    let end = Position::new(start.line, start.character + needle.len() as u32);
+    lsp_types::Range { start, end }
+}
+
+/// The OTUI↔Lua id cross-reference bridge (spec §2.3), driven entirely through files on disk and the
+/// background workspace scan — no `.lua` document is ever opened in this test. This exercises:
+///
+/// * **Forward** (OTUI `id:` → Lua): `textDocument/references` on `login.otui`'s `id: closeButton`
+///   must include, beyond the usual document-local result, the `getChildById('closeButton')` call in
+///   the PAIRED `login.lua` — found purely from the disk scan's `lua_ref_index` entry, proving the
+///   startup-scan fix (a `.lua` file with refs but no widget defs must not be skipped by the
+///   `defs.is_empty()` continue).
+/// * **Scoping (negative)**: an unrelated `other/other.lua` references the SAME id string
+///   (`closeButton`) but is not `login.otui`'s pair — its location must never appear. This is the
+///   correctness boundary the whole node rests on (workspace-wide `LuaRefIndex::lookup` would leak
+///   it; `LuaRefIndex::document` on the paired doc only must not).
+/// * **Reverse** (Lua → OTUI): `textDocument/references` on the `closeButton` argument inside
+///   `login.lua`'s `getChildById` call — again never opened — must resolve back to the `id:`
+///   declaration in `login.otui`, and must resolve to NOTHING for `other.lua` (it has no paired
+///   `.otui` on disk at all).
+#[test]
+fn otui_lua_bridge_resolves_both_directions_via_the_disk_scan() {
+    let base = std::env::temp_dir().join(format!(
+        "otui-lua-bridge-disk-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _cleanup = TempDirGuard(base.clone());
+
+    let login_dir = base.join("modules").join("login");
+    std::fs::create_dir_all(&login_dir).expect("mkdir login");
+    let login_otui_src = "MainWindow < UIWidget\n  Button\n    id: closeButton\n";
+    let login_otui_path = login_dir.join("login.otui");
+    std::fs::write(&login_otui_path, login_otui_src).expect("write login.otui");
+
+    let login_lua_src =
+        "function onCreate(rootWidget)\n  local btn = rootWidget:getChildById('closeButton')\n  \
+         btn:hide()\nend\n";
+    let login_lua_path = login_dir.join("login.lua");
+    std::fs::write(&login_lua_path, login_lua_src).expect("write login.lua");
+
+    // A DIFFERENT module, unpaired with login.otui (different directory AND stem), that happens to
+    // reference the very same id string. Its location must never leak into either direction.
+    let other_dir = base.join("modules").join("other");
+    std::fs::create_dir_all(&other_dir).expect("mkdir other");
+    let other_lua_src =
+        "function onCreate(rootWidget)\n  local btn = rootWidget:getChildById('closeButton')\nend\n";
+    let other_lua_path = other_dir.join("other.lua");
+    std::fs::write(&other_lua_path, other_lua_src).expect("write other.lua");
+
+    let login_otui_uri = file_uri(&login_otui_path);
+    let login_lua_uri = file_uri(&login_lua_path);
+    let other_lua_uri = file_uri(&other_lua_path);
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+
+    #[allow(deprecated)]
+    client_handshake_with_params(
+        &client,
+        InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: file_uri(&base),
+                name: "ws".to_owned(),
+            }]),
+            ..InitializeParams::default()
+        },
+    );
+
+    // Open only the `.otui` file — deliberately never `login.lua`/`other.lua` — so every Lua-side
+    // result in this test can only have come from the disk scan.
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: login_otui_uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: login_otui_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+
+    // First push is `did_open`'s own synchronous publish; the second is the scan's completion
+    // refresh, which only fires once BOTH the `.otui` and `.lua` scans (including `lua_ref_index`)
+    // have finished — see `wait_for_nth_diagnostics`'s doc comment. One call, `n = 2`: each call
+    // starts counting from scratch over newly received messages, so two separate `n = 1` calls would
+    // actually wait for the 3rd push overall, not the 2nd.
+    let _ = wait_for_nth_diagnostics(&client, &login_otui_uri, 2);
+
+    // --- Forward: id: closeButton -> its uses, scoped to the paired login.lua only. ---
+    let forward = send_references(
+        &client,
+        2,
+        &login_otui_uri,
+        position_of(login_otui_src, "closeButton"),
+        true,
+    )
+    .expect("forward references present");
+
+    let in_login_lua: Vec<&Location> = forward.iter().filter(|l| l.uri == login_lua_uri).collect();
+    assert_eq!(
+        in_login_lua.len(),
+        1,
+        "the paired login.lua's getChildById call must appear exactly once: {forward:#?}"
+    );
+    assert_eq!(
+        in_login_lua[0].range,
+        range_of(login_lua_src, "closeButton"),
+        "the location must land on the id token inside the quotes, not the whole call"
+    );
+    assert!(
+        forward.iter().all(|l| l.uri != other_lua_uri),
+        "an unpaired module referencing the same id string must never appear: {forward:#?}"
+    );
+    // The pre-existing OTUI-local declaration is still present alongside the bridged result.
+    assert!(
+        forward
+            .iter()
+            .any(|l| l.uri == login_otui_uri && l.range == range_of(login_otui_src, "closeButton")),
+        "the local id: declaration must still be included: {forward:#?}"
+    );
+
+    // --- Reverse: the getChildById argument in login.lua -> the id: declaration in login.otui. ---
+    let reverse = send_references(
+        &client,
+        3,
+        &login_lua_uri,
+        position_of(login_lua_src, "closeButton"),
+        true,
+    )
+    .expect("reverse references present");
+    assert_eq!(
+        reverse.len(),
+        1,
+        "exactly one declaration site: {reverse:#?}"
+    );
+    assert_eq!(reverse[0].uri, login_otui_uri);
+    assert_eq!(reverse[0].range, range_of(login_otui_src, "closeButton"));
+
+    // --- Reverse, unpaired: other.lua has no `.otui` sibling on disk at all -> nothing resolves. ---
+    let reverse_unpaired = send_references(
+        &client,
+        4,
+        &other_lua_uri,
+        position_of(other_lua_src, "closeButton"),
+        true,
+    )
+    .expect("reverse (unpaired) still answers Some, just empty");
+    assert!(
+        reverse_unpaired.is_empty(),
+        "other.lua has no paired .otui, so nothing should resolve: {reverse_unpaired:#?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 5);
+}
+
+/// The forward direction of the bridge must see an **unsaved** edit to an open `.lua` buffer — not
+/// just what is on disk — so a controller mid-edit still resolves. Exercises
+/// `Backend::reindex_lua_refs_open` (wired from `did_open`/`did_change`) with no workspace root at
+/// all, so only the open-buffer path is in play (there is no background scan to race against).
+#[test]
+fn forward_references_see_an_unsaved_lua_buffer_edit() {
+    let panel_otui_src = "Panel < UIWidget\n  Button\n    id: closeButton\n";
+    let panel_otui_uri = Uri::from_str("file:///scratch/panel.otui").expect("uri");
+    let panel_lua_uri = Uri::from_str("file:///scratch/panel.lua").expect("uri");
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: panel_otui_uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: panel_otui_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen otui");
+    let _ = recv_diagnostics(&client, &panel_otui_uri);
+
+    // Open the paired .lua buffer with text that does NOT yet reference the id.
+    let initial_lua = "-- nothing here yet\n";
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: panel_lua_uri.clone(),
+                    language_id: "lua".to_owned(),
+                    version: 1,
+                    text: initial_lua.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen lua");
+    // A `.lua` document still gets an (empty) diagnostics push (the language guard) — wait for it so
+    // the didOpen has been fully processed before the references request below.
+    let _ = recv_diagnostics(&client, &panel_lua_uri);
+
+    // Sanity: before the edit, the bridge finds nothing in panel.lua.
+    let before = send_references(
+        &client,
+        2,
+        &panel_otui_uri,
+        position_of(panel_otui_src, "closeButton"),
+        false,
+    )
+    .expect("references present");
+    assert!(
+        before.iter().all(|l| l.uri != panel_lua_uri),
+        "no reference exists yet: {before:#?}"
+    );
+
+    // Edit the (still unsaved) buffer to add a getChildById call.
+    let edited_lua = "-- nothing here yet\nlocal btn = rootWidget:getChildById('closeButton')\n";
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didChange".to_owned(),
+            DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: panel_lua_uri.clone(),
+                    version: 2,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: edited_lua.to_owned(),
+                }],
+            },
+        )))
+        .expect("send didChange lua");
+    let _ = recv_diagnostics(&client, &panel_lua_uri);
+
+    let after = send_references(
+        &client,
+        3,
+        &panel_otui_uri,
+        position_of(panel_otui_src, "closeButton"),
+        false,
+    )
+    .expect("references present");
+    let in_lua: Vec<&Location> = after.iter().filter(|l| l.uri == panel_lua_uri).collect();
+    assert_eq!(
+        in_lua.len(),
+        1,
+        "the unsaved edit must be reflected immediately, without a save: {after:#?}"
+    );
+    assert_eq!(in_lua[0].range, range_of(edited_lua, "closeButton"));
+
+    shutdown_and_exit(&client, server_thread, 4);
 }
