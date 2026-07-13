@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::str::FromStr;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
@@ -1002,33 +1002,57 @@ fn send_references(
         .map(|v| serde_json::from_value(v).expect("Vec<Location>"))
 }
 
-/// Read from the client end until the `n`th `textDocument/publishDiagnostics` notification for
-/// `uri` has arrived (1-based), skipping everything else in between. Used to detect "the background
-/// workspace scan's completion refresh has run": `did_open` always sends the FIRST diagnostics push
-/// synchronously, so waiting for a SECOND one for the same `uri` is a deterministic (non-sleeping)
-/// signal that the scan — which republishes diagnostics for every open document once it finishes —
-/// has completed, and so has whatever it indexes (here, `lua_ref_index`).
+/// Poll `textDocument/references` for `uri`/`position` until `accept` returns `true` for a `Some`
+/// result, or the overall [`RECV_TIMEOUT`] deadline elapses — whichever comes first.
 ///
-/// Bounded by [`RECV_TIMEOUT`] for the same reason as [`recv_diagnostics`].
-fn wait_for_nth_diagnostics(client: &Connection, uri: &Uri, n: usize) -> PublishDiagnosticsParams {
-    let mut count = 0usize;
+/// This is the deterministic replacement for a since-retired helper that waited for the SECOND
+/// `textDocument/publishDiagnostics` push as a "the background scan has finished" signal: `did_open`
+/// sends the first push synchronously, and the scan republishes every open document once it
+/// completes, so a second push *looked* like a safe "scan done" marker. It was not: the scan is
+/// spawned from `initialized`, so for a workspace this small it can finish (and run its completion
+/// refresh) BEFORE the server has even processed the test's `did_open` notification — the refresh
+/// then iterates zero open documents, the second push never comes, and the test hangs for the full
+/// [`RECV_TIMEOUT`] on a race, not a bug (see the `references` handlers: they read `style_index`/
+/// `lua_ref_index`/`lua_texts` live on every call, with no dependency on that diagnostics republish at
+/// all — the republish is a UX nicety, not a correctness gate).
+///
+/// Polling the actual query sidesteps the race entirely: once the scan has indexed what a given
+/// query needs, the very next poll observes it, independent of any diagnostics ordering. Each attempt
+/// gets a fresh request id, taken from (and incrementing) `*next_id`, so no two in-flight requests in
+/// a retry loop ever share an id. Panics with the last-seen result — never a silent pass — if `accept`
+/// still rejects everything once the deadline passes.
+///
+/// Callers should generally pass `accept = |_| true` — "any `Some` means the file this query needs is
+/// indexed" — and assert on the *returned* `Vec<Location>` afterward with plain `assert_eq!`/`assert!`,
+/// rather than folding the expected content into `accept` itself. That way a genuine product
+/// regression is reported as an immediate, specific assertion failure, not as this function's 10s
+/// timeout panic (which reads as "the scan never finished" even when it did, and the answer was simply
+/// wrong).
+fn references_until(
+    client: &Connection,
+    next_id: &mut i32,
+    uri: &Uri,
+    position: Position,
+    include_declaration: bool,
+    mut accept: impl FnMut(&[Location]) -> bool,
+) -> Vec<Location> {
+    let deadline = Instant::now() + RECV_TIMEOUT;
+    let mut last: Option<Vec<Location>> = None;
     loop {
-        match client.receiver.recv_timeout(RECV_TIMEOUT) {
-            Ok(Message::Notification(note)) if note.method == "textDocument/publishDiagnostics" => {
-                let params: PublishDiagnosticsParams = serde_json::from_value(note.params)
-                    .expect("deserialize PublishDiagnosticsParams");
-                if &params.uri == uri {
-                    count += 1;
-                    if count == n {
-                        return params;
-                    }
-                }
+        let id = *next_id;
+        *next_id += 1;
+        if let Some(locations) = send_references(client, id, uri, position, include_declaration) {
+            if accept(&locations) {
+                return locations;
             }
-            Ok(_) => continue,
-            Err(e) => panic!(
-                "timed out after {RECV_TIMEOUT:?} waiting for publishDiagnostics #{n} for {uri:?} \
-                 (server channel: {e})"
-            ),
+            last = Some(locations);
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "textDocument/references for {uri:?} at {position:?} never satisfied the expected \
+                 condition within {RECV_TIMEOUT:?} of polling (the background scan likely never \
+                 finished indexing what this query needs); last non-null result: {last:?}"
+            );
         }
     }
 }
@@ -1058,6 +1082,14 @@ fn range_of(text: &str, needle: &str) -> lsp_types::Range {
 ///   `login.lua`'s `getChildById` call — again never opened — must resolve back to the `id:`
 ///   declaration in `login.otui`, and must resolve to NOTHING for `other.lua` (it has no paired
 ///   `.otui` on disk at all).
+///
+/// The body below checks these in REVERSE order (reverse, then reverse-unpaired, then forward), not
+/// the order listed above: the two reverse queries are polled to convergence via
+/// [`references_until`], and convergence on both doubles as proof that the background scan has fully
+/// indexed both `login.lua` and `other.lua` — which the forward query's negative-scoping assertion
+/// needs to be reliable (see `references_until`'s doc comment for why waiting on a diagnostics count
+/// instead was flaky, and the forward query's own comment for why it deliberately runs last,
+/// unretried).
 #[test]
 fn otui_lua_bridge_resolves_both_directions_via_the_disk_scan() {
     let base = std::env::temp_dir().join(format!(
@@ -1124,17 +1156,63 @@ fn otui_lua_bridge_resolves_both_directions_via_the_disk_scan() {
         )))
         .expect("send didOpen");
 
-    // First push is `did_open`'s own synchronous publish; the second is the scan's completion
-    // refresh, which only fires once BOTH the `.otui` and `.lua` scans (including `lua_ref_index`)
-    // have finished — see `wait_for_nth_diagnostics`'s doc comment. One call, `n = 2`: each call
-    // starts counting from scratch over newly received messages, so two separate `n = 1` calls would
-    // actually wait for the 3rd push overall, not the 2nd.
-    let _ = wait_for_nth_diagnostics(&client, &login_otui_uri, 2);
+    // Request ids for everything below are handed out from this counter: `references_until` may
+    // issue several attempts per call, so a fixed literal per call (as a single `send_references`
+    // would use) is not enough.
+    let mut next_id = 2i32;
 
-    // --- Forward: id: closeButton -> its uses, scoped to the paired login.lua only. ---
+    // --- Reverse first, polled: the getChildById argument in login.lua -> the id: declaration in
+    // login.otui. The poll only waits for readiness (any `Some`) — never for the expected content —
+    // so a real bug in the resolution surfaces as a normal, immediate `assert_eq!` failure below, not
+    // a 10s helper timeout. `references` reads `lua_ref_index`/`lua_texts` live and a whole file's
+    // refs are written in one atomic `set_document` call (never partially), so the first `Some` this
+    // sees is already login.lua's fully-indexed, final answer. Converging here also proves login.lua
+    // has been fully indexed by the background scan — a prerequisite the forward query's
+    // negative-scoping check below relies on.
+    let reverse = references_until(
+        &client,
+        &mut next_id,
+        &login_lua_uri,
+        position_of(login_lua_src, "closeButton"),
+        true,
+        |_locs| true,
+    );
+    assert_eq!(
+        reverse.len(),
+        1,
+        "exactly one declaration site: {reverse:#?}"
+    );
+    assert_eq!(reverse[0].uri, login_otui_uri);
+    assert_eq!(reverse[0].range, range_of(login_otui_src, "closeButton"));
+
+    // --- Reverse, unpaired, polled: other.lua has no `.otui` sibling on disk at all -> nothing
+    // resolves. `lua_references` answers `None` (not yet indexed) until the scan reaches other.lua,
+    // then `Some([])` forever after (it is permanently unpaired) — so "any `Some` result" is already
+    // the converged, correct signal here, and polling for it also proves other.lua has been fully
+    // indexed, the second prerequisite for the forward query below.
+    let reverse_unpaired = references_until(
+        &client,
+        &mut next_id,
+        &other_lua_uri,
+        position_of(other_lua_src, "closeButton"),
+        true,
+        |_locs| true,
+    );
+    assert!(
+        reverse_unpaired.is_empty(),
+        "other.lua has no paired .otui, so nothing should resolve: {reverse_unpaired:#?}"
+    );
+
+    // --- Forward: id: closeButton -> its uses, scoped to the paired login.lua only. Both login.lua
+    // and other.lua are now confirmed fully indexed (the two polls above), so this single, unretried
+    // query already reflects the scan's final state — including for the negative-scoping assertion,
+    // which would otherwise risk a false pass if `other.lua` had not been indexed yet at the moment it
+    // was checked. ---
+    let forward_id = next_id;
+    next_id += 1;
     let forward = send_references(
         &client,
-        2,
+        forward_id,
         &login_otui_uri,
         position_of(login_otui_src, "closeButton"),
         true,
@@ -1164,38 +1242,7 @@ fn otui_lua_bridge_resolves_both_directions_via_the_disk_scan() {
         "the local id: declaration must still be included: {forward:#?}"
     );
 
-    // --- Reverse: the getChildById argument in login.lua -> the id: declaration in login.otui. ---
-    let reverse = send_references(
-        &client,
-        3,
-        &login_lua_uri,
-        position_of(login_lua_src, "closeButton"),
-        true,
-    )
-    .expect("reverse references present");
-    assert_eq!(
-        reverse.len(),
-        1,
-        "exactly one declaration site: {reverse:#?}"
-    );
-    assert_eq!(reverse[0].uri, login_otui_uri);
-    assert_eq!(reverse[0].range, range_of(login_otui_src, "closeButton"));
-
-    // --- Reverse, unpaired: other.lua has no `.otui` sibling on disk at all -> nothing resolves. ---
-    let reverse_unpaired = send_references(
-        &client,
-        4,
-        &other_lua_uri,
-        position_of(other_lua_src, "closeButton"),
-        true,
-    )
-    .expect("reverse (unpaired) still answers Some, just empty");
-    assert!(
-        reverse_unpaired.is_empty(),
-        "other.lua has no paired .otui, so nothing should resolve: {reverse_unpaired:#?}"
-    );
-
-    shutdown_and_exit(&client, server_thread, 5);
+    shutdown_and_exit(&client, server_thread, next_id);
 }
 
 /// The forward direction of the bridge must see an **unsaved** edit to an open `.lua` buffer — not
@@ -1380,19 +1427,22 @@ fn reverse_references_resolve_an_id_inherited_from_a_base_style() {
         )))
         .expect("send didOpen");
 
-    // Wait for the scan's completion refresh (see `wait_for_nth_diagnostics`'s doc comment): only
-    // then are `style_index` (base.otui's `MiniWindow` def) and `lua_ref_index`/`lua_texts` (mod.lua's
-    // getChildById call) guaranteed populated.
-    let _ = wait_for_nth_diagnostics(&client, &mod_otui_uri, 2);
-
-    let reverse = send_references(
+    // Poll until mod.lua is indexed (see `references_until`'s doc comment): the background scan
+    // indexes every `.otui` file (base.otui's `MiniWindow` def, into `style_index`) BEFORE it indexes
+    // any `.lua` file (mod.lua's getChildById call, into `lua_ref_index`/`lua_texts`) — a single
+    // sequential background thread runs the `.otui` scan to completion, then the `.lua` scan — so the
+    // first `Some` response here (mod.lua indexed) already guarantees base.otui was indexed too. The
+    // predicate only waits for readiness, not the expected content, so a real resolution bug fails via
+    // the `assert_eq!`s below, not this poll's timeout.
+    let mut next_id = 2i32;
+    let reverse = references_until(
         &client,
-        2,
+        &mut next_id,
         &mod_lua_uri,
         position_of(mod_lua_src, "closeButton"),
         true,
-    )
-    .expect("reverse references present");
+        |_locs| true,
+    );
 
     assert_eq!(
         reverse.len(),
@@ -1413,7 +1463,7 @@ fn reverse_references_resolve_an_id_inherited_from_a_base_style() {
         "the range must land on the id: value inside base.otui: {reverse:#?}"
     );
 
-    shutdown_and_exit(&client, server_thread, 3);
+    shutdown_and_exit(&client, server_thread, next_id);
 }
 
 /// `did_close` on a `.lua` buffer must re-sync `lua_ref_index` from **disk**, discarding whatever the
