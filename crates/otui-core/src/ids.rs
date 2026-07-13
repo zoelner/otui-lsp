@@ -104,9 +104,18 @@ pub struct VisibleId {
 /// negatives, so a missing id here is not proof of anything. (This repo has already retired one
 /// diagnostic for exactly this class of unsoundness; do not reintroduce it here.)
 ///
+/// `lua` supplies the Lua-parent half of [`resolve_ancestry`]'s walk — the ancestor names above the
+/// native `UI*` class an instantiated type's `< Base` chain reaches (and above any `__class:`
+/// re-root). It never changes which `.otui` files supply `body_ids` (that is always
+/// [`StyleIndex::lookup`], keyed by style name); it can only *lengthen* the set of ancestor names
+/// `collect_instantiated_ids` resolves ids for — e.g. reaching `UITable`'s Lua parent
+/// `UIScrollArea` — so an ancestor name that also happens to be declared as an `.otui` style (an
+/// otherwise Lua-only class wearing a style body) contributes its ids too. Passing
+/// `&LuaWidgetIndex::new()` only omits that extra reach; it never adds a false candidate.
+///
 /// Returns an empty vec when `source` cannot be parsed.
 #[must_use]
-pub fn visible_ids(source: &str, styles: &StyleIndex) -> Vec<VisibleId> {
+pub fn visible_ids(source: &str, styles: &StyleIndex, lua: &LuaWidgetIndex) -> Vec<VisibleId> {
     let Some(tree) = SyntaxTree::parse(source) else {
         return Vec::new();
     };
@@ -116,23 +125,9 @@ pub fn visible_ids(source: &str, styles: &StyleIndex) -> Vec<VisibleId> {
     let mut local_names = HashSet::new();
     collect_local_ids(root, source, &mut local, &mut local_names);
 
-    // An empty `LuaWidgetIndex` only truncates `resolve_ancestry`'s *Lua*-parent chain — the walk
-    // above the native `UI*` class it reaches (and above any `__class:` re-root) — never the
-    // `.otui` `< Base` chain itself, which is what actually supplies `body_ids` (via
-    // `StyleIndex::lookup`, keyed by style name). This is a **recall** shortcut, not a soundness
-    // one: it can only make `visible_ids` return *fewer* candidates, by skipping a Lua-only
-    // ancestor between the native class and `UIWidget` (e.g. `UITable`'s `UIScrollArea` parent).
-    // Checked, not assumed: across the full corpus (778 style names/bases), 35 have a longer
-    // ancestry with a real `LuaWidgetIndex` than with an empty one, and in every one of those 35
-    // cases the extra ancestor carries zero `body_ids` — because no `.otui` file declares a
-    // top-level style literally named after a native/Lua-only class (`UITable`, `UIScrollArea`,
-    // …). So this shortcut currently costs nothing measured, but it is a recall gap in principle:
-    // a `.otui` style named e.g. `UIScrollArea` with its own `id:` declarations would be missed by
-    // a caller that only reaches `UITable` directly.
-    let lua = LuaWidgetIndex::new();
     let mut seen_types = HashSet::new();
     let mut inherited = Vec::new();
-    collect_instantiated_ids(root, source, styles, &lua, &mut seen_types, &mut inherited);
+    collect_instantiated_ids(root, source, styles, lua, &mut seen_types, &mut inherited);
 
     // Shadowing (see module docs): a local declaration wins over an inherited id of the same name.
     inherited.retain(|v| !local_names.contains(&v.id));
@@ -281,6 +276,7 @@ fn slice<'a>(source: &'a str, node: Node<'_>) -> &'a str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lua_widgets::scan_widgets;
     use crate::style_index::extract_style_defs;
 
     /// Build a [`StyleIndex`] from `(doc, otui_source)` pairs.
@@ -291,6 +287,20 @@ mod tests {
             index.set_document(*doc, extract_style_defs(&tree));
         }
         index
+    }
+
+    /// Build a [`LuaWidgetIndex`] from `(doc, lua_source)` pairs.
+    fn lua(docs: &[(&str, &str)]) -> LuaWidgetIndex {
+        let mut index = LuaWidgetIndex::new();
+        for (doc, src) in docs {
+            index.set_document(*doc, scan_widgets(src));
+        }
+        index
+    }
+
+    /// An empty [`LuaWidgetIndex`] for tests that don't exercise Lua ancestry.
+    fn no_lua() -> LuaWidgetIndex {
+        LuaWidgetIndex::new()
     }
 
     fn ids_of(visible: &[VisibleId]) -> Vec<&str> {
@@ -310,7 +320,7 @@ mod tests {
         )]);
         let doc = "MainWindow < MiniWindow\n  Label\n    id: title\n";
 
-        let visible = visible_ids(doc, &styles);
+        let visible = visible_ids(doc, &styles, &no_lua());
         assert_eq!(ids_of(&visible), ["closeButton", "contentsPanel", "title"]);
 
         let close = visible
@@ -335,7 +345,7 @@ mod tests {
 
     #[test]
     fn a_locally_declared_id_has_document_origin() {
-        let visible = visible_ids("Panel\n  id: header\n", &StyleIndex::new());
+        let visible = visible_ids("Panel\n  id: header\n", &StyleIndex::new(), &no_lua());
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].id, "header");
         assert_eq!(visible[0].origin, IdOrigin::Document);
@@ -346,7 +356,7 @@ mod tests {
         // A < B < C, and the id lives in C's body; a document instantiating A must still see it.
         let styles = styles(&[("a.otui", "A < B\nB < C\nC < UIWidget\n  id: deep\n")]);
         let doc = "Instance < A\n";
-        let visible = visible_ids(doc, &styles);
+        let visible = visible_ids(doc, &styles, &no_lua());
         assert_eq!(ids_of(&visible), ["deep"]);
         match &visible[0].origin {
             IdOrigin::InheritedStyle { style, .. } => assert_eq!(style, "C"),
@@ -359,7 +369,7 @@ mod tests {
         // A < B and B < A: resolve_ancestry's cycle guard must still make this return promptly.
         let styles = styles(&[("a.otui", "A < B\n  id: onA\nB < A\n  id: onB\n")]);
         let doc = "Instance < A\n";
-        let visible = visible_ids(doc, &styles);
+        let visible = visible_ids(doc, &styles, &no_lua());
         assert_eq!(ids_of(&visible), ["onA", "onB"]);
     }
 
@@ -373,7 +383,7 @@ mod tests {
         )]);
         let doc = "MainWindow < MiniWindow\n  Button\n    id: closeButton\n";
 
-        let visible = visible_ids(doc, &styles);
+        let visible = visible_ids(doc, &styles, &no_lua());
         let matches: Vec<&VisibleId> = visible.iter().filter(|v| v.id == "closeButton").collect();
         assert_eq!(
             matches.len(),
@@ -388,25 +398,25 @@ mod tests {
         // A widget nested (not just top-level) can itself instantiate another style.
         let styles = styles(&[("styles.otui", "InnerPanel < UIWidget\n  id: innerId\n")]);
         let doc = "Outer < UIWidget\n  InnerPanel\n    id: outerOverride\n";
-        let visible = visible_ids(doc, &styles);
+        let visible = visible_ids(doc, &styles, &no_lua());
         assert_eq!(ids_of(&visible), ["innerId", "outerOverride"]);
     }
 
     #[test]
     fn no_styles_and_no_local_ids_yields_nothing() {
-        assert!(visible_ids("Panel < UIWidget\n", &StyleIndex::new()).is_empty());
+        assert!(visible_ids("Panel < UIWidget\n", &StyleIndex::new(), &no_lua()).is_empty());
     }
 
     #[test]
     fn unparseable_source_yields_nothing() {
-        assert!(visible_ids("", &StyleIndex::new()).is_empty());
+        assert!(visible_ids("", &StyleIndex::new(), &no_lua()).is_empty());
     }
 
     #[test]
     fn repeated_instantiations_of_the_same_style_do_not_duplicate_ids() {
         let styles = styles(&[("styles.otui", "Item < UIWidget\n  id: itemId\n")]);
         let doc = "Outer < UIWidget\n  Item\n  Item\n  Item\n";
-        let visible = visible_ids(doc, &styles);
+        let visible = visible_ids(doc, &styles, &no_lua());
         let matches: Vec<&VisibleId> = visible.iter().filter(|v| v.id == "itemId").collect();
         assert_eq!(matches.len(), 1, "must not duplicate: {visible:?}");
     }
@@ -417,7 +427,7 @@ mod tests {
         // `!childNode->isUnique()` child loop (uimanager.cpp:735) never creates its children as
         // widgets. An id declared inside must be invisible whether it would have been local...
         let local_doc = "Outer < UIWidget\n  $pressed:\n    VerticalScrollBar\n      id: phantom\n";
-        assert!(visible_ids(local_doc, &StyleIndex::new()).is_empty());
+        assert!(visible_ids(local_doc, &StyleIndex::new(), &no_lua()).is_empty());
 
         // ...or inherited through a style the document instantiates.
         let styles = styles(&[(
@@ -425,7 +435,7 @@ mod tests {
             "MiniWindow < UIMiniWindow\n  $pressed:\n    VerticalScrollBar\n      id: phantom\n",
         )]);
         let doc = "MainWindow < MiniWindow\n";
-        assert!(visible_ids(doc, &styles).is_empty());
+        assert!(visible_ids(doc, &styles, &no_lua()).is_empty());
     }
 
     #[test]
@@ -437,7 +447,7 @@ mod tests {
         let local_doc =
             "CharacterTitles < UIWidget\n  visible: false\n    VerticalScrollBar\n      \
              id: ListScrollbar\n";
-        assert!(visible_ids(local_doc, &StyleIndex::new()).is_empty());
+        assert!(visible_ids(local_doc, &StyleIndex::new(), &no_lua()).is_empty());
 
         let styles = styles(&[(
             "styles.otui",
@@ -445,7 +455,7 @@ mod tests {
              id: ListScrollbar\n",
         )]);
         let doc = "Instance < CharacterTitles\n";
-        assert!(visible_ids(doc, &styles).is_empty());
+        assert!(visible_ids(doc, &styles, &no_lua()).is_empty());
     }
 
     #[test]
@@ -459,7 +469,7 @@ mod tests {
         let styles = styles(&[("base.otui", "Base < UIWidget\n  id: baseId\n")]);
         let doc = "Outer < UIWidget\n  $pressed:\n    X < Base\n";
         assert!(
-            visible_ids(doc, &styles).is_empty(),
+            visible_ids(doc, &styles, &no_lua()).is_empty(),
             "a style_header nested under a $state block must never be instantiated"
         );
     }
@@ -473,7 +483,7 @@ mod tests {
         let styles = styles(&[("base.otui", "Base < UIWidget\n  id: baseId\n")]);
         let doc = "Outer < UIWidget\n  visible: false\n    X < Base\n";
         assert!(
-            visible_ids(doc, &styles).is_empty(),
+            visible_ids(doc, &styles, &no_lua()).is_empty(),
             "a style_header nested under a plain property must never be instantiated"
         );
     }
@@ -487,7 +497,7 @@ mod tests {
         // — and the `id: phantomUnderId` inside it — is never created (`uimanager.cpp:735`).
         let local_doc = "Panel\n  id: a\n    Button\n      id: phantomUnderId\n";
         assert_eq!(
-            ids_of(&visible_ids(local_doc, &StyleIndex::new())),
+            ids_of(&visible_ids(local_doc, &StyleIndex::new(), &no_lua())),
             ["a"],
             "the over-indented Button's id must not be visible"
         );
@@ -499,7 +509,7 @@ mod tests {
         )]);
         let doc = "Instance < Panel\n";
         assert_eq!(
-            ids_of(&visible_ids(doc, &styles)),
+            ids_of(&visible_ids(doc, &styles, &no_lua())),
             ["a"],
             "the over-indented Button's id must not be visible when inherited either"
         );
@@ -509,7 +519,7 @@ mod tests {
     fn a_widget_over_indented_under_an_anchor_property_is_never_visible() {
         let local_doc =
             "Panel\n  anchors.left: parent.left\n    Button\n      id: phantomUnderAnchor\n";
-        assert!(visible_ids(local_doc, &StyleIndex::new()).is_empty());
+        assert!(visible_ids(local_doc, &StyleIndex::new(), &no_lua()).is_empty());
 
         let styles = styles(&[(
             "styles.otui",
@@ -517,7 +527,7 @@ mod tests {
              id: phantomUnderAnchor\n",
         )]);
         let doc = "Instance < Panel\n";
-        assert!(visible_ids(doc, &styles).is_empty());
+        assert!(visible_ids(doc, &styles, &no_lua()).is_empty());
     }
 
     #[test]
@@ -530,7 +540,7 @@ mod tests {
             "Base < UIWidget\n  id: shared\nA < Base\nB < Base\n",
         )]);
         let doc = "Outer < UIWidget\n  A\n  B\n";
-        let visible = visible_ids(doc, &styles);
+        let visible = visible_ids(doc, &styles, &no_lua());
         let matches: Vec<&VisibleId> = visible.iter().filter(|v| v.id == "shared").collect();
         assert_eq!(
             matches.len(),
@@ -538,5 +548,35 @@ mod tests {
             "the shared ancestor's id must appear once, not once per instantiating type: \
              {visible:?}"
         );
+    }
+
+    #[test]
+    fn a_lua_defined_parent_with_its_own_otui_style_body_contributes_ids_only_with_a_real_lua_index(
+    ) {
+        // MyTable < UITable: UITable has no .otui def, so the .otui chain dead-ends at it as a
+        // native class (resolve_ancestry's `is_native_base` heuristic). UITable's *Lua* parent is
+        // UIScrollArea -- an otherwise Lua-only class that, unusually, also has its own .otui style
+        // declaration (with a body id). resolve_ancestry only reaches UIScrollArea via `lua`'s
+        // parent-chain walk (phase 2); an empty index never crosses into it, so the id is missed
+        // unless the real LuaWidgetIndex is threaded all the way through visible_ids.
+        let styles = styles(&[
+            ("a.otui", "MyTable < UITable\n"),
+            ("b.otui", "UIScrollArea < UIWidget\n  id: scrollId\n"),
+        ]);
+        let lua = lua(&[(
+            "uitable.lua",
+            "UITable = extends(UIScrollArea, 'UITable')\n",
+        )]);
+        let doc = "Outer < UIWidget\n  MyTable\n";
+
+        // With an empty Lua index, the walk never reaches UIScrollArea -- the id is missed.
+        assert!(
+            ids_of(&visible_ids(doc, &styles, &no_lua())).is_empty(),
+            "sanity: an empty Lua index must not see UIScrollArea's id"
+        );
+
+        // With the real index threaded through, the walk crosses UITable's Lua parent
+        // UIScrollArea and picks up its body id.
+        assert_eq!(ids_of(&visible_ids(doc, &styles, &lua)), ["scrollId"]);
     }
 }
