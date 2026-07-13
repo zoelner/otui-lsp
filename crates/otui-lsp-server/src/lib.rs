@@ -757,9 +757,10 @@ impl Backend {
         out
     }
 
-    /// Recompute exactly one module's contribution to [`module_ui_index`](Self::module_ui_index) in
-    /// response to a watched-file change to `uri`, or do nothing when `uri` is not relevant
-    /// (anything other than a `.otmod`, `.lua`, or `.otui` file).
+    /// Refresh [`module_ui_index`](Self::module_ui_index) in response to a watched-file change to
+    /// `uri`, or do nothing when `uri` is not relevant (anything other than a `.otmod`, `.lua`, or
+    /// `.otui` file). Usually recomputes exactly one module's contribution; a `.otui`
+    /// create/delete rebuilds every module instead (see below).
     ///
     /// Runs for **every** relevant watched change, independent of the open-buffer/style-index/
     /// Lua-index handling in [`did_change_watched_files`](Self::did_change_watched_files) —
@@ -773,11 +774,25 @@ impl Backend {
     ///   directory, finds no `.otmod` there anymore, and returns an empty pair list, which
     ///   [`ModuleUiIndex::set_module`] treats as "remove this module" — so a deleted `.otmod`
     ///   correctly clears its module's associations rather than leaking stale ones forever.
-    /// * A changed `.lua`/`.otui` file walks upward for the nearest module directory that owns it
-    ///   ([`find_owning_module_dir`]) and rebuilds that module instead — covering both "a controller
-    ///   gained/lost a `loadUI` call" and "a `loadUI` target was created/deleted" with the same
-    ///   rebuild, since [`scan_module_dir`] re-derives the whole association from disk every time.
-    fn update_module_index_for(&self, uri: &Uri) {
+    /// * A `.lua`/`.otui` [`FileChangeType::CHANGED`] walks upward for the nearest module directory
+    ///   that owns it ([`find_owning_module_dir`]) and rebuilds that module instead — covering "a
+    ///   controller gained/lost a `loadUI` call", since [`scan_module_dir`] re-derives the whole
+    ///   association from disk every time.
+    /// * A `.otui` [`FileChangeType::CREATED`]/[`FileChangeType::DELETED`] instead rebuilds **every**
+    ///   module in the workspace ([`build_module_index`]) rather than only the changed file's own
+    ///   owning module. A `/`-rooted [`resolve_vfs_rooted_otui`] target can live in a wholly different
+    ///   module than the controller that loads it (spec §2.3's cross-module `loadUI` case, the same
+    ///   one [`scan_module_dir`]'s own doc comment traces with the `game_taskboard`/`kill_tracker`
+    ///   example) — scoping the rebuild to the changed file's owning module the way the `.lua`/`CHANGED`
+    ///   branch does would leave a controller in a DIFFERENT module associated (or not) based on
+    ///   whether its rooted target existed at the time its OWN module was last rebuilt, never
+    ///   refreshing once the target itself appears or disappears. A full rebuild is the simplest
+    ///   correct fix — no reverse-dependency graph tracking which module's controllers reference which
+    ///   other module's paths — and is cheap enough to run inline on the single-threaded message loop:
+    ///   measured at ~27ms over a real, ~50-module OTClient install (82 `.otmod` files), and this path
+    ///   only runs on a `.otui` create/delete watch event, never per keystroke or per `.lua`/`.otmod`
+    ///   change.
+    fn update_module_index_for(&self, uri: &Uri, typ: FileChangeType) {
         let Some(path) = uri_to_file_path(uri) else {
             return;
         };
@@ -789,6 +804,15 @@ impl Backend {
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("otui"));
         if !(is_otmod || is_lua || is_otui) {
+            return;
+        }
+        if is_otui && matches!(typ, FileChangeType::CREATED | FileChangeType::DELETED) {
+            let roots = self.roots.lock().expect("roots mutex poisoned").clone();
+            let built = build_module_index(&roots);
+            *self
+                .module_ui_index
+                .write()
+                .expect("module_ui_index lock poisoned") = built;
             return;
         }
         let module_dir = if is_otmod {
@@ -1321,12 +1345,11 @@ fn scan_module_dir(module_dir: &Path, client_roots: &[PathBuf]) -> Vec<(Uri, Uri
 
 /// Resolve a `loadUI`/`displayUI`/`importStyle` argument's `rest` (the literal with its leading `/`
 /// already stripped) against the mounted OTClient virtual filesystem — the SAME mount set
-/// [`resolve_asset_candidates`] probes for an ordinary `/`-rooted asset path: each of `client_roots`
-/// joined with [`otui_core::links::ASSET_MOUNT_DIRS`] (`mods`/`modules`/`data`, highest priority
-/// first), then the bare root itself (the always-mounted, lowest-priority search path). `.otui` is
-/// implied when `rest` has no extension of its own, mirroring the plain-relative branch just above
-/// the call site in [`scan_module_dir`]. Returns the first candidate that exists on disk, or `None`
-/// when nothing under any root does — never a guess.
+/// [`resolve_asset_candidates`] probes for an ordinary `/`-rooted asset path. The candidate
+/// CONSTRUCTION (the mount order, `.otui`-extension inference) is language/runtime semantics that
+/// lives in [`otui_core::links::vfs_rooted_candidates`], not here — this function is left with only
+/// the two things that are genuinely I/O-shell concerns: rejecting an untrusted `rest` before it ever
+/// reaches a filesystem join, and the `.is_file()` probe over the resulting candidates.
 ///
 /// Confirmed against the engine's own path resolution (`ResourceManager::resolvePath`,
 /// `resourcemanager.cpp`):
@@ -1345,13 +1368,6 @@ fn scan_module_dir(module_dir: &Path, client_roots: &[PathBuf]) -> Vec<(Uri, Uri
 /// [`otui_core::links::ASSET_MOUNT_DIRS`]'s doc comment for the full `init.lua`/`main.cpp` mount
 /// trace) in mount order, first match wins.
 fn resolve_vfs_rooted_otui(rest: &str, client_roots: &[PathBuf]) -> Option<PathBuf> {
-    fn with_otui_extension(mut p: PathBuf) -> PathBuf {
-        if p.extension().is_none() {
-            p.set_extension("otui");
-        }
-        p
-    }
-
     // Mirror the plain-relative branch's own `..` guard in `scan_module_dir`: a `ParentDir`
     // component would walk `root.join(mount).join(rest)` straight out of the client-root subtree
     // into a foreign directory — a false pairing the real engine could never produce, because
@@ -1364,7 +1380,10 @@ fn resolve_vfs_rooted_otui(rest: &str, client_roots: &[PathBuf]) -> Option<PathB
     // collapses a doubled `/` (`stdext::replace_all(fullPath, "//", "/")`) before handing the
     // (still virtual-root-relative) result to PHYSFS — so a `//`-prefixed literal is rejected
     // rather than silently collapsed: it is not a shape seen anywhere in the real corpus, and
-    // refusing it is strictly safer than guessing at the engine's post-collapse target.
+    // refusing it is strictly safer than guessing at the engine's post-collapse target. Kept
+    // server-side (rather than moved alongside the candidate builder into `otui-core`) for the same
+    // reason the plain-relative branch's own `..` guard stays in `scan_module_dir`: it is a
+    // safety check on untrusted input feeding a filesystem join, not a resolution rule.
     if Path::new(rest).components().any(|c| {
         matches!(
             c,
@@ -1376,19 +1395,9 @@ fn resolve_vfs_rooted_otui(rest: &str, client_roots: &[PathBuf]) -> Option<PathB
         return None;
     }
 
-    for root in client_roots {
-        for mount in otui_core::links::ASSET_MOUNT_DIRS {
-            let candidate = with_otui_extension(root.join(mount).join(rest));
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-        let candidate = with_otui_extension(root.join(rest));
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    otui_core::links::vfs_rooted_candidates(rest, client_roots, "otui")
+        .into_iter()
+        .find(|candidate| candidate.is_file())
 }
 
 /// Build [`ModuleUiIndex`] from scratch by scanning every module directory under `roots`. Blocking
@@ -3255,7 +3264,7 @@ impl Backend {
             // so it must run before any branch below that `continue`s past it (the open-buffer
             // check, in particular: a currently-open `.otui`/`.lua` file's on-disk existence still
             // matters here even though its style/Lua-index re-indexing is skipped for it).
-            self.update_module_index_for(&uri);
+            self.update_module_index_for(&uri, change.typ);
 
             if is_otmod_uri(&uri) {
                 // A `.otmod` module manifest is never a style/Lua document in its own right —
@@ -3731,7 +3740,7 @@ impl Backend {
         // through `otui_document_text` (which is `None` for a `.lua` document by construction; see
         // its doc comment).
         if self.document_language(&uri) == Language::Lua {
-            return self.lua_references(&uri, position, encoding);
+            return self.lua_references(&uri, position, include_declaration, encoding);
         }
 
         // Read the request document's text (unknown document → nothing to resolve).
@@ -3839,10 +3848,19 @@ impl Backend {
     /// targets, never for suppressing them, so every match it returns becomes a candidate `Location`
     /// here without further filtering. A `setId` literal match, in contrast, is EXACT — the literal
     /// IS the declaration — so it carries zero false-positive risk of its own.
+    ///
+    /// Both candidate sources above are **declarations** of the id (an `.otui` `id:` and a Lua
+    /// `setId("id")` equally *define* the id, they just do it in different languages), so both are
+    /// gated by `include_declaration` — the same flag [`collect_references`] honors for the
+    /// OTUI-local `Id` case. This handler has no separate *reference*-class result to fall back to
+    /// when the flag is `false` (unlike [`collect_references`]'s anchor refs), so `false` legitimately
+    /// yields an empty `Vec` — "no declaration sites", per spec §5.4's `include_declaration`
+    /// semantics, not "not applicable" (that is still `None`, reserved for no ref under the cursor).
     fn lua_references(
         &self,
         lua_uri: &Uri,
         position: lsp_types::Position,
+        include_declaration: bool,
         encoding: PositionEncoding,
     ) -> Option<Vec<Location>> {
         let text = self.lua_text_for(lua_uri)?;
@@ -3850,6 +3868,9 @@ impl Backend {
         let target_ref = otui_core::lua_refs::ref_at(&text, offset)?;
 
         let mut out = Vec::new();
+        if !include_declaration {
+            return Some(out);
+        }
         let documents = self.merged_documents();
         let styles = self.style_index.read().expect("style_index lock poisoned");
         let lua_widgets = self.lua_index.read().expect("lua_index lock poisoned");
