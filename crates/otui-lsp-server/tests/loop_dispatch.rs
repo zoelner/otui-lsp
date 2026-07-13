@@ -1243,6 +1243,197 @@ fn otui_lua_bridge_resolves_both_directions_via_the_disk_scan() {
     shutdown_and_exit(&client, server_thread, next_id);
 }
 
+/// The module-association half of the OTUI↔Lua bridge (node `smart-pairing`): a controller and its
+/// UI file that share NEITHER a directory NOR a stem — the shape `paired_uri`'s same-directory/
+/// same-stem fast path alone cannot resolve — must still pair, via the module's `.otmod` `scripts:`
+/// list crossed with the controller's `g_ui.loadUI` call.
+///
+/// Mirrors `otui_lua_bridge_resolves_both_directions_via_the_disk_scan`'s shape and rationale
+/// (reverse-then-reverse-unpaired-then-forward ordering, `references_until` used only as a
+/// readiness poll, never to encode the expected content) with the module-association wrinkle:
+///
+/// * `mymodule/mymodule.otmod` names `ctrl` as its controller (`scripts: [ ctrl ]`).
+/// * `mymodule/ctrl.lua` calls `g_ui.loadUI('styles/ui')` and `getChildById('x')`.
+/// * `mymodule/styles/ui.otui` declares `id: x` — a DIFFERENT stem AND directory than `ctrl.lua`,
+///   so `paired_uri` alone finds nothing here; only the module association does.
+/// * `othermodule/othermodule.otmod` + `othermodule/otherctrl.lua` (`getChildById('x')`, but NO
+///   `loadUI` call at all) is the **negative** case: same id string, its own `.otmod`, but no
+///   association naming `ui.otui` — its location must never appear in the forward direction.
+/// * `othermodule/decoy.otui` (`id: x`, never loaded by any controller) is the reverse-direction
+///   negative case — it must never appear when resolving `ctrl.lua`'s `getChildById('x')` back to a
+///   declaration.
+#[test]
+fn module_association_pairs_a_controller_with_a_differently_named_and_located_ui_file() {
+    let base = std::env::temp_dir().join(format!(
+        "otui-module-assoc-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _cleanup = TempDirGuard(base.clone());
+
+    let my_module_dir = base.join("modules").join("mymodule");
+    std::fs::create_dir_all(my_module_dir.join("styles")).expect("mkdir mymodule/styles");
+    std::fs::write(
+        my_module_dir.join("mymodule.otmod"),
+        "Module\n  name: mymodule\n  scripts: [ ctrl ]\n",
+    )
+    .expect("write mymodule.otmod");
+    let ctrl_lua_src = "function onCreate(w)\n  g_ui.loadUI('styles/ui')\n  \
+                        local btn = w:getChildById('x')\nend\n";
+    let ctrl_lua_path = my_module_dir.join("ctrl.lua");
+    std::fs::write(&ctrl_lua_path, ctrl_lua_src).expect("write ctrl.lua");
+    let ui_otui_src = "MainWindow < UIWidget\n  Button\n    id: x\n";
+    let ui_otui_path = my_module_dir.join("styles").join("ui.otui");
+    std::fs::write(&ui_otui_path, ui_otui_src).expect("write ui.otui");
+
+    let other_module_dir = base.join("modules").join("othermodule");
+    std::fs::create_dir_all(&other_module_dir).expect("mkdir othermodule");
+    std::fs::write(
+        other_module_dir.join("othermodule.otmod"),
+        "Module\n  name: othermodule\n  scripts: [ otherctrl ]\n",
+    )
+    .expect("write othermodule.otmod");
+    // Same id string, its own real `.otmod`, but NO `loadUI`/`displayUI`/`importStyle` call at all —
+    // this controller is associated with nothing.
+    let other_ctrl_lua_src = "function onCreate(w)\n  local btn = w:getChildById('x')\nend\n";
+    let other_ctrl_lua_path = other_module_dir.join("otherctrl.lua");
+    std::fs::write(&other_ctrl_lua_path, other_ctrl_lua_src).expect("write otherctrl.lua");
+    // Declares the same id, but no controller ever loads it — must never surface as a reverse
+    // navigation target for ctrl.lua's getChildById.
+    let decoy_otui_src = "Decoy < UIWidget\n  Button\n    id: x\n";
+    let decoy_otui_path = other_module_dir.join("decoy.otui");
+    std::fs::write(&decoy_otui_path, decoy_otui_src).expect("write decoy.otui");
+
+    let my_lua_uri = file_uri(&ctrl_lua_path);
+    let my_otui_uri = file_uri(&ui_otui_path);
+    let other_lua_uri = file_uri(&other_ctrl_lua_path);
+    let decoy_otui_uri = file_uri(&decoy_otui_path);
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+
+    #[allow(deprecated)]
+    client_handshake_with_params(
+        &client,
+        InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: file_uri(&base),
+                name: "ws".to_owned(),
+            }]),
+            ..InitializeParams::default()
+        },
+    );
+
+    // Open only `ui.otui` — never any `.lua`/`.otmod` file — so every Lua-side result here can only
+    // have come from the background disk scan's module-association index.
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: my_otui_uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: ui_otui_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+
+    let mut next_id = 2i32;
+
+    // --- Reverse: ctrl.lua's getChildById('x') -> ui.otui's id: x declaration.
+    //
+    // Unlike the disk-scan bridge test above, "any `Some`" is NOT a safe readiness signal here:
+    // `module_ui_index` is populated by a THIRD phase of the background scan, running strictly
+    // AFTER the style/lua-ref phases that make `lua_text_for`/`ref_at` succeed at all — so
+    // `lua_references` can legitimately answer `Some([])` (the getChildById token was found, but
+    // the module association had not been built yet) well before the real, non-empty answer is
+    // ready. Polling until the result is non-empty instead is the correct proxy: `module_ui_index`
+    // is swapped in with a single atomic write at the end of that phase
+    // (`*module_ui_index.write().expect(..) = built`), so the first non-empty answer already
+    // reflects that phase's fully-settled state — exactly like the disk-scan test's "any `Some`"
+    // does for its own (single-phase) dependency.
+    let reverse = references_until(
+        &client,
+        &mut next_id,
+        &my_lua_uri,
+        position_of(ctrl_lua_src, "x"),
+        true,
+        |locs: &[Location]| !locs.is_empty(),
+    );
+    assert_eq!(
+        reverse.len(),
+        1,
+        "exactly one declaration site, resolved purely via the module association: {reverse:#?}"
+    );
+    assert_eq!(reverse[0].uri, my_otui_uri);
+    assert_eq!(reverse[0].range, range_of(ui_otui_src, "x"));
+    assert!(
+        reverse[0].uri != decoy_otui_uri,
+        "an otui file no controller ever loads must never be a reverse target"
+    );
+
+    // --- Reverse, unpaired: otherctrl.lua calls no loadUI/displayUI/importStyle at all, so it has
+    // no module association (and no same-stem sibling either) -> nothing resolves, permanently.
+    // "Any `Some`" is safe here (unlike above): the reverse poll just above already proved
+    // `module_ui_index`'s single atomic swap has happened, and server state here is monotonic — a
+    // later request can only see that same fully-settled index or a still-later one, never an
+    // earlier, partial one.
+    let reverse_unpaired = references_until(
+        &client,
+        &mut next_id,
+        &other_lua_uri,
+        position_of(other_ctrl_lua_src, "x"),
+        true,
+        |_locs| true,
+    );
+    assert!(
+        reverse_unpaired.is_empty(),
+        "otherctrl.lua has no module association and no same-stem sibling: {reverse_unpaired:#?}"
+    );
+
+    // --- Forward: id: x -> its uses, scoped to the associated ctrl.lua only. Both ctrl.lua and
+    // otherctrl.lua are now confirmed indexed by the two polls above, so this single, unretried
+    // query already reflects the scan's final state.
+    let forward_id = next_id;
+    next_id += 1;
+    let forward = send_references(
+        &client,
+        forward_id,
+        &my_otui_uri,
+        position_of(ui_otui_src, "x"),
+        true,
+    )
+    .expect("forward references present");
+
+    let in_ctrl_lua: Vec<&Location> = forward.iter().filter(|l| l.uri == my_lua_uri).collect();
+    assert_eq!(
+        in_ctrl_lua.len(),
+        1,
+        "the associated ctrl.lua's getChildById call must appear exactly once: {forward:#?}"
+    );
+    assert_eq!(
+        in_ctrl_lua[0].range,
+        range_of(ctrl_lua_src, "x"),
+        "the location must land on the id token inside the quotes"
+    );
+    assert!(
+        forward.iter().all(|l| l.uri != other_lua_uri),
+        "an unrelated module's controller (same id, no loadUI association) must never appear: \
+         {forward:#?}"
+    );
+    assert!(
+        forward
+            .iter()
+            .any(|l| l.uri == my_otui_uri && l.range == range_of(ui_otui_src, "x")),
+        "the local id: declaration must still be included: {forward:#?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, next_id);
+}
+
 /// The forward direction of the bridge must see an **unsaved** edit to an open `.lua` buffer — not
 /// just what is on disk — so a controller mid-edit still resolves. Exercises
 /// `Backend::reindex_lua_refs_open` (wired from `did_open`/`did_change`) with no workspace root at
