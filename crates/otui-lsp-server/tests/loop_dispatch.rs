@@ -291,6 +291,72 @@ fn memory_connection_drives_initialize_open_hover_shutdown() {
     assert_eq!(termination.exit_code(), 0);
 }
 
+/// Hovering a style whose base inherits transitively (`Foo < Bar`, `Bar < UIButton`) must show the
+/// **full** resolved chain, not just the first hop — proving the hover render walks all the way to
+/// the native class via `resolve_ancestry` rather than stopping at `Bar`.
+#[test]
+fn memory_connection_hover_shows_the_full_multi_hop_inheritance_chain() {
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+
+    client_handshake(&client);
+
+    let uri = Uri::from_str("file:///scratch/chain.otui").expect("uri");
+    let text = "Foo < Bar\nBar < UIButton\n".to_owned();
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: text.clone(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+
+    // Hover over `Foo`, the declared name — its own base is `Bar`, which itself resolves onward to
+    // the native `UIButton`.
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(2),
+            "textDocument/hover".to_owned(),
+            HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: position_of(&text, "Foo"),
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            },
+        )))
+        .expect("send hover");
+    let hover_resp = recv_response(&client, &RequestId::from(2));
+    assert!(hover_resp.error.is_none(), "hover errored: {hover_resp:?}");
+    let value = hover_markdown(&hover_resp);
+
+    // The chain must reach past the immediate hop (`Bar`) to the ultimately-resolved native class.
+    assert!(value.contains("Bar"), "chain must mention `Bar`: {value}");
+    assert!(
+        value.contains("UIButton"),
+        "chain must resolve to the native `UIButton`: {value}"
+    );
+    assert!(
+        value.contains("(built-in)"),
+        "the native end of the chain must be marked built-in: {value}"
+    );
+    // The full arrow chain, in order — not just the two names appearing somewhere in the text.
+    assert!(
+        value.contains("Bar") && value.find("Bar").unwrap() < value.find("UIButton").unwrap(),
+        "chain must read Bar before UIButton: {value}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 3);
+}
+
 /// A standalone `exit` notification (no preceding `shutdown`) must terminate the loop and be
 /// classified as an abnormal exit (process status 1), never silently dropped.
 #[test]
