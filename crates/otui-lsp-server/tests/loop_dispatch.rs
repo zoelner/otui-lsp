@@ -1690,3 +1690,266 @@ fn watched_delete_drops_the_lua_ref_index_entry() {
 
     shutdown_and_exit(&client, server_thread, 4);
 }
+
+/// A watched-file `CHANGED` event for a `.lua` module that is **currently open** must not clobber
+/// `lua_ref_index`/`lua_texts` with stale disk text: the open buffer is the source of truth for the
+/// ref index (kept current by `did_change` → `reindex_lua_refs_open`), so `apply_lua_watch_change`
+/// must skip the disk reindex for it — mirroring the `is_open` guard the `.otui` branch of
+/// `did_change_watched_files` already applies before its own `index_from_disk`.
+///
+/// Sequence: disk holds `getChildById('idDisk')`; open the buffer and edit it (unsaved) to
+/// `getChildById('idBuf')`; fire a watched `CHANGED` event for that same uri. Forward references
+/// must still reflect the buffer (`idBuf`), never fall back to the stale disk scan (`idDisk`).
+#[test]
+fn watched_change_does_not_clobber_an_open_lua_buffer() {
+    let base = std::env::temp_dir().join(format!(
+        "otui-lua-bridge-watch-change-open-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    std::fs::create_dir_all(&base).expect("mkdir base");
+    let _cleanup = TempDirGuard(base.clone());
+
+    let panel_otui_src = "Panel < UIWidget\n  Button\n    id: idDisk\n  Button\n    id: idBuf\n";
+    let panel_otui_path = base.join("panel.otui");
+    std::fs::write(&panel_otui_path, panel_otui_src).expect("write panel.otui");
+
+    let disk_lua_src = "function onCreate(rootWidget)\n  rootWidget:getChildById('idDisk')\nend\n";
+    let panel_lua_path = base.join("panel.lua");
+    std::fs::write(&panel_lua_path, disk_lua_src).expect("write panel.lua");
+
+    let panel_otui_uri = file_uri(&panel_otui_path);
+    let panel_lua_uri = file_uri(&panel_lua_path);
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: panel_otui_uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: panel_otui_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen otui");
+    let _ = recv_diagnostics(&client, &panel_otui_uri);
+
+    // Open panel.lua with the on-disk content, then edit it (unsaved) to reference 'idBuf' instead.
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: panel_lua_uri.clone(),
+                    language_id: "lua".to_owned(),
+                    version: 1,
+                    text: disk_lua_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen lua");
+    let _ = recv_diagnostics(&client, &panel_lua_uri);
+
+    let edited_lua = "function onCreate(rootWidget)\n  rootWidget:getChildById('idBuf')\nend\n";
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didChange".to_owned(),
+            DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: panel_lua_uri.clone(),
+                    version: 2,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: edited_lua.to_owned(),
+                }],
+            },
+        )))
+        .expect("send didChange lua");
+    let _ = recv_diagnostics(&client, &panel_lua_uri);
+
+    // Baseline before the watch event: the live edit already resolves 'idBuf'.
+    let baseline_buf = send_references(
+        &client,
+        2,
+        &panel_otui_uri,
+        position_of(panel_otui_src, "idBuf"),
+        false,
+    )
+    .expect("references present");
+    assert!(
+        baseline_buf.iter().any(|l| l.uri == panel_lua_uri),
+        "the live unsaved edit must resolve 'idBuf' before any watch event: {baseline_buf:#?}"
+    );
+
+    // A watched CHANGED event fires for the same, still-open uri (disk still says 'idDisk' — the
+    // watcher does not know or care that the change came from elsewhere).
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "workspace/didChangeWatchedFiles".to_owned(),
+            DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: panel_lua_uri.clone(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            },
+        )))
+        .expect("send didChangeWatchedFiles changed");
+
+    // The watch event must NOT clobber the open buffer's ref index: 'idBuf' must still resolve, and
+    // 'idDisk' — only present on disk, never in the live buffer — must still NOT resolve.
+    let after_watch_buf = send_references(
+        &client,
+        3,
+        &panel_otui_uri,
+        position_of(panel_otui_src, "idBuf"),
+        false,
+    )
+    .expect("references present");
+    assert!(
+        after_watch_buf.iter().any(|l| l.uri == panel_lua_uri),
+        "a watched CHANGED event for an open buffer must not clobber its ref index — 'idBuf' must \
+         still resolve: {after_watch_buf:#?}"
+    );
+    let after_watch_disk = send_references(
+        &client,
+        4,
+        &panel_otui_uri,
+        position_of(panel_otui_src, "idDisk"),
+        false,
+    )
+    .expect("references present");
+    assert!(
+        after_watch_disk.iter().all(|l| l.uri != panel_lua_uri),
+        "the watch event must not fall back to the stale disk scan — 'idDisk' must not resolve \
+         while the buffer (which never mentions it) is open: {after_watch_disk:#?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 5);
+}
+
+/// A watched-file `DELETE` event for a `.lua` module that is **currently open** must not deindex
+/// `lua_ref_index`/`lua_texts` either: the buffer is still the source of truth (it may not even
+/// correspond to what got deleted on disk — e.g. a save-as-rename momentarily deletes the old path),
+/// and `did_close` is what eventually re-syncs (or drops) the entry once the buffer actually closes.
+///
+/// Sequence: open a `.lua` buffer and edit it (unsaved) to `getChildById('idBuf')`; fire a watched
+/// `DELETE` event for that same uri. Forward references must still resolve `idBuf` from the buffer.
+#[test]
+fn watched_delete_does_not_clobber_an_open_lua_buffer() {
+    let base = std::env::temp_dir().join(format!(
+        "otui-lua-bridge-watch-delete-open-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    std::fs::create_dir_all(&base).expect("mkdir base");
+    let _cleanup = TempDirGuard(base.clone());
+
+    let panel_otui_src = "Panel < UIWidget\n  Button\n    id: idBuf\n";
+    let panel_otui_path = base.join("panel.otui");
+    std::fs::write(&panel_otui_path, panel_otui_src).expect("write panel.otui");
+
+    let disk_lua_src = "function onCreate(rootWidget)\nend\n";
+    let panel_lua_path = base.join("panel.lua");
+    std::fs::write(&panel_lua_path, disk_lua_src).expect("write panel.lua");
+
+    let panel_otui_uri = file_uri(&panel_otui_path);
+    let panel_lua_uri = file_uri(&panel_lua_path);
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: panel_otui_uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: panel_otui_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen otui");
+    let _ = recv_diagnostics(&client, &panel_otui_uri);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: panel_lua_uri.clone(),
+                    language_id: "lua".to_owned(),
+                    version: 1,
+                    text: disk_lua_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen lua");
+    let _ = recv_diagnostics(&client, &panel_lua_uri);
+
+    let edited_lua = "function onCreate(rootWidget)\n  rootWidget:getChildById('idBuf')\nend\n";
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didChange".to_owned(),
+            DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: panel_lua_uri.clone(),
+                    version: 2,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: edited_lua.to_owned(),
+                }],
+            },
+        )))
+        .expect("send didChange lua");
+    let _ = recv_diagnostics(&client, &panel_lua_uri);
+
+    // A watched DELETE event fires for the same, still-open uri.
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "workspace/didChangeWatchedFiles".to_owned(),
+            DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: panel_lua_uri.clone(),
+                    typ: FileChangeType::DELETED,
+                }],
+            },
+        )))
+        .expect("send didChangeWatchedFiles deleted");
+
+    let after_delete = send_references(
+        &client,
+        2,
+        &panel_otui_uri,
+        position_of(panel_otui_src, "idBuf"),
+        false,
+    )
+    .expect("references present");
+    assert!(
+        after_delete.iter().any(|l| l.uri == panel_lua_uri),
+        "a watched DELETE event for an open buffer must not deindex it — 'idBuf' must still \
+         resolve from the live buffer: {after_delete:#?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 3);
+}

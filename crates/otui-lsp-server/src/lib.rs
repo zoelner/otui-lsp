@@ -2626,15 +2626,33 @@ impl Backend {
 
     /// Apply one watched-file change for a `.lua` module to both [`lua_index`](Self::lua_index)
     /// (widget definitions) and [`lua_ref_index`](Self::lua_ref_index) (id cross-references, the
-    /// other half of the OTUI↔Lua bridge): drop both on delete, else re-scan the file from disk into
-    /// both. An unreadable/oversized/binary file is skipped (logged once, not twice).
+    /// other half of the OTUI↔Lua bridge). An unreadable/oversized/binary file is skipped (logged
+    /// once, not twice).
+    ///
+    /// The two indexes are NOT treated the same here, mirroring how they already differ elsewhere:
+    /// [`lua_index`](Self::lua_index) is "fed only from disk" by design (see
+    /// [`index_lua_from_disk`](Self::index_lua_from_disk) — a `.lua` document's widget defs never
+    /// reflect an open buffer's unsaved edits), so a watch event always re-scans it from disk, open
+    /// or not. [`lua_ref_index`](Self::lua_ref_index)/[`lua_texts`](Self::lua_texts), in contrast,
+    /// DO track the open buffer (`set_open_document` → `reindex_lua_refs_open`) — the same "open
+    /// buffer wins" rule the OTUI branch of `did_change_watched_files` applies via `is_open` — so a
+    /// disk event for a currently open `.lua` file must skip touching them, on both change and
+    /// delete: reindexing from stale disk text would leave `lua_ref_index`'s spans mismatched with
+    /// [`lua_text_for`](Self::lua_text_for)'s buffer text, and deindexing on delete would erase the
+    /// open buffer's own entry out from under it. `did_close` re-syncs from disk once the buffer
+    /// goes away.
     fn apply_lua_watch_change(&self, uri: &Uri, typ: FileChangeType) {
+        let open = self.is_open(uri);
         if typ == FileChangeType::DELETED {
             self.deindex_lua(uri);
-            self.deindex_lua_refs(uri);
+            if !open {
+                self.deindex_lua_refs(uri);
+            }
         } else if let Some(text) = read_indexed_file(uri) {
             self.index_lua_from_disk(uri, &text);
-            self.index_lua_refs_from_disk(uri, text);
+            if !open {
+                self.index_lua_refs_from_disk(uri, text);
+            }
         } else {
             self.log(
                 MessageType::INFO,
