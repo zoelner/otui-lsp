@@ -11,14 +11,25 @@
 //!    [`LineIndex`].
 
 use lang_api::{SemanticToken as CoreToken, SemanticTokenKind};
-use lsp_types::{SemanticToken as LspToken, SemanticTokenType, SemanticTokensLegend};
+use lsp_types::{
+    SemanticToken as LspToken, SemanticTokenModifier, SemanticTokenType, SemanticTokensLegend,
+};
 
 use crate::position::{LineIndex, PositionEncoding};
+
+/// The one token modifier this server advertises: `defaultLibrary`, marking an engine-provided
+/// construct (a `UI*` built-in widget base, a known `$state` name) so a theme can shade it apart
+/// from a user-defined one. Its bit position in the modifier bitset is index 0.
+const MODIFIERS: [SemanticTokenModifier; 1] = [SemanticTokenModifier::DEFAULT_LIBRARY];
+const DEFAULT_LIBRARY_BIT: u32 = 1 << 0;
 
 /// The `SemanticTokenType` a core [`SemanticTokenKind`] is advertised and encoded as.
 ///
 /// LSP has no dedicated boolean type, so `Boolean` is surfaced as `KEYWORD` (booleans read as
-/// keyword-like literals); every other kind maps to its eponymous standard type.
+/// keyword-like literals). `BuiltinType` and `InheritedType` are both `< Base` names, split into
+/// `TYPE` (carrying the `defaultLibrary` modifier) and `CLASS` respectively; `UnknownState` shares
+/// `ENUM_MEMBER` with a valid state but drops the `defaultLibrary` modifier. Every other kind maps
+/// to its eponymous standard type.
 fn type_of(kind: SemanticTokenKind) -> SemanticTokenType {
     match kind {
         SemanticTokenKind::Comment => SemanticTokenType::COMMENT,
@@ -31,15 +42,29 @@ fn type_of(kind: SemanticTokenKind) -> SemanticTokenType {
         SemanticTokenKind::Variable => SemanticTokenType::VARIABLE,
         SemanticTokenKind::Operator => SemanticTokenType::OPERATOR,
         SemanticTokenKind::Keyword => SemanticTokenType::KEYWORD,
+        SemanticTokenKind::BuiltinType => SemanticTokenType::TYPE,
+        SemanticTokenKind::InheritedType => SemanticTokenType::CLASS,
+        SemanticTokenKind::Event => SemanticTokenType::EVENT,
+        SemanticTokenKind::UnknownState => SemanticTokenType::ENUM_MEMBER,
     }
 }
 
-/// The legend advertised in `initialize`: token types in [`SemanticTokenKind::ALL`] order, with no
-/// modifiers. Index `i` in this list is the `token_type` emitted for `SemanticTokenKind::ALL[i]`.
+/// The modifier bitset a core [`SemanticTokenKind`] is encoded with. Only engine-provided
+/// constructs carry `defaultLibrary`; everything else is unmodified.
+fn modifiers_of(kind: SemanticTokenKind) -> u32 {
+    match kind {
+        SemanticTokenKind::BuiltinType | SemanticTokenKind::EnumMember => DEFAULT_LIBRARY_BIT,
+        _ => 0,
+    }
+}
+
+/// The legend advertised in `initialize`: token types in [`SemanticTokenKind::ALL`] order plus the
+/// [`MODIFIERS`] vocabulary. Index `i` in the type list is the `token_type` emitted for
+/// `SemanticTokenKind::ALL[i]`, and bit `j` of a token's modifier set selects `MODIFIERS[j]`.
 pub fn legend() -> SemanticTokensLegend {
     SemanticTokensLegend {
         token_types: SemanticTokenKind::ALL.iter().map(|&k| type_of(k)).collect(),
-        token_modifiers: Vec::new(),
+        token_modifiers: MODIFIERS.to_vec(),
     }
 }
 
@@ -95,7 +120,7 @@ pub fn encode(text: &str, tokens: &[CoreToken], encoding: PositionEncoding) -> V
             delta_start,
             length,
             token_type: tok.kind.index(),
-            token_modifiers_bitset: 0,
+            token_modifiers_bitset: modifiers_of(tok.kind),
         });
         prev_line = pos.line;
         prev_start = pos.character;
@@ -118,7 +143,10 @@ mod tests {
     #[test]
     fn legend_maps_kinds_one_to_one_in_all_order() {
         let legend = legend();
-        assert!(legend.token_modifiers.is_empty());
+        assert_eq!(
+            legend.token_modifiers,
+            vec![SemanticTokenModifier::DEFAULT_LIBRARY]
+        );
         assert_eq!(legend.token_types.len(), SemanticTokenKind::ALL.len());
         // The index a kind encodes to must select its own type in the legend.
         assert_eq!(
@@ -138,6 +166,46 @@ mod tests {
             legend.token_types[SemanticTokenKind::Boolean.index() as usize],
             SemanticTokenType::KEYWORD
         );
+        // The enriched kinds: a built-in base is a TYPE, a file-defined base a CLASS, an event its
+        // own EVENT, and an unknown state shares ENUM_MEMBER with a valid one.
+        assert_eq!(
+            legend.token_types[SemanticTokenKind::BuiltinType.index() as usize],
+            SemanticTokenType::TYPE
+        );
+        assert_eq!(
+            legend.token_types[SemanticTokenKind::InheritedType.index() as usize],
+            SemanticTokenType::CLASS
+        );
+        assert_eq!(
+            legend.token_types[SemanticTokenKind::Event.index() as usize],
+            SemanticTokenType::EVENT
+        );
+        assert_eq!(
+            legend.token_types[SemanticTokenKind::UnknownState.index() as usize],
+            SemanticTokenType::ENUM_MEMBER
+        );
+    }
+
+    #[test]
+    fn engine_provided_constructs_carry_the_default_library_modifier() {
+        // A built-in widget base and a known state are `defaultLibrary`; a user-defined type,
+        // an unknown state, and everything else are unmodified.
+        let text = "X\n";
+        let modifiers = |kind| {
+            encode(text, &[tok(0, 1, kind)], PositionEncoding::Utf16)[0].token_modifiers_bitset
+        };
+        assert_eq!(
+            modifiers(SemanticTokenKind::BuiltinType),
+            DEFAULT_LIBRARY_BIT
+        );
+        assert_eq!(
+            modifiers(SemanticTokenKind::EnumMember),
+            DEFAULT_LIBRARY_BIT
+        );
+        assert_eq!(modifiers(SemanticTokenKind::InheritedType), 0);
+        assert_eq!(modifiers(SemanticTokenKind::UnknownState), 0);
+        assert_eq!(modifiers(SemanticTokenKind::Event), 0);
+        assert_eq!(modifiers(SemanticTokenKind::Property), 0);
     }
 
     #[test]

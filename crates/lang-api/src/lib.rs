@@ -64,10 +64,12 @@ pub struct Diagnostic {
 pub enum SemanticTokenKind {
     /// A full-line `//` / `#` comment.
     Comment,
-    /// A widget/type name: a style header's `Name` and its `< Base`, and a bare container tag.
+    /// A widget/type name: a style header's `Name` and a bare container tag. A `< Base` is a more
+    /// specific [`BuiltinType`](SemanticTokenKind::BuiltinType) or
+    /// [`InheritedType`](SemanticTokenKind::InheritedType) instead.
     Type,
-    /// A key: a generic `property`, `id`, an `anchors.<edge>` object/edge, or an `@event` /
-    /// `&alias` / `!expr` key name.
+    /// A key: a generic `property`, `id`, an `anchors.<edge>` object/edge, or an `&alias` / `!expr`
+    /// key name. An `@event` key is a more specific [`Event`](SemanticTokenKind::Event) instead.
     Property,
     /// A string value: a quoted string, a `#`-carve-out `&` alias literal, a `color` literal
     /// (colors are highlighted as strings — see the `semantic` module), a bare word value, and a
@@ -77,21 +79,35 @@ pub enum SemanticTokenKind {
     Number,
     /// A `true` / `false` boolean literal.
     Boolean,
-    /// A `$state` name inside a state selector (an enumerated widget state).
+    /// A `$state` name inside the engine's **known** set (a recognised widget state). A name outside
+    /// that set is an [`UnknownState`](SemanticTokenKind::UnknownState) instead.
     EnumMember,
     /// A variable: a `$variable` reference, an `id:` value (the id being defined), and an
     /// `anchors.<edge>:` target (the referenced widget/edge).
     Variable,
     /// An operator: the `!` negation marker on a `$state`.
     Operator,
-    /// A keyword-like literal: the `~` null value.
+    /// A keyword-like literal: the `~` null value, or the magic `parent`/`prev`/`next` relative
+    /// anchor reference in an `anchors.<edge>: <target>` target (the engine's
+    /// `UIAnchor::getHookedWidget` treats exactly those three strings as the relative hooked
+    /// widget; any other target is a concrete widget id, tokenized as `Variable`).
     Keyword,
+    /// A `< Base` naming a built-in native widget class — a base beginning with `UI`. Distinguished
+    /// from a file-defined parent so the client can render engine widgets as a standard-library type.
+    BuiltinType,
+    /// A `< Base` naming a file-defined parent style — a base not beginning with `UI`.
+    InheritedType,
+    /// An `@event` handler key name (`@onClick`, `@onSetup`, …).
+    Event,
+    /// A `$state` name **outside** the engine's known set. It silently never matches at runtime — a
+    /// latent authoring bug — so it is surfaced distinctly from a valid [`EnumMember`] state.
+    UnknownState,
 }
 
 impl SemanticTokenKind {
     /// The canonical ordering of every kind. A token's legend index is its position here, so the
     /// server builds its `SemanticTokensLegend` by mapping this array 1:1 to LSP token types.
-    pub const ALL: [SemanticTokenKind; 10] = [
+    pub const ALL: [SemanticTokenKind; 14] = [
         SemanticTokenKind::Comment,
         SemanticTokenKind::Type,
         SemanticTokenKind::Property,
@@ -102,6 +118,10 @@ impl SemanticTokenKind {
         SemanticTokenKind::Variable,
         SemanticTokenKind::Operator,
         SemanticTokenKind::Keyword,
+        SemanticTokenKind::BuiltinType,
+        SemanticTokenKind::InheritedType,
+        SemanticTokenKind::Event,
+        SemanticTokenKind::UnknownState,
     ];
 
     /// This kind's index in [`ALL`](SemanticTokenKind::ALL) — the `token_type` value emitted in
@@ -118,6 +138,10 @@ impl SemanticTokenKind {
             SemanticTokenKind::Variable => 7,
             SemanticTokenKind::Operator => 8,
             SemanticTokenKind::Keyword => 9,
+            SemanticTokenKind::BuiltinType => 10,
+            SemanticTokenKind::InheritedType => 11,
+            SemanticTokenKind::Event => 12,
+            SemanticTokenKind::UnknownState => 13,
         }
     }
 }
@@ -308,6 +332,10 @@ mod tests {
             SemanticTokenKind::Variable,
             SemanticTokenKind::Operator,
             SemanticTokenKind::Keyword,
+            SemanticTokenKind::BuiltinType,
+            SemanticTokenKind::InheritedType,
+            SemanticTokenKind::Event,
+            SemanticTokenKind::UnknownState,
         ];
         assert_eq!(
             kinds.len(),
@@ -329,7 +357,11 @@ mod tests {
                 | SemanticTokenKind::EnumMember
                 | SemanticTokenKind::Variable
                 | SemanticTokenKind::Operator
-                | SemanticTokenKind::Keyword => assert_at_own_index(kind),
+                | SemanticTokenKind::Keyword
+                | SemanticTokenKind::BuiltinType
+                | SemanticTokenKind::InheritedType
+                | SemanticTokenKind::Event
+                | SemanticTokenKind::UnknownState => assert_at_own_index(kind),
             }
         }
     }
