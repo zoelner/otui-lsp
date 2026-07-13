@@ -128,7 +128,30 @@ enum Language {
     /// tree — every widget-semantic surface (diagnostics above all, but also hover/completion/
     /// references/rename over the style graph, code lens, inlay hints, document links/colors) is a
     /// no-op here, exactly like [`Language::Lua`] is for those same surfaces.
-    Manifest,
+    ///
+    /// Carries [`ManifestKind`] — which of the two manifest schemas
+    /// ([`otui_core::manifest::analyze_manifest`] vs.
+    /// [`otui_core::manifest::analyze_font_manifest`]) applies — so that choice is made **once**,
+    /// right here where [`classify`](Language::classify)/[`from_uri`](Language::from_uri) already
+    /// resolve every signal (`languageId` *and* URI extension, `file:` or not) into a `Language`.
+    /// Before this, [`compute_and_send_manifest_diagnostics`] re-derived font-vs-module on its own
+    /// via a second, `file:`-URI-only helper (`is_otfont_uri`) that could disagree with this enum's
+    /// own classification — e.g. a `.otfont` opened under a non-`file:` URI, or recognized only by
+    /// `languageId`, would still pass this helper's `false` and silently fall back to the module
+    /// schema, wrongly reporting `missing-module-root` on a valid font manifest. Keeping the kind
+    /// inside the variant makes that drift impossible: whoever computed the `Language` also computed
+    /// the schema, from the very same signals.
+    Manifest(ManifestKind),
+}
+
+/// Which manifest schema a [`Language::Manifest`] document is judged against — see that variant's
+/// doc comment for why this lives inside it rather than being re-derived from the URI a second time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManifestKind {
+    /// A `.otmod` module manifest: [`otui_core::manifest::analyze_manifest`].
+    Module,
+    /// A `.otfont` font manifest: [`otui_core::manifest::analyze_font_manifest`].
+    Font,
 }
 
 impl Language {
@@ -149,15 +172,25 @@ impl Language {
     /// existing client.
     fn classify(uri: &Uri, language_id: &str) -> Self {
         if language_id.eq_ignore_ascii_case("lua") || Self::from_uri(uri) == Language::Lua {
-            Language::Lua
-        } else if language_id.eq_ignore_ascii_case("otmod")
-            || language_id.eq_ignore_ascii_case("otfont")
-            || Self::from_uri(uri) == Language::Manifest
-        {
-            Language::Manifest
-        } else {
-            Language::Otui
+            return Language::Lua;
         }
+        // The manifest kind, like the Lua check above, honors EITHER signal — a `languageId` of
+        // "otfont"/"otmod" is decisive on its own, whatever the URI looks like (an `untitled:`
+        // buffer, or a URI whose extension the client's own convention does not surface). This is
+        // also the single place the kind is picked: `from_uri`'s URI-only answer is only consulted
+        // when `language_id` said nothing, so a caller can never end up with a `Language::Manifest`
+        // whose kind was decided by a second, disagreeing check downstream (see the variant's doc
+        // comment).
+        if language_id.eq_ignore_ascii_case("otfont") {
+            return Language::Manifest(ManifestKind::Font);
+        }
+        if language_id.eq_ignore_ascii_case("otmod") {
+            return Language::Manifest(ManifestKind::Module);
+        }
+        if let Language::Manifest(kind) = Self::from_uri(uri) {
+            return Language::Manifest(kind);
+        }
+        Language::Otui
     }
 
     /// Classify from the URI's file extension alone. Used when a request names a document this
@@ -185,10 +218,11 @@ impl Language {
         if let Some(path) = uri_to_file_path(uri) {
             return match path.extension() {
                 Some(ext) if ext.eq_ignore_ascii_case("lua") => Language::Lua,
-                Some(ext)
-                    if ext.eq_ignore_ascii_case("otmod") || ext.eq_ignore_ascii_case("otfont") =>
-                {
-                    Language::Manifest
+                Some(ext) if ext.eq_ignore_ascii_case("otmod") => {
+                    Language::Manifest(ManifestKind::Module)
+                }
+                Some(ext) if ext.eq_ignore_ascii_case("otfont") => {
+                    Language::Manifest(ManifestKind::Font)
                 }
                 _ => Language::Otui,
             };
@@ -200,10 +234,11 @@ impl Language {
         let path = s.split(['#', '?']).next().unwrap_or(s);
         match path.rsplit('.').next() {
             Some(ext) if ext.eq_ignore_ascii_case("lua") => Language::Lua,
-            Some(ext)
-                if ext.eq_ignore_ascii_case("otmod") || ext.eq_ignore_ascii_case("otfont") =>
-            {
-                Language::Manifest
+            Some(ext) if ext.eq_ignore_ascii_case("otmod") => {
+                Language::Manifest(ManifestKind::Module)
+            }
+            Some(ext) if ext.eq_ignore_ascii_case("otfont") => {
+                Language::Manifest(ManifestKind::Font)
             }
             _ => Language::Otui,
         }
@@ -488,9 +523,13 @@ impl Backend {
     ///   from before the buffer's `languageId` was known to us) — it is only the analysis that is
     ///   skipped.
     /// * [`Language::Manifest`] — analyzed with the manifest-flavored
-    ///   [`otui_core::manifest::analyze_manifest`], never the widget-aware pass: a `.otmod`/
-    ///   `.otfont` is not a widget tree, so `name:`/`scripts:`/`sandboxed:` must never be judged
-    ///   against the widget property catalog (the regression this routing exists to fix).
+    ///   [`otui_core::manifest::analyze_manifest`]/[`otui_core::manifest::analyze_font_manifest`],
+    ///   never the widget-aware pass: a `.otmod`/`.otfont` is not a widget tree, so
+    ///   `name:`/`scripts:`/`sandboxed:` must never be judged against the widget property catalog
+    ///   (the regression this routing exists to fix). Which of the two schemas applies is read
+    ///   straight off the variant's carried [`ManifestKind`] — the same classification
+    ///   [`document_language`](Self::document_language) just produced — never re-derived from `uri`
+    ///   a second time (see [`Language::Manifest`]'s doc comment).
     /// * [`Language::Otui`] — the existing widget-aware pass, unchanged.
     ///
     /// The single-threaded loop processes `did_open`/`did_change` to completion one at a time, so
@@ -502,13 +541,14 @@ impl Backend {
             Language::Lua => {
                 self.send_diagnostics(uri, Vec::new(), Some(version));
             }
-            Language::Manifest => {
+            Language::Manifest(kind) => {
                 let encoding = self.encoding();
                 compute_and_send_manifest_diagnostics(
                     &self.sender,
                     &self.documents,
                     encoding,
                     uri,
+                    kind,
                     text,
                     version,
                 );
@@ -621,7 +661,7 @@ impl Backend {
             // `lua_ref_index`. Its `scripts:`/`dependencies:` bookkeeping lives in the separate
             // module-association index (`ModuleUiIndex`, built from disk via `is_otmod_uri`), not
             // here.
-            Language::Manifest => {}
+            Language::Manifest(_) => {}
         }
     }
 
@@ -669,7 +709,7 @@ impl Backend {
     fn otml_document_text(&self, uri: &Uri) -> Option<String> {
         let docs = self.documents.read().expect("documents lock poisoned");
         let doc = docs.get(uri)?;
-        matches!(doc.language, Language::Otui | Language::Manifest).then(|| doc.text.clone())
+        matches!(doc.language, Language::Otui | Language::Manifest(_)).then(|| doc.text.clone())
     }
 
     /// The unified text view every span→range aggregator resolves against: the OPEN buffers overlaid
@@ -945,24 +985,29 @@ fn compute_and_send_diagnostics(
 /// Like [`compute_and_send_diagnostics`], but for a module/font manifest ([`Language::Manifest`]):
 /// runs the manifest-flavored [`analyze_manifest`]/[`analyze_font_manifest`] (spec: `module.cpp`'s
 /// `Module::discover` / `bitmapfont.cpp`'s `BitmapFont::load`) instead of the widget-aware pass,
-/// picking the schema from `uri`'s extension (a `.otfont` gets the font schema; every other
-/// [`Language::Manifest`] extension — today, only `.otmod` — gets the module schema, the far more
-/// common case). No workspace style/Lua indexes are threaded through — a manifest's own
-/// diagnostics never depend on them — and no missing-asset augmentation either: none of a
-/// manifest's keys (`scripts:`, `dependencies:`, `load-later:`, `texture:`, …) are asset paths in
-/// the `image-source`/`icon` sense [`missing_asset_diagnostics`] resolves.
+/// picking the schema from `kind` — the [`ManifestKind`] the caller's `Language::Manifest` already
+/// carries, itself produced by [`Language::classify`]/[`Language::from_uri`] from `uri` (and, for an
+/// open buffer, `languageId`) — never re-derived from `uri` a second time here. A second, narrower
+/// URI-only check drifting from the classifier is exactly the bug class [`Language::Manifest`]'s doc
+/// comment warns about: it would fail closed for anything the classifier accepts that the narrower
+/// check does not (a non-`file:` URI, a `languageId`-only signal, …), silently judging a font
+/// manifest against the module schema and reporting a spurious `missing-module-root`. No workspace
+/// style/Lua indexes are threaded through — a manifest's own diagnostics never depend on them — and
+/// no missing-asset augmentation either: none of a manifest's keys (`scripts:`, `dependencies:`,
+/// `load-later:`, `texture:`, …) are asset paths in the `image-source`/`icon` sense
+/// [`missing_asset_diagnostics`] resolves.
 fn compute_and_send_manifest_diagnostics(
     sender: &Sender<Message>,
     documents: &RwLock<HashMap<Uri, Document>>,
     encoding: PositionEncoding,
     uri: Uri,
+    kind: ManifestKind,
     text: &str,
     version: i32,
 ) {
-    let core_diags = if is_otfont_uri(&uri) {
-        analyze_font_manifest(text)
-    } else {
-        analyze_manifest(text)
+    let core_diags = match kind {
+        ManifestKind::Font => analyze_font_manifest(text),
+        ManifestKind::Module => analyze_manifest(text),
     };
     let lsp_diags = convert::all_to_lsp(text, &core_diags, encoding);
     let latest = documents
@@ -1208,18 +1253,6 @@ fn is_otmod_uri(uri: &Uri) -> bool {
     uri_to_file_path(uri).is_some_and(|p| {
         p.extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("otmod"))
-    })
-}
-
-/// Whether `uri` names a `.otfont` file (case-insensitive extension match, mirroring
-/// [`is_otmod_uri`]) — a font manifest, judged against
-/// [`otui_core::manifest::analyze_font_manifest`]'s schema rather than
-/// [`otui_core::manifest::analyze_manifest`]'s module one (see
-/// [`compute_and_send_manifest_diagnostics`]'s call site).
-fn is_otfont_uri(uri: &Uri) -> bool {
-    uri_to_file_path(uri).is_some_and(|p| {
-        p.extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("otfont"))
     })
 }
 
@@ -4301,7 +4334,7 @@ impl Backend {
             },
             // Never fed into either index on open (see `set_open_document`), so there is nothing
             // to re-sync on close either.
-            Language::Manifest => {}
+            Language::Manifest(_) => {}
         }
     }
 }

@@ -2676,3 +2676,64 @@ Font
 
     shutdown_and_exit(&client, server_thread, 2);
 }
+
+/// The schema selector must agree with the classifier on every URI form — not just the `file:`
+/// extension form the previous test already covers. Here the URI carries no `.otfont` extension at
+/// all (so a `file:`-URI-extension-only schema check would miss it entirely), and only the
+/// `didOpen` `languageId` says "this is a font manifest" — exactly the signal
+/// `Language::classify`/`Language::from_uri` already honor on their own (see their doc comments).
+///
+/// Before this was fixed, the schema picker used a second, narrower, `file:`-URI-only check that
+/// disagreed with the classifier in exactly this case: it saw no `.otfont` extension, fell back to
+/// the module schema, and the well-formed font manifest below would have been wrongly flagged with
+/// `missing-module-root` (no top-level `Module` node — because this document's root is `Font`).
+#[test]
+fn otfont_recognized_only_by_language_id_still_uses_font_schema() {
+    let uri = Uri::from_str("file:///scratch/small-9px.fontdata").expect("uri");
+    let source = "\
+Font
+  name: small-9px
+  texture: small-9px
+  height: 9
+  glyph-size: 9 9
+  space-width: 3
+  spacing: 1 0
+";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otfont".to_owned(),
+                    version: 1,
+                    text: source.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+
+    let published = recv_diagnostics(&client, &uri);
+    assert!(
+        !published
+            .diagnostics
+            .iter()
+            .any(|d| d.code == Some(NumberOrString::String("missing-module-root".to_owned()))),
+        "a font manifest recognized only via languageId must never be judged against the module \
+         schema: {:#?}",
+        published.diagnostics
+    );
+    assert!(
+        published.diagnostics.is_empty(),
+        "a well-formed font manifest should have no diagnostics, whatever URI form named it: {:#?}",
+        published.diagnostics
+    );
+
+    shutdown_and_exit(&client, server_thread, 2);
+}

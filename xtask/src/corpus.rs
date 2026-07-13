@@ -105,14 +105,25 @@ pub fn run(root: &Path) {
 /// extension `ext` under `root` and print its own `by code` census plus every
 /// `unknown-manifest-key` finding with its file — the manifest-schema counterpart of the `.otui`
 /// widget census above (see this module's doc comment for why the schemas stay separate maps).
+///
+/// The printed total counts only the files actually **analyzed** (`read_to_string` succeeded), not
+/// every file `files(root, ext)` found — a file that failed to read contributes nothing to
+/// `by_code`, so counting it in the total would claim the census covered more than it did. Any
+/// skip is reported explicitly (`N analyzed (M skipped: unreadable)`) rather than silently folded
+/// into — or dropped from — the total, so a real skip stays visible instead of just shrinking the
+/// number with no explanation. On the engine corpus this harness targets, every discovered
+/// `.otmod`/`.otfont` reads as UTF-8 text, so `M` is 0 and the printed total is unchanged from
+/// before.
 fn manifest_census(ext: &str, root: &Path, analyze: fn(&str) -> Vec<lang_api::Diagnostic>) {
     let manifests = files(root, ext);
+    let mut analyzed = 0usize;
     let mut by_code: BTreeMap<&str, usize> = BTreeMap::new();
     let mut unknown_keys: Vec<(PathBuf, String)> = Vec::new();
     for f in &manifests {
         let Ok(src) = std::fs::read_to_string(f) else {
             continue;
         };
+        analyzed += 1;
         for d in analyze(&src) {
             *by_code.entry(d.code).or_default() += 1;
             if d.code == "unknown-manifest-key" {
@@ -120,7 +131,14 @@ fn manifest_census(ext: &str, root: &Path, analyze: fn(&str) -> Vec<lang_api::Di
             }
         }
     }
-    println!("\n{} .{ext} | by code: {by_code:?}", manifests.len());
+    let skipped = manifests.len() - analyzed;
+    if skipped == 0 {
+        println!("\n{analyzed} .{ext} | by code: {by_code:?}");
+    } else {
+        println!(
+            "\n{analyzed} .{ext} analyzed ({skipped} skipped: unreadable) | by code: {by_code:?}"
+        );
+    }
     if !unknown_keys.is_empty() {
         println!("unknown-manifest-key finding(s):");
         for (file, key) in &unknown_keys {
