@@ -213,6 +213,16 @@ fn completion_kind_to_lsp(kind: CoreCompletionKind) -> LspCompletionItemKind {
     }
 }
 
+/// Strip the minimal inline Markdown marks the engine's documentation text uses — code-span
+/// backticks and `**bold**` emphasis — for a client that did not advertise Markdown support in
+/// `documentationFormat`. Deliberately not a full Markdown parser (there is no nesting, no links, no
+/// block structure in this text — just backticks and bold): a plain character strip is exact for the
+/// text the engine actually produces and keeps the words themselves untouched, e.g.
+/// `` "`#ff0000`" `` → `"#ff0000"`, `` "**`width`**" `` → `"width"`.
+fn strip_markdown_marks(text: &str) -> String {
+    text.replace("**", "").replace('`', "")
+}
+
 /// Convert a single core [`CompletionItem`](CoreCompletionItem) into an `lsp_types::CompletionItem`,
 /// carrying its label, kind, detail and documentation. Completion labels are already the value to
 /// insert (no span remapping needed — the client applies them at the cursor).
@@ -224,9 +234,10 @@ fn completion_kind_to_lsp(kind: CoreCompletionKind) -> LspCompletionItemKind {
 /// always falls back to the plain `label`, exactly as before snippets existed.
 ///
 /// `markdown_docs` gates the format of `item.documentation` (when present): a client that advertised
-/// `MarkupKind::Markdown` in `textDocument.completion.completionItem.documentationFormat` gets it
-/// rendered as Markdown, else as plain text — the engine's doc text is already valid either way
-/// (Markdown backtick/emphasis syntax degrades to readable plain text with the marks left in).
+/// `MarkupKind::Markdown` in `textDocument.completion.completionItem.documentationFormat` gets the
+/// engine's doc text unchanged (it is already valid Markdown); a client that did not gets it run
+/// through [`strip_markdown_marks`] first, so it never sees a literal `` ` `` / `**` mark it has no
+/// renderer for.
 pub fn completion_item_to_lsp(
     item: &CoreCompletionItem,
     snippet_support: bool,
@@ -242,12 +253,17 @@ pub fn completion_item_to_lsp(
         _ => (None, Some(InsertTextFormat::PLAIN_TEXT)),
     };
     let documentation = item.documentation.clone().map(|value| {
-        let kind = if markdown_docs {
-            MarkupKind::Markdown
+        if markdown_docs {
+            Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value,
+            })
         } else {
-            MarkupKind::PlainText
-        };
-        Documentation::MarkupContent(MarkupContent { kind, value })
+            Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: strip_markdown_marks(&value),
+            })
+        }
     });
     LspCompletionItem {
         label: item.label.clone(),
@@ -580,22 +596,37 @@ mod tests {
 
     #[test]
     fn documentation_renders_as_plain_text_when_the_client_did_not_advertise_markdown() {
+        // A color value's documentation is exactly the kind of text that must not leak raw
+        // Markdown marks to a PlainText-only client: `` `#ff0000` `` must come back as `#ff0000`,
+        // with the backticks stripped, not carried through literally.
         let core = CoreCompletionItem {
-            label: "width".to_owned(),
-            kind: CoreCompletionKind::Keyword,
-            detail: Some("property".to_owned()),
+            label: "red".to_owned(),
+            kind: CoreCompletionKind::Value,
+            detail: Some("named color".to_owned()),
             sort_text: None,
             insert_text: None,
             insert_format: CoreInsertFormat::Plain,
-            documentation: Some("**`width`** — a dimension.".to_owned()),
+            documentation: Some("`#ff0000`".to_owned()),
         };
         let lsp = completion_item_to_lsp(&core, true, false);
         match lsp.documentation {
             Some(Documentation::MarkupContent(content)) => {
                 assert_eq!(content.kind, MarkupKind::PlainText);
+                assert_eq!(content.value, "#ff0000");
             }
             other => panic!("expected PlainText MarkupContent, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn strip_markdown_marks_removes_backticks_and_bold_emphasis() {
+        assert_eq!(strip_markdown_marks("plain"), "plain");
+        assert_eq!(strip_markdown_marks("`#ff0000`"), "#ff0000");
+        assert_eq!(strip_markdown_marks("**`width`**"), "width");
+        assert_eq!(
+            strip_markdown_marks("One of: `flex`, `grid`, `none`"),
+            "One of: flex, grid, none"
+        );
     }
 
     #[test]
