@@ -87,7 +87,10 @@ pub enum SemanticTokenKind {
     Variable,
     /// An operator: the `!` negation marker on a `$state`.
     Operator,
-    /// A keyword-like literal: the `~` null value.
+    /// A keyword-like literal: the `~` null value, or the magic `parent`/`prev`/`next` relative
+    /// anchor reference in an `anchors.<edge>: <target>` target (the engine's
+    /// `UIAnchor::getHookedWidget` treats exactly those three strings as the relative hooked
+    /// widget; any other target is a concrete widget id, tokenized as `Variable`).
     Keyword,
     /// A `< Base` naming a built-in native widget class — a base beginning with `UI`. Distinguished
     /// from a file-defined parent so the client can render engine widgets as a standard-library type.
