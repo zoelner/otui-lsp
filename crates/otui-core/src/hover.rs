@@ -156,19 +156,22 @@ fn classify_base(base: &str, index: &StyleIndex, lua: &LuaWidgetIndex) -> StyleH
 }
 
 /// Build the [`Inheritance`] descriptor for the chain starting at `base`: resolve it via
-/// [`resolve_ancestry`] and keep only the prefix up to (and including) the native class it reaches,
-/// dropping that resolver's Lua-parent walk and implicit `UIWidget` root — see the [`Inheritance`]
-/// doc comment for why. When resolution never reaches a native class (a dangling deeper base, or a
-/// cycle), the whole resolved chain is kept as-is; there is no native cutoff to truncate at.
+/// [`resolve_ancestry`] and keep only its `otui_chain_len` prefix — the `.otui` `< Base` walk
+/// itself, ending at the native class when it reaches one — dropping everything that resolver
+/// appends afterward (a native's Lua parent chain, a `__class:` re-root's own Lua ancestry). See
+/// [`Inheritance`]'s doc comment for why, and
+/// [`crate::widget_resolve::WidgetAncestry::otui_chain_len`] for exactly what it cuts.
+///
+/// Truncating at `otui_chain_len` unconditionally (not only when a native class is reached)
+/// matters: a chain that dead-ends at an undefined base can still carry a `__class:` re-root
+/// somewhere along it, and that re-root's Lua widget class (and *its* Lua parents) would otherwise
+/// leak into the display as if they were `< Base` hops, when they are a different namespace
+/// entirely (the runtime class the engine instantiates, not a style the header names).
 fn inheritance_of(base: &str, index: &StyleIndex, lua: &LuaWidgetIndex) -> Inheritance {
     let ancestry = resolve_ancestry(base, index, lua);
     let native = ancestry.native.is_some();
     let mut chain = ancestry.chain;
-    if let Some(name) = ancestry.native
-        && let Some(pos) = chain.iter().position(|hop| *hop == name)
-    {
-        chain.truncate(pos + 1);
-    }
+    chain.truncate(ancestry.otui_chain_len);
     Inheritance { chain, native }
 }
 
@@ -357,6 +360,39 @@ mod tests {
         let index = index_of(&[("file:///a.otui", "Foo < Bar\nBar < Missing\n")]);
         let src = "Foo < Bar\nBar < Missing\n";
         let hover = style_hover_at(src, at(src, "Foo"), &index, &no_lua()).expect("hit");
+        assert_eq!(
+            hover.kind,
+            StyleHoverKind::StyleName {
+                name: "Foo".to_owned(),
+                inherits: Some(Inheritance {
+                    chain: vec!["Bar".to_owned(), "Missing".to_owned()],
+                    native: false,
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn a_dead_end_chain_never_leaks_a_class_reroots_lua_ancestry() {
+        // Foo < Bar < Missing (a dead end — Missing is undefined), and Bar carries a `__class:`
+        // re-root to UISpinBox, which itself extends UITextEdit in Lua. The displayed inheritance
+        // must be exactly the `.otui` `< Base` walk (Bar -> Missing) — UISpinBox and UITextEdit are
+        // the re-rooted *runtime widget class* namespace (spec: `__class:` names the instantiated
+        // class, not a style base) and must never render as if they were further `< Base` hops.
+        let index = index_of(&[(
+            "file:///a.otui",
+            "Foo < Bar\nBar < Missing\n  __class: UISpinBox\n",
+        )]);
+        let lua = {
+            let mut l = LuaWidgetIndex::new();
+            l.set_document(
+                "uispinbox.lua",
+                crate::lua_widgets::scan_widgets("UISpinBox = extends(UITextEdit, 'UISpinBox')\n"),
+            );
+            l
+        };
+        let src = "Foo < Bar\nBar < Missing\n  __class: UISpinBox\n";
+        let hover = style_hover_at(src, at(src, "Foo"), &index, &lua).expect("hit");
         assert_eq!(
             hover.kind,
             StyleHoverKind::StyleName {

@@ -33,6 +33,16 @@ pub struct WidgetAncestry {
     /// The native `UI*` widget the `.otui` chain resolved to, or `None` when the chain dead-ended at
     /// an undefined base or a malformed header before reaching a native class.
     pub native: Option<String>,
+    /// How many of `chain`'s leading entries belong to the `.otui` `Name < Base` walk itself
+    /// (`chain[..otui_chain_len]`) — ending at the native class when [`native`](Self::native) is
+    /// `Some`, or at the dead end / cycle when it is `None`. Every entry from `otui_chain_len`
+    /// onward is a *different* namespace: a native class's Lua parent chain, or a `__class:`
+    /// re-root's own Lua ancestry. A caller that wants only the declared style inheritance — not
+    /// the Lua widget-class lineage used for property validation — must cut here, not merely stop
+    /// at the first name it recognizes as native (see the [`hover`](crate::hover) module, which
+    /// hit exactly this bug: an undefined-base chain plus a `__class:` re-root was leaking Lua
+    /// class names into a display meant to show only `< Base` hops).
+    pub otui_chain_len: usize,
 }
 
 impl WidgetAncestry {
@@ -119,6 +129,11 @@ pub fn resolve_ancestry(start: &str, styles: &StyleIndex, lua: &LuaWidgetIndex) 
             None => break,
         }
     }
+    // The `.otui` walk ends here — everything pushed to `chain` above is a declared `< Base` hop
+    // (or, when reached, the native class the header stops at). Recorded now, before phase 2 can
+    // push anything else, so callers that want *only* this portion don't have to guess a cutoff
+    // from `chain`'s contents (see `otui_chain_len`'s doc comment).
+    let otui_chain_len = chain.len();
 
     // Phase 2: the Lua parent chain of each class we landed on — the native `UI*` the style chain
     // reached, plus every `__class:` re-root. A `__class` class (e.g. `UISpinBox`) is typically a Lua
@@ -155,7 +170,11 @@ pub fn resolve_ancestry(start: &str, styles: &StyleIndex, lua: &LuaWidgetIndex) 
         chain.push(UI_WIDGET.to_owned());
     }
 
-    WidgetAncestry { chain, native }
+    WidgetAncestry {
+        chain,
+        native,
+        otui_chain_len,
+    }
 }
 
 /// The engine's root widget class, the implicit ancestor of every widget.
