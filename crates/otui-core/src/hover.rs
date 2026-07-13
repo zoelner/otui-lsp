@@ -11,16 +11,28 @@
 //!
 //! No I/O, no `lsp-types`.
 
+use crate::lua_widgets::LuaWidgetIndex;
 use crate::navigation::style_header_at;
 use crate::style_index::{StyleIndex, is_native_base};
+use crate::widget_resolve::resolve_ancestry;
 use lang_api::ByteSpan;
 
-/// The base a style inherits from, resolved for hover display.
+/// The resolved chain a base leads to, from that base itself up through every further `< Base`
+/// hop, ending at the native `UI*` class it ultimately resolves to (spec §5.5's "what does this
+/// style ultimately derive from" answer) — or as far as resolution reaches when it dead-ends on an
+/// undefined base or a cycle before finding one.
+///
+/// Reuses [`widget_resolve::resolve_ancestry`] rather than re-walking the style graph, then keeps
+/// only the part relevant to hover: everything up to and including the resolved native class,
+/// dropping that resolver's own Lua-parent walk and implicit `UIWidget` root (those answer a
+/// different question — "what custom properties does this widget accept" — not "what does this
+/// style inherit from").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Inheritance {
-    /// The base's name (the `Base` in `Name < Base`).
-    pub base: String,
-    /// Whether that base is a native `UI*` built-in class (vs. a user style).
+    /// Every name on the chain, nearest first: the base itself, then each further hop it resolves
+    /// to. Ends at the native class when [`native`](Self::native) is `true`.
+    pub chain: Vec<String>,
+    /// Whether the chain reaches a native `UI*` built-in class (its last name is that class).
     pub native: bool,
 }
 
@@ -69,6 +81,8 @@ pub enum StyleHoverKind {
 }
 
 /// Describe what a hover at `offset` conveys, resolving against the workspace `index` (spec §5.5).
+/// `lua` is the Lua widget index [`widget_resolve::resolve_ancestry`] needs to walk the same chain
+/// the inlay hints and completion features already resolve against.
 ///
 /// Returns `None` when the cursor is not on a top-level style header's declared-name or base token
 /// (delegating that decision to [`style_header_at`]). The result is **deterministic**: when a base
@@ -76,7 +90,12 @@ pub enum StyleHoverKind {
 /// `(document id, name-span start)` before the inherited-base next hop is chosen, so the same inputs
 /// always produce the same description.
 #[must_use]
-pub fn style_hover_at(source: &str, offset: usize, index: &StyleIndex) -> Option<StyleHover> {
+pub fn style_hover_at(
+    source: &str,
+    offset: usize,
+    index: &StyleIndex,
+    lua: &LuaWidgetIndex,
+) -> Option<StyleHover> {
     let header = style_header_at(source, offset)?;
 
     // Base branch: the cursor is within the base token — describe the base.
@@ -86,12 +105,15 @@ pub fn style_hover_at(source: &str, offset: usize, index: &StyleIndex) -> Option
     {
         return Some(StyleHover {
             span: base_span,
-            kind: classify_base(base, index),
+            kind: classify_base(base, index, lua),
         });
     }
 
     // Name branch: describe this style and, if present, what it inherits from.
-    let inherits = header.base.as_deref().map(inheritance_of);
+    let inherits = header
+        .base
+        .as_deref()
+        .map(|base| inheritance_of(base, index, lua));
     Some(StyleHover {
         span: header.name_span,
         kind: StyleHoverKind::StyleName {
@@ -102,7 +124,7 @@ pub fn style_hover_at(source: &str, offset: usize, index: &StyleIndex) -> Option
 }
 
 /// Classify a `Name < Base` base name against the workspace index (base branch of [`style_hover_at`]).
-fn classify_base(base: &str, index: &StyleIndex) -> StyleHoverKind {
+fn classify_base(base: &str, index: &StyleIndex, lua: &LuaWidgetIndex) -> StyleHoverKind {
     if is_native_base(base) {
         return StyleHoverKind::NativeBase {
             name: base.to_owned(),
@@ -125,7 +147,7 @@ fn classify_base(base: &str, index: &StyleIndex) -> StyleHoverKind {
     let inherits = hits
         .iter()
         .find_map(|(_, def)| def.base.as_deref())
-        .map(inheritance_of);
+        .map(|base| inheritance_of(base, index, lua));
     StyleHoverKind::UserBase {
         name: base.to_owned(),
         def_count: hits.len(),
@@ -133,12 +155,21 @@ fn classify_base(base: &str, index: &StyleIndex) -> StyleHoverKind {
     }
 }
 
-/// Build the [`Inheritance`] descriptor for a base name, classifying its native-ness up front.
-fn inheritance_of(base: &str) -> Inheritance {
-    Inheritance {
-        base: base.to_owned(),
-        native: is_native_base(base),
+/// Build the [`Inheritance`] descriptor for the chain starting at `base`: resolve it via
+/// [`resolve_ancestry`] and keep only the prefix up to (and including) the native class it reaches,
+/// dropping that resolver's Lua-parent walk and implicit `UIWidget` root — see the [`Inheritance`]
+/// doc comment for why. When resolution never reaches a native class (a dangling deeper base, or a
+/// cycle), the whole resolved chain is kept as-is; there is no native cutoff to truncate at.
+fn inheritance_of(base: &str, index: &StyleIndex, lua: &LuaWidgetIndex) -> Inheritance {
+    let ancestry = resolve_ancestry(base, index, lua);
+    let native = ancestry.native.is_some();
+    let mut chain = ancestry.chain;
+    if let Some(name) = ancestry.native
+        && let Some(pos) = chain.iter().position(|hop| *hop == name)
+    {
+        chain.truncate(pos + 1);
     }
+    Inheritance { chain, native }
 }
 
 #[cfg(test)]
@@ -162,11 +193,16 @@ mod tests {
         src.find(needle).expect("needle present")
     }
 
+    /// No `.lua` widget definitions — most tests here are purely about the `.otui` chain.
+    fn no_lua() -> LuaWidgetIndex {
+        LuaWidgetIndex::new()
+    }
+
     #[test]
     fn native_base_is_classified_as_built_in() {
         let index = index_of(&[("file:///a.otui", "MyPanel < UIWidget\n")]);
         let src = "MyPanel < UIWidget\n";
-        let hover = style_hover_at(src, at(src, "UIWidget"), &index).expect("hit");
+        let hover = style_hover_at(src, at(src, "UIWidget"), &index, &no_lua()).expect("hit");
         assert_eq!(
             hover.kind,
             StyleHoverKind::NativeBase {
@@ -184,14 +220,14 @@ mod tests {
             ("file:///use.otui", "Child < MyPanel\n"),
         ]);
         let src = "Child < MyPanel\n";
-        let hover = style_hover_at(src, at(src, "MyPanel"), &index).expect("hit");
+        let hover = style_hover_at(src, at(src, "MyPanel"), &index, &no_lua()).expect("hit");
         assert_eq!(
             hover.kind,
             StyleHoverKind::UserBase {
                 name: "MyPanel".to_owned(),
                 def_count: 1,
                 inherits: Some(Inheritance {
-                    base: "UIWidget".to_owned(),
+                    chain: vec!["UIWidget".to_owned()],
                     native: true,
                 }),
             }
@@ -202,7 +238,23 @@ mod tests {
     fn dangling_base_has_no_definition() {
         let index = index_of(&[("file:///a.otui", "Child < Missing\n")]);
         let src = "Child < Missing\n";
-        let hover = style_hover_at(src, at(src, "Missing"), &index).expect("hit");
+        let hover = style_hover_at(src, at(src, "Missing"), &index, &no_lua()).expect("hit");
+        assert_eq!(
+            hover.kind,
+            StyleHoverKind::DanglingBase {
+                name: "Missing".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn a_base_that_itself_dangles_deeper_in_the_chain_still_classifies_the_hovered_hop() {
+        // `Child < Missing` where `Missing` itself is undefined nowhere: `Missing` is a *dangling*
+        // base to hover directly (not a `UserBase` with a broken `inherits`), regardless of how deep
+        // in some other chain it might be referenced from.
+        let index = index_of(&[("file:///a.otui", "Foo < Bar\nBar < Missing\n")]);
+        let src = "Bar < Missing\n";
+        let hover = style_hover_at(src, at(src, "Missing"), &index, &no_lua()).expect("hit");
         assert_eq!(
             hover.kind,
             StyleHoverKind::DanglingBase {
@@ -220,7 +272,7 @@ mod tests {
             ("file:///a.otui", "Dup < UIWidget\n"),
         ]);
         let src = "Child < Dup\n";
-        let hover = style_hover_at(src, at(src, "Dup"), &index).expect("hit");
+        let hover = style_hover_at(src, at(src, "Dup"), &index, &no_lua()).expect("hit");
         match hover.kind {
             StyleHoverKind::UserBase {
                 name,
@@ -233,7 +285,7 @@ mod tests {
                 assert_eq!(
                     inherits,
                     Some(Inheritance {
-                        base: "UIWidget".to_owned(),
+                        chain: vec!["UIWidget".to_owned()],
                         native: true,
                     })
                 );
@@ -246,13 +298,13 @@ mod tests {
     fn declared_name_describes_the_style_and_its_base() {
         let index = index_of(&[("file:///a.otui", "MainWindow < UIWindow\n")]);
         let src = "MainWindow < UIWindow\n";
-        let hover = style_hover_at(src, at(src, "MainWindow"), &index).expect("hit");
+        let hover = style_hover_at(src, at(src, "MainWindow"), &index, &no_lua()).expect("hit");
         assert_eq!(
             hover.kind,
             StyleHoverKind::StyleName {
                 name: "MainWindow".to_owned(),
                 inherits: Some(Inheritance {
-                    base: "UIWindow".to_owned(),
+                    chain: vec!["UIWindow".to_owned()],
                     native: true,
                 }),
             }
@@ -261,10 +313,67 @@ mod tests {
     }
 
     #[test]
+    fn a_direct_native_base_shows_the_native_immediately_with_no_bogus_self_hop() {
+        // `Baz < UIWidget`: the chain must be exactly `["UIWidget"]` — never
+        // `["UIWidget", "UIWidget"]` or anything else that would render as a self-referencing hop.
+        let index = index_of(&[("file:///a.otui", "Baz < UIWidget\n")]);
+        let src = "Baz < UIWidget\n";
+        let hover = style_hover_at(src, at(src, "Baz"), &index, &no_lua()).expect("hit");
+        assert_eq!(
+            hover.kind,
+            StyleHoverKind::StyleName {
+                name: "Baz".to_owned(),
+                inherits: Some(Inheritance {
+                    chain: vec!["UIWidget".to_owned()],
+                    native: true,
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn a_multi_hop_chain_resolves_all_the_way_to_the_native_class() {
+        // Foo < Bar < UIButton: hovering Foo's declared name must show the *full* chain
+        // (Bar -> UIButton), not stop at the first hop (Bar) the way a naive one-hop lookup would.
+        let index = index_of(&[("file:///a.otui", "Foo < Bar\nBar < UIButton\n")]);
+        let src = "Foo < Bar\nBar < UIButton\n";
+        let hover = style_hover_at(src, at(src, "Foo"), &index, &no_lua()).expect("hit");
+        assert_eq!(
+            hover.kind,
+            StyleHoverKind::StyleName {
+                name: "Foo".to_owned(),
+                inherits: Some(Inheritance {
+                    chain: vec!["Bar".to_owned(), "UIButton".to_owned()],
+                    native: true,
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn a_chain_that_never_reaches_a_native_class_is_reported_without_one() {
+        // Foo < Bar < Missing: the chain dead-ends at an undefined base, so no native class — the
+        // whole (broken) chain is still shown, just without the native marker.
+        let index = index_of(&[("file:///a.otui", "Foo < Bar\nBar < Missing\n")]);
+        let src = "Foo < Bar\nBar < Missing\n";
+        let hover = style_hover_at(src, at(src, "Foo"), &index, &no_lua()).expect("hit");
+        assert_eq!(
+            hover.kind,
+            StyleHoverKind::StyleName {
+                name: "Foo".to_owned(),
+                inherits: Some(Inheritance {
+                    chain: vec!["Bar".to_owned(), "Missing".to_owned()],
+                    native: false,
+                }),
+            }
+        );
+    }
+
+    #[test]
     fn bare_header_name_has_no_inheritance() {
         let index = index_of(&[("file:///a.otui", "Standalone\n  id: x\n")]);
         let src = "Standalone\n  id: x\n";
-        let hover = style_hover_at(src, at(src, "Standalone"), &index).expect("hit");
+        let hover = style_hover_at(src, at(src, "Standalone"), &index, &no_lua()).expect("hit");
         assert_eq!(
             hover.kind,
             StyleHoverKind::StyleName {
@@ -278,6 +387,6 @@ mod tests {
     fn non_header_offset_yields_nothing() {
         let index = index_of(&[("file:///a.otui", "MainWindow < UIWindow\n  id: main\n")]);
         let src = "MainWindow < UIWindow\n  id: main\n";
-        assert!(style_hover_at(src, at(src, "main"), &index).is_none());
+        assert!(style_hover_at(src, at(src, "main"), &index, &no_lua()).is_none());
     }
 }

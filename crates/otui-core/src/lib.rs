@@ -231,20 +231,22 @@ impl OtuiService {
 
     /// Describe the hover for the style token under `offset`, resolved against the workspace `index`
     /// (spec §5.5). Returns a structured [`StyleHover`] — native vs. user base, workspace-resolution,
-    /// definition count and inheritance are all decided here in the engine — or `None` when the cursor
-    /// is not on a top-level style header's name or base token. The server only formats the result
-    /// into an LSP hover.
+    /// definition count and the **full** resolved inheritance chain (down to the native class it
+    /// reaches, if any — see [`hover::Inheritance`]) are all decided here in the engine — or `None`
+    /// when the cursor is not on a top-level style header's name or base token. The server only
+    /// formats the result into an LSP hover.
     ///
     /// Inherent (not on the [`LanguageService`] trait) because it consumes server-owned state (the
-    /// workspace [`StyleIndex`]).
+    /// workspace [`StyleIndex`] and [`LuaWidgetIndex`]).
     #[must_use]
     pub fn style_hover_at(
         &self,
         source: &str,
         offset: usize,
         index: &StyleIndex,
+        lua: &LuaWidgetIndex,
     ) -> Option<StyleHover> {
-        hover::style_hover_at(source, offset, index)
+        hover::style_hover_at(source, offset, index, lua)
     }
 
     /// Describe the **property key** under `offset` for hover (spec §5.5): what value the property

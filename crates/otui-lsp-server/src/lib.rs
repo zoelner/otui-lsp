@@ -2670,12 +2670,24 @@ fn code_span(text: &str) -> String {
     format!("{fence} {text} {fence}")
 }
 
-/// Append an "Inherits from `Base`" line (marking a native base as `(built-in)`) when `inherits` is
-/// present; a no-op otherwise.
+/// Append an "Inherits from `Base` → `Next` → …" line (marking the chain's end as `(built-in)`
+/// when it reaches a native class — see [`Inheritance`]) when `inherits` is present; a no-op
+/// otherwise.
+///
+/// Renders the **full** resolved chain, not just its first hop: `Foo < Bar` with `Bar < UIButton`
+/// reads "Inherits from `Bar` → `UIButton` (built-in)", so the reader never has to hand-walk
+/// intermediate hops themselves. A base that already *is* the native class (`Baz < UIWidget`)
+/// yields a single-name chain, so this never prints a redundant `UIWidget → UIWidget`.
 fn append_inherits(value: &mut String, inherits: Option<&Inheritance>) {
     if let Some(inh) = inherits {
+        let chain = inh
+            .chain
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(" → ");
         let native = if inh.native { " (built-in)" } else { "" };
-        value.push_str(&format!("\n\nInherits from `{}`{native}", inh.base));
+        value.push_str(&format!("\n\nInherits from {chain}{native}"));
     }
 }
 
@@ -4285,9 +4297,11 @@ impl Backend {
         let line_index = LineIndex::new(&text);
         let offset = line_index.offset_at(position, encoding);
         let index = self.style_index.read().expect("style_index lock poisoned");
-        if let Some(desc) = self.service.style_hover_at(&text, offset, &index) {
+        let lua = self.lua_index.read().expect("lua_index lock poisoned");
+        if let Some(desc) = self.service.style_hover_at(&text, offset, &index, &lua) {
             return Some(render_hover(&desc, &line_index, encoding));
         }
+        drop(lua);
         drop(index);
         // Not a style token — fall back to a property-key hover (value type from the catalog/schema
         // metadata; no workspace index needed).
@@ -7097,7 +7111,7 @@ end
     fn hover_at(index: &StyleIndex, text: &str, needle: &str) -> Hover {
         let offset = text.find(needle).expect("needle present");
         let desc = OtuiService::new()
-            .style_hover_at(text, offset, index)
+            .style_hover_at(text, offset, index, &LuaWidgetIndex::new())
             .expect("cursor is on a style token");
         let line_index = LineIndex::new(text);
         render_hover(&desc, &line_index, PositionEncoding::Utf16)
@@ -7201,7 +7215,7 @@ end
         let offset = src.find("main").expect("present");
         assert!(
             OtuiService::new()
-                .style_hover_at(src, offset, &index)
+                .style_hover_at(src, offset, &index, &LuaWidgetIndex::new())
                 .is_none()
         );
     }
