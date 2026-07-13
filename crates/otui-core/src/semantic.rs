@@ -12,8 +12,8 @@
 //! |----------------------------------------------------------------------|--------------|
 //! | `comment`                                                            | `Comment`    |
 //! | `style_name`, `tag`                                                  | `Type`       |
-//! | `style_base` beginning with `UI`                                     | `BuiltinType` |
-//! | `style_base` not beginning with `UI`                                 | `InheritedType` |
+//! | `style_base` recognised by [`is_native_base`](crate::style_index::is_native_base)     | `BuiltinType` |
+//! | `style_base` not recognised by `is_native_base`                      | `InheritedType` |
 //! | `event_name`                                                         | `Event`      |
 //! | `property_key`, `id_key`, `anchor_keyword`, `anchor_edge`, `alias_name`, `expr_name` | `Property` |
 //! | `string`, `hash_literal`, `color`                                    | `String`     |
@@ -26,8 +26,10 @@
 //! | `null` (the `~`)                                                     | `Keyword`    |
 //! | `plain_value` under `id_property`                                    | `Variable`   |
 //! | `plain_value` elsewhere                                              | `String`     |
-//! | `identifier` under `anchor_target`, leading segment `parent`/`prev`/`next` | `Keyword` (leading segment) + `Variable` (`.edge`, if any) |
-//! | `identifier` under `anchor_target`, otherwise                        | `Variable` (whole target) |
+//! | `identifier` under a non-`fill`/`centerIn` `anchor_target`, leading segment `parent`/`prev`/`next` | `Keyword` (leading segment) + `Variable` (`.edge`, if any) |
+//! | `identifier` under a non-`fill`/`centerIn` `anchor_target`, otherwise | `Variable` (whole target) |
+//! | `identifier` under a `fill`/`centerIn` `anchor_target`, whole text exactly `parent`/`prev`/`next` | `Keyword` (whole target) |
+//! | `identifier` under a `fill`/`centerIn` `anchor_target`, otherwise     | `Variable` (whole target, never split) |
 //! | `identifier` elsewhere (inline-array word)                           | `String`     |
 //!
 //! Deliberately **not** tokenized: structural punctuation (`<`, `:`, `$`, `.`, `[`, `]`, `,`, `-`,
@@ -38,15 +40,26 @@
 //! reads as one atom rather than a number with punctuation.
 //!
 //! An `anchor_target` (the `<target>` in `anchors.<edge>: <target>`) is a single `DOTTED` grammar
-//! token, but the engine treats its leading dotted segment specially: exactly `parent`, `prev` and
-//! `next` name the relative hooked widget (`UIAnchor::getHookedWidget` in
-//! `src/framework/ui/uianchorlayout.cpp`); any other leading segment is a concrete widget id
-//! (`getChildById`). [`collect`] splits that one grammar token into up to two semantic tokens to
-//! surface the distinction: the magic leading segment as `Keyword` and the remaining `.edge` part
-//! as `Variable`. A concrete id (including one that merely contains a magic word, e.g.
-//! `parentPanel`) stays a single `Variable` token, matching an ordinary id reference.
+//! token, but the engine treats it differently depending on the edge. For an ordinary edge (`left`,
+//! `right`, `top`, `bottom`, `horizontalCenter`, `verticalCenter`), the runtime splits the target on
+//! `.` into a widget id and a hooked edge (`src/framework/ui/uiwidgetbasestyle.cpp`), and
+//! `UIAnchor::getHookedWidget` (`src/framework/ui/uianchorlayout.cpp`) treats exactly `parent`,
+//! `prev` and `next` as the leading widget id as the relative hooked widget; any other leading
+//! segment is a concrete widget id (`getChildById`). [`collect`] mirrors that split, splitting the
+//! one grammar token into up to two semantic tokens: the magic leading segment as `Keyword` and the
+//! remaining `.edge` part as `Variable`. A concrete id (including one that merely contains a magic
+//! word, e.g. `parentPanel`) stays a single `Variable` token, matching an ordinary id reference.
+//!
+//! `fill` and `centerIn` are different: the engine passes the **whole, unsplit** target string
+//! straight to `UIWidget::fill`/`centerIn` (`src/framework/ui/uiwidgetbasestyle.cpp`), which forward
+//! it to `getHookedWidget` unchanged — so the magic check there compares the *entire* string, not a
+//! dot-separated leading segment. `anchors.fill: parent` is the magic parent reference (`Keyword`,
+//! the whole token), but `anchors.fill: parent.left` is a single concrete widget id lookup for
+//! `getChildById("parent.left")` (`Variable`, the whole token, never split on `.`). [`collect`]
+//! (via [`emit_anchor_target`]) reads the sibling `edge` field to tell the two cases apart.
 
 use crate::schema;
+use crate::style_index::is_native_base;
 use crate::syntax::SyntaxTree;
 use lang_api::{ByteSpan, SemanticToken, SemanticTokenKind};
 use tree_sitter::Node;
@@ -89,10 +102,13 @@ fn kind_for(node: Node<'_>, source: &str) -> Option<SemanticTokenKind> {
     let kind = match node.kind() {
         "comment" => Comment,
         "style_name" | "tag" => Type,
-        // A `< Base` beginning with `UI` names a built-in native widget class; anything else is a
-        // file-defined parent style. Same `^UI` split the grammar and diagnostics use.
+        // A `< Base` recognised as a native class by `is_native_base` (UI + an uppercase third
+        // char, e.g. `UIWidget`) is a built-in; anything else is a file-defined parent style. This
+        // is the same classifier `hover`/`widget_resolve`/`completion`/`diagnostics` use, so e.g.
+        // `UIwidget` or `UI2Panel` — which merely start with `UI` but aren't the engine's naming
+        // convention — are `InheritedType` here too, not `BuiltinType`.
         "style_base" => {
-            if text().starts_with("UI") {
+            if is_native_base(text()) {
                 BuiltinType
             } else {
                 InheritedType
@@ -131,17 +147,46 @@ fn kind_for(node: Node<'_>, source: &str) -> Option<SemanticTokenKind> {
 /// Emit the token(s) for an `anchor_target`'s `identifier` node.
 ///
 /// The grammar lexes the whole `<target>` in `anchors.<edge>: <target>` as one `DOTTED` token
-/// (e.g. `parent.left` or `closeButton.left`). The engine's `UIAnchor::getHookedWidget`
-/// (`src/framework/ui/uianchorlayout.cpp`) treats exactly the leading segments `parent`, `next`
-/// and `prev` as the relative hooked widget; any other leading segment is a concrete widget id
-/// resolved via `getChildById`. So when the leading dotted segment is exactly one of those three
-/// magic words, split the single grammar token into a `Keyword` covering the magic segment and a
-/// `Variable` covering the remaining `.edge` part (if any); otherwise emit the whole target as one
-/// `Variable` token, unchanged from a plain id reference. Matching is exact on the leading
-/// segment, so a concrete id that merely contains a magic word (e.g. `parentPanel`) is not split.
+/// (e.g. `parent.left` or `closeButton.left`). How the engine reads it depends on the sibling
+/// `edge` (read from the enclosing `anchor_property` node):
+///
+/// - For `fill`/`centerIn`, `UIWidget::fill`/`centerIn` (`src/framework/ui/uiwidgetbasestyle.cpp`)
+///   forward the **whole, unsplit** target string to `getHookedWidget`, which compares it against
+///   `parent`/`next`/`prev` as a whole. So the target is exactly one token: `Keyword` only when the
+///   entire text is one of those three words, `Variable` (unsplit, even if it contains a `.`)
+///   otherwise.
+/// - For every other edge, the runtime splits the target on `.` into a widget id and a hooked edge
+///   first, and `UIAnchor::getHookedWidget` (`src/framework/ui/uianchorlayout.cpp`) treats exactly
+///   the leading segments `parent`, `next` and `prev` as the relative hooked widget; any other
+///   leading segment is a concrete widget id resolved via `getChildById`. So when the leading
+///   dotted segment is exactly one of those three magic words, split the single grammar token into
+///   a `Keyword` covering the magic segment and a `Variable` covering the remaining `.edge` part
+///   (if any); otherwise emit the whole target as one `Variable` token, unchanged from a plain id
+///   reference.
+///
+/// Both branches match exactly (never a substring), so a concrete id that merely contains a magic
+/// word (e.g. `parentPanel`, or `parent.left` under `fill`) is never split.
 fn emit_anchor_target(node: Node<'_>, source: &str, out: &mut Vec<SemanticToken>) {
     let span = SyntaxTree::span_of(node);
     let text = node.utf8_text(source.as_bytes()).unwrap_or_default();
+
+    let edge = node
+        .parent() // anchor_target
+        .and_then(|target| target.parent()) // anchor_property
+        .and_then(|property| property.child_by_field_name("edge"))
+        .and_then(|edge| edge.utf8_text(source.as_bytes()).ok());
+    let whole_string_magic_check = matches!(edge, Some("fill") | Some("centerIn"));
+
+    if whole_string_magic_check {
+        let kind = if matches!(text, "parent" | "prev" | "next") {
+            SemanticTokenKind::Keyword
+        } else {
+            SemanticTokenKind::Variable
+        };
+        out.push(SemanticToken { span, kind });
+        return;
+    }
+
     let leading = text.split('.').next().unwrap_or(text);
     if !matches!(leading, "parent" | "prev" | "next") {
         out.push(SemanticToken {
@@ -335,6 +380,34 @@ Derived < BaseThing
     }
 
     #[test]
+    fn native_base_split_uses_the_canonical_is_native_base_classifier_not_starts_with() {
+        // `is_native_base` (`crate::style_index`) requires `UI` followed by an ASCII-uppercase
+        // third char. `UIwidget` and `UI2Panel` both start with "UI" (the old, wrong rule) but are
+        // NOT native by the canonical classifier, so they must be `InheritedType`, matching
+        // `hover`/`widget_resolve`/`completion`/`diagnostics`. Revert-confirm: under the old
+        // `text().starts_with("UI")` rule both would wrongly come out `BuiltinType`.
+        let src = "\
+Foo < UIwidget
+Bar < UI2Panel
+Baz < UIButton
+";
+        let toks = tokens(src);
+        assert_eq!(
+            token_for(src, &toks, "UIwidget").kind,
+            SemanticTokenKind::InheritedType
+        );
+        assert_eq!(
+            token_for(src, &toks, "UI2Panel").kind,
+            SemanticTokenKind::InheritedType
+        );
+        // Sanity: a genuine native base is unaffected.
+        assert_eq!(
+            token_for(src, &toks, "UIButton").kind,
+            SemanticTokenKind::BuiltinType
+        );
+    }
+
+    #[test]
     fn tokens_are_sorted_and_non_overlapping() {
         let toks = tokens(SNIPPET);
         assert!(!toks.is_empty());
@@ -479,6 +552,64 @@ Button
         let toks = tokens(src);
         let target_start = src.find("closeButton.left").unwrap();
         let target_span = ByteSpan::new(target_start, target_start + "closeButton.left".len());
+        let tok = toks.iter().find(|t| t.span == target_span);
+        assert_eq!(tok.map(|t| t.kind), Some(SemanticTokenKind::Variable));
+        assert!(!toks.iter().any(|t| t.kind == SemanticTokenKind::Keyword));
+    }
+
+    // --- fill/centerIn targets: engine passes the whole string, unsplit, to getHookedWidget -------
+    //
+    // Engine: `UIWidget::fill`/`centerIn` (`src/framework/ui/uiwidgetbasestyle.cpp`) forward the
+    // *entire* target string to `getHookedWidget`, which only recognises it as magic when the whole
+    // string equals "parent"/"prev"/"next" — unlike a regular edge, it is never `.`-split first.
+
+    #[test]
+    fn anchor_target_fill_bare_parent_is_a_single_keyword_token() {
+        let src = "Panel\n  anchors.fill: parent\n";
+        let toks = tokens(src);
+        let target_start = src.rfind("parent").unwrap();
+        let target_span = ByteSpan::new(target_start, target_start + "parent".len());
+        let matching: Vec<_> = toks
+            .iter()
+            .filter(|t| t.span.start >= target_start)
+            .collect();
+        assert_eq!(matching.len(), 1, "expected one token, found {matching:?}");
+        assert_eq!(matching[0].span, target_span);
+        assert_eq!(matching[0].kind, SemanticTokenKind::Keyword);
+    }
+
+    #[test]
+    fn anchor_target_fill_dotted_parent_is_not_split_and_is_a_single_variable() {
+        // Unlike a regular edge, `fill` never splits on `.`: the engine passes "parent.left"
+        // whole to `getHookedWidget`, which does not match "parent" exactly, so this is a single
+        // concrete `getChildById("parent.left")` lookup, not the magic parent reference.
+        // Revert-confirm: under the old always-split-on-first-`.` rule this would wrongly emit a
+        // `Keyword` for "parent" plus a `Variable` for "left".
+        let src = "Panel\n  anchors.fill: parent.left\n";
+        let toks = tokens(src);
+        let target_start = src.find("parent.left").unwrap();
+        let target_span = ByteSpan::new(target_start, target_start + "parent.left".len());
+        let tok = toks.iter().find(|t| t.span == target_span);
+        assert_eq!(tok.map(|t| t.kind), Some(SemanticTokenKind::Variable));
+        assert!(!toks.iter().any(|t| t.kind == SemanticTokenKind::Keyword));
+    }
+
+    #[test]
+    fn anchor_target_centerin_bare_next_is_a_single_keyword_token() {
+        let src = "Panel\n  anchors.centerIn: next\n";
+        let toks = tokens(src);
+        let target_start = src.rfind("next").unwrap();
+        let target_span = ByteSpan::new(target_start, target_start + "next".len());
+        let tok = toks.iter().find(|t| t.span == target_span);
+        assert_eq!(tok.map(|t| t.kind), Some(SemanticTokenKind::Keyword));
+    }
+
+    #[test]
+    fn anchor_target_centerin_concrete_id_stays_a_single_variable_token() {
+        let src = "Panel\n  anchors.centerIn: closeButton\n";
+        let toks = tokens(src);
+        let target_start = src.find("closeButton").unwrap();
+        let target_span = ByteSpan::new(target_start, target_start + "closeButton".len());
         let tok = toks.iter().find(|t| t.span == target_span);
         assert_eq!(tok.map(|t| t.kind), Some(SemanticTokenKind::Variable));
         assert!(!toks.iter().any(|t| t.kind == SemanticTokenKind::Keyword));
