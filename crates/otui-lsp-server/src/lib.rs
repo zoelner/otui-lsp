@@ -801,7 +801,9 @@ impl Backend {
         let Some(module_dir) = module_dir else {
             return;
         };
-        let pairs = scan_module_dir(&module_dir);
+        let workspace_roots = self.workspace_root_paths();
+        let client_roots = detect_client_roots(Some(&module_dir), &workspace_roots);
+        let pairs = scan_module_dir(&module_dir, &client_roots);
         self.module_ui_index
             .write()
             .expect("module_ui_index lock poisoned")
@@ -1202,10 +1204,12 @@ fn collect_module_dirs(dir: &Path, out: &mut HashSet<PathBuf>) {
 /// Best-effort throughout, matching the wildcard/variable-argument tolerances
 /// [`otmod_scripts`]/[`scan_ui_loads`] already document: a missing `.otmod`, a controller that
 /// loads nothing, or a `loadUI` argument that is a variable simply contributes no pair — never a
-/// panic, never a guess. A `loadUI` argument starting with `/` (resolved by the engine against the
-/// mounted virtual filesystem root, not a plain relative join — 4 complete-literal calls in the
-/// whole engine corpus) is likewise left unresolved rather than guessed at.
-fn scan_module_dir(module_dir: &Path) -> Vec<(Uri, Uri)> {
+/// panic, never a guess. A `loadUI` argument starting with `/` is a VFS-absolute path (see
+/// [`resolve_vfs_rooted_otui`]'s doc comment for the engine trace) resolved against `client_roots`
+/// when at least one was detected for this module directory; with none detected, it is left
+/// unresolved rather than guessed at — exactly [`detect_client_roots`]'s existing "silence, not a
+/// guess" contract for a `/`-rooted path.
+fn scan_module_dir(module_dir: &Path, client_roots: &[PathBuf]) -> Vec<(Uri, Uri)> {
     let mut controllers: Vec<PathBuf> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(module_dir) {
         for entry in entries.flatten() {
@@ -1258,13 +1262,26 @@ fn scan_module_dir(module_dir: &Path) -> Vec<(Uri, Uri)> {
         // does not exist, and silently miss the pairing entirely.
         let controller_dir = controller_path.parent().unwrap_or(module_dir);
         for load in scan_ui_loads(&text) {
-            if load.path.starts_with('/') {
+            if let Some(rest) = load.path.strip_prefix('/') {
                 // A leading `/` resolves against the mounted virtual filesystem root (the OTClient
-                // install's `data`/`modules` mount), not a plain relative join — the same rule
-                // `otui_core::links`/`resolve_asset_candidates` already handles for ordinary
-                // `image-source`/`icon` asset paths, but doing so here would need this function to
-                // also carry a confirmed client-install root per controller. Rare in the real corpus
-                // (4 complete-literal calls total) — best-effort: skip rather than guess.
+                // install's `mods`/`modules`/`data` overlay, then the bare root itself) — the same
+                // rule `resolve_asset_candidates` already applies to ordinary `image-source`/`icon`
+                // asset paths (see [`resolve_vfs_rooted_otui`]'s doc comment for the engine trace).
+                // This is still an EXACT resolution, not a heuristic: the path is a complete literal
+                // naming one specific file, so pairing to whatever it resolves to is correct even
+                // when that file lives in a wholly different module's directory (real corpus example:
+                // `game_taskboard/trackers/miniwindows_tracker.lua`'s
+                // `g_ui.importStyle('/modules/game_taskboard/trackers/styles/kill_tracker.otui')`
+                // resolves under its OWN module, but the mechanism is the same one that would resolve
+                // a genuinely cross-module target). With no client root detected for this module,
+                // there is no trustworthy mount set to resolve against — skip rather than guess,
+                // mirroring [`detect_client_roots`]'s own silence rule.
+                if let Some(otui) = resolve_vfs_rooted_otui(rest, client_roots) {
+                    let Some(otui_uri) = uri_from_file_path(&otui) else {
+                        continue;
+                    };
+                    pairs.push((lua_uri.clone(), otui_uri));
+                }
                 continue;
             }
             if Path::new(&load.path)
@@ -1302,13 +1319,69 @@ fn scan_module_dir(module_dir: &Path) -> Vec<(Uri, Uri)> {
     pairs
 }
 
+/// Resolve a `loadUI`/`displayUI`/`importStyle` argument's `rest` (the literal with its leading `/`
+/// already stripped) against the mounted OTClient virtual filesystem — the SAME mount set
+/// [`resolve_asset_candidates`] probes for an ordinary `/`-rooted asset path: each of `client_roots`
+/// joined with [`otui_core::links::ASSET_MOUNT_DIRS`] (`mods`/`modules`/`data`, highest priority
+/// first), then the bare root itself (the always-mounted, lowest-priority search path). `.otui` is
+/// implied when `rest` has no extension of its own, mirroring the plain-relative branch just above
+/// the call site in [`scan_module_dir`]. Returns the first candidate that exists on disk, or `None`
+/// when nothing under any root does — never a guess.
+///
+/// Confirmed against the engine's own path resolution (`ResourceManager::resolvePath`,
+/// `resourcemanager.cpp`):
+/// ```cpp
+/// if (path.starts_with("/"))
+///     fullPath = path;
+/// else {
+///     ...
+///     fullPath += scriptPath + "/"; // getCurrentSourcePath() — the *relative* branch
+///     fullPath += path;
+/// }
+/// ```
+/// — a leading `/` is used exactly as written, never joined onto the calling script's own
+/// directory; the resulting `fullPath` is then looked up through PHYSFS, which searches every
+/// mounted path (the install root itself, plus `mods`/`modules`/`data` — see
+/// [`otui_core::links::ASSET_MOUNT_DIRS`]'s doc comment for the full `init.lua`/`main.cpp` mount
+/// trace) in mount order, first match wins.
+fn resolve_vfs_rooted_otui(rest: &str, client_roots: &[PathBuf]) -> Option<PathBuf> {
+    fn with_otui_extension(mut p: PathBuf) -> PathBuf {
+        if p.extension().is_none() {
+            p.set_extension("otui");
+        }
+        p
+    }
+
+    for root in client_roots {
+        for mount in otui_core::links::ASSET_MOUNT_DIRS {
+            let candidate = with_otui_extension(root.join(mount).join(rest));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        let candidate = with_otui_extension(root.join(rest));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Build [`ModuleUiIndex`] from scratch by scanning every module directory under `roots`. Blocking
 /// filesystem work, run only from the background scan thread — mirrors
 /// [`scan_workspace`]/[`scan_workspace_lua`] in that respect.
+///
+/// Each module directory's `/`-rooted `loadUI` targets are resolved against the client root(s)
+/// detected FOR THAT DIRECTORY ([`detect_client_roots`], anchored on the module directory itself, the
+/// same anchoring [`missing_asset_diagnostics`] uses per-document) — not a single client root shared
+/// across the whole workspace scan — so a workspace containing more than one OTClient checkout still
+/// resolves each module against its own install, never a foreign one.
 fn build_module_index(roots: &[Uri]) -> ModuleUiIndex {
+    let workspace_roots: Vec<PathBuf> = roots.iter().filter_map(uri_to_file_path).collect();
     let mut index = ModuleUiIndex::new();
     for dir in find_module_dirs(roots) {
-        let pairs = scan_module_dir(&dir);
+        let client_roots = detect_client_roots(Some(&dir), &workspace_roots);
+        let pairs = scan_module_dir(&dir, &client_roots);
         if !pairs.is_empty() {
             index.by_module.insert(dir, pairs);
         }
@@ -7507,7 +7580,7 @@ end
         )
         .expect("write ui.otui");
 
-        let pairs = scan_module_dir(&base);
+        let pairs = scan_module_dir(&base, &[]);
         assert_eq!(pairs.len(), 1, "{pairs:?}");
         assert!(pairs[0].0.as_str().ends_with("ctrl.lua"), "{pairs:?}");
         assert!(
@@ -7529,7 +7602,7 @@ end
         std::fs::write(base.join("ctrl.lua"), "g_ui.loadUI('does-not-exist')\n")
             .expect("write ctrl.lua");
 
-        assert!(scan_module_dir(&base).is_empty());
+        assert!(scan_module_dir(&base, &[]).is_empty());
     }
 
     #[test]
@@ -7544,7 +7617,7 @@ end
         std::fs::write(base.join("dynamicName.otui"), "Panel < UIWidget\n").expect("write otui");
 
         assert!(
-            scan_module_dir(&base).is_empty(),
+            scan_module_dir(&base, &[]).is_empty(),
             "a variable argument must never be resolved, even if a file happens to share its name"
         );
     }
@@ -7577,7 +7650,7 @@ end
         std::fs::write(other_dir.join("ui.otui"), "Panel < UIWidget\n").expect("write ui.otui");
 
         assert!(
-            scan_module_dir(&module_dir).is_empty(),
+            scan_module_dir(&module_dir, &[]).is_empty(),
             "a `..`-walking argument must never be resolved, even if the target exists on disk"
         );
     }
@@ -7602,7 +7675,7 @@ end
         std::fs::write(base.join("nested").join("deep.otui"), "Panel < UIWidget\n")
             .expect("write otui");
 
-        let pairs = scan_module_dir(&base);
+        let pairs = scan_module_dir(&base, &[]);
         assert_eq!(pairs.len(), 1, "{pairs:?}");
         assert!(pairs[0].0.as_str().ends_with("deep.lua"), "{pairs:?}");
         assert!(
@@ -7640,11 +7713,78 @@ end
         std::fs::write(base.join("bestiary.otui"), "Panel < UIWidget\n  // decoy\n")
             .expect("decoy");
 
-        let pairs = scan_module_dir(&base);
+        let pairs = scan_module_dir(&base, &[]);
         assert_eq!(pairs.len(), 1, "{pairs:?}");
         assert!(
             pairs[0].1.as_str().ends_with("tab/bestiary/bestiary.otui"),
             "must resolve next to the controller, not at the module root: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn scan_module_dir_resolves_a_vfs_rooted_load_ui_path_against_the_client_root() {
+        // A `/`-rooted `loadUI` argument is a VFS-absolute path (see `resolve_vfs_rooted_otui`'s doc
+        // comment) — resolved against the client root's `modules/` overlay, into a DIFFERENT
+        // module's directory than the controller itself, never a plain join onto the controller's
+        // own directory (which would look for a nonexistent `mymodule/othermod/styles/ui.otui`).
+        let base =
+            std::env::temp_dir().join(format!("otui-module-scan-vfs-root-{}", std::process::id()));
+        let _cleanup = ModuleTestDir(base.clone());
+        let my_module_dir = base.join("modules").join("mymodule");
+        std::fs::create_dir_all(&my_module_dir).expect("mkdir mymodule");
+        std::fs::write(
+            my_module_dir.join("m.otmod"),
+            "Module\n  scripts: [ ctrl ]\n",
+        )
+        .expect("write otmod");
+        std::fs::write(
+            my_module_dir.join("ctrl.lua"),
+            "g_ui.loadUI('/modules/othermod/styles/ui')\n",
+        )
+        .expect("write ctrl.lua");
+        let other_styles_dir = base.join("modules").join("othermod").join("styles");
+        std::fs::create_dir_all(&other_styles_dir).expect("mkdir othermod/styles");
+        std::fs::write(other_styles_dir.join("ui.otui"), "Panel < UIWidget\n").expect("write otui");
+
+        // Without a client root: silence, never a guess.
+        assert!(
+            scan_module_dir(&my_module_dir, &[]).is_empty(),
+            "a /-rooted path must never resolve without a detected client root"
+        );
+
+        // With the client root: resolves into the OTHER module's directory.
+        let pairs = scan_module_dir(&my_module_dir, std::slice::from_ref(&base));
+        assert_eq!(pairs.len(), 1, "{pairs:?}");
+        assert!(pairs[0].0.as_str().ends_with("ctrl.lua"), "{pairs:?}");
+        assert!(
+            pairs[0].1.as_str().ends_with("othermod/styles/ui.otui")
+                || pairs[0].1.as_str().ends_with("othermod%2Fstyles%2Fui.otui"),
+            "{pairs:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_vfs_rooted_otui_finds_a_target_under_the_modules_overlay() {
+        let base =
+            std::env::temp_dir().join(format!("otui-resolve-vfs-rooted-{}", std::process::id()));
+        let _cleanup = ModuleTestDir(base.clone());
+        let dir = base.join("modules").join("game_npctrade").join("templates");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("npctrade_legacy.otui"), "Panel < UIWidget\n").expect("write otui");
+
+        let found = resolve_vfs_rooted_otui(
+            "game_npctrade/templates/npctrade_legacy",
+            std::slice::from_ref(&base),
+        );
+        assert_eq!(
+            found,
+            Some(dir.join("npctrade_legacy.otui")),
+            "extensionless rest implies .otui, resolved via the modules/ overlay"
+        );
+
+        assert_eq!(
+            resolve_vfs_rooted_otui("does/not/exist", std::slice::from_ref(&base)),
+            None
         );
     }
 
@@ -7657,7 +7797,7 @@ end
         std::fs::write(base.join("ctrl.lua"), "g_ui.loadUI('x')\n").expect("write ctrl.lua");
         std::fs::write(base.join("x.otui"), "Panel < UIWidget\n").expect("write otui");
 
-        assert!(scan_module_dir(&base).is_empty());
+        assert!(scan_module_dir(&base, &[]).is_empty());
     }
 
     #[test]

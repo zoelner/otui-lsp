@@ -1434,6 +1434,183 @@ fn module_association_pairs_a_controller_with_a_differently_named_and_located_ui
     shutdown_and_exit(&client, server_thread, next_id);
 }
 
+/// The `/`-rooted (VFS-absolute) `loadUI` half of the module-association bridge (node
+/// `bridge-exact-resolution`, commit 1): a controller's `g_ui.loadUI('/modules/othermod/styles/ui')`
+/// names its `.otui` by a complete, VFS-absolute literal, resolved against the mounted OTClient
+/// virtual filesystem (the detected client root's `mods`/`modules`/`data` overlay, then the bare
+/// root — `resolve_vfs_rooted_otui`'s doc comment cites the engine's `resourcemanager.cpp`
+/// `resolvePath`) rather than a plain directory join. The target sits in a DIFFERENT module's
+/// directory than the controller (`othermod`, not `mymodule`) — the shape neither `paired_uri`'s
+/// same-stem fast path nor a plain relative join could ever resolve.
+///
+/// Mirrors `module_association_pairs_a_controller_with_a_differently_named_and_located_ui_file`'s
+/// shape: reverse, polled to convergence via [`references_until`] (module_ui_index is the third,
+/// strictly-later scan phase, so "any `Some`" is not a safe readiness signal here — only
+/// non-emptiness is, for the same reason that test's doc comment explains).
+#[test]
+fn vfs_rooted_load_ui_path_pairs_with_a_style_in_a_different_module_directory() {
+    let base = std::env::temp_dir().join(format!(
+        "otui-vfs-rooted-pairing-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _cleanup = TempDirGuard(base.clone());
+    // A real OTClient install root: `init.lua` + `data/` + `modules/` (`mark_as_client_root`) — the
+    // mount set a `/`-rooted `loadUI` argument resolves against.
+    mark_as_client_root(&base);
+
+    let my_module_dir = base.join("modules").join("mymodule");
+    std::fs::create_dir_all(&my_module_dir).expect("mkdir mymodule");
+    std::fs::write(
+        my_module_dir.join("mymodule.otmod"),
+        "Module\n  name: mymodule\n  scripts: [ ctrl ]\n",
+    )
+    .expect("write mymodule.otmod");
+    let ctrl_lua_src = "function onCreate(w)\n  g_ui.loadUI('/modules/othermod/styles/ui')\n  \
+                        local btn = w:getChildById('x')\nend\n";
+    let ctrl_lua_path = my_module_dir.join("ctrl.lua");
+    std::fs::write(&ctrl_lua_path, ctrl_lua_src).expect("write ctrl.lua");
+
+    let other_module_styles_dir = base.join("modules").join("othermod").join("styles");
+    std::fs::create_dir_all(&other_module_styles_dir).expect("mkdir othermod/styles");
+    let ui_otui_src = "MainWindow < UIWidget\n  Button\n    id: x\n";
+    let ui_otui_path = other_module_styles_dir.join("ui.otui");
+    std::fs::write(&ui_otui_path, ui_otui_src).expect("write ui.otui");
+
+    let ctrl_lua_uri = file_uri(&ctrl_lua_path);
+    let ui_otui_uri = file_uri(&ui_otui_path);
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+
+    #[allow(deprecated)]
+    client_handshake_with_params(
+        &client,
+        InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: file_uri(&base),
+                name: "ws".to_owned(),
+            }]),
+            ..InitializeParams::default()
+        },
+    );
+
+    // Open only `ui.otui` — never `ctrl.lua`/`mymodule.otmod` — so the reverse resolution below can
+    // only have come from the background disk scan's VFS-rooted module-association resolution.
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: ui_otui_uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: ui_otui_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+
+    let mut next_id = 2i32;
+
+    // Reverse: ctrl.lua's getChildById('x') -> ui.otui's id: x, resolved purely via the `/`-rooted
+    // loadUI path against the detected client root. Polled to convergence (non-empty), not "any
+    // Some" — see this test's doc comment.
+    let reverse = references_until(
+        &client,
+        &mut next_id,
+        &ctrl_lua_uri,
+        position_of(ctrl_lua_src, "x"),
+        true,
+        |locs: &[Location]| !locs.is_empty(),
+    );
+    assert_eq!(
+        reverse.len(),
+        1,
+        "exactly one declaration site, resolved via the VFS-rooted loadUI path: {reverse:#?}"
+    );
+    assert_eq!(reverse[0].uri, ui_otui_uri);
+    assert_eq!(reverse[0].range, range_of(ui_otui_src, "x"));
+
+    shutdown_and_exit(&client, server_thread, next_id);
+}
+
+/// Negative case for the test above: with NO detected OTClient install root (no `init.lua` +
+/// `data`/`modules` siblings anywhere above the module directory), a `/`-rooted `loadUI` argument
+/// must NOT pair — silently, never a guess (mirrors `detect_client_roots`'/`resolve_asset_candidates`'
+/// existing "no root, no resolution" contract for an ordinary asset path). The exact same layout as
+/// the positive test above, minus the client-root markers.
+#[test]
+fn vfs_rooted_load_ui_path_does_not_pair_without_a_detected_client_root() {
+    let base = std::env::temp_dir().join(format!(
+        "otui-vfs-rooted-no-root-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _cleanup = TempDirGuard(base.clone());
+    // Deliberately NOT `mark_as_client_root(&base)`: no `init.lua`, no `data/` — so no ancestor walk
+    // from the module directory ever finds a client root.
+
+    let my_module_dir = base.join("modules").join("mymodule");
+    std::fs::create_dir_all(&my_module_dir).expect("mkdir mymodule");
+    std::fs::write(
+        my_module_dir.join("mymodule.otmod"),
+        "Module\n  name: mymodule\n  scripts: [ ctrl ]\n",
+    )
+    .expect("write mymodule.otmod");
+    let ctrl_lua_src = "function onCreate(w)\n  g_ui.loadUI('/modules/othermod/styles/ui')\n  \
+                        local btn = w:getChildById('x')\nend\n";
+    let ctrl_lua_path = my_module_dir.join("ctrl.lua");
+    std::fs::write(&ctrl_lua_path, ctrl_lua_src).expect("write ctrl.lua");
+
+    let other_module_styles_dir = base.join("modules").join("othermod").join("styles");
+    std::fs::create_dir_all(&other_module_styles_dir).expect("mkdir othermod/styles");
+    let ui_otui_src = "MainWindow < UIWidget\n  Button\n    id: x\n";
+    let ui_otui_path = other_module_styles_dir.join("ui.otui");
+    // The target genuinely exists on disk — proves the negative result comes from "no client root
+    // to resolve against", not "the file happens to be missing".
+    std::fs::write(&ui_otui_path, ui_otui_src).expect("write ui.otui");
+
+    let ctrl_lua_uri = file_uri(&ctrl_lua_path);
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+
+    #[allow(deprecated)]
+    client_handshake_with_params(
+        &client,
+        InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: file_uri(&base),
+                name: "ws".to_owned(),
+            }]),
+            ..InitializeParams::default()
+        },
+    );
+
+    let mut next_id = 2i32;
+
+    // "Any `Some`" is a safe readiness signal here, same reasoning as the disk-scan bridge test's
+    // "reverse_unpaired" case: with no client root, this pairing never happens, so `lua_references`
+    // answers `Some([])` forever once `ctrl.lua`'s ref index entry lands — there is no later,
+    // non-empty state to wait for.
+    let reverse = references_until(
+        &client,
+        &mut next_id,
+        &ctrl_lua_uri,
+        position_of(ctrl_lua_src, "x"),
+        true,
+        |_locs| true,
+    );
+    assert!(
+        reverse.is_empty(),
+        "a /-rooted loadUI path must never pair without a detected client root: {reverse:#?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, next_id);
+}
+
 /// The forward direction of the bridge must see an **unsaved** edit to an open `.lua` buffer — not
 /// just what is on disk — so a controller mid-edit still resolves. Exercises
 /// `Backend::reindex_lua_refs_open` (wired from `did_open`/`did_change`) with no workspace root at
