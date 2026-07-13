@@ -1352,6 +1352,30 @@ fn resolve_vfs_rooted_otui(rest: &str, client_roots: &[PathBuf]) -> Option<PathB
         p
     }
 
+    // Mirror the plain-relative branch's own `..` guard in `scan_module_dir`: a `ParentDir`
+    // component would walk `root.join(mount).join(rest)` straight out of the client-root subtree
+    // into a foreign directory — a false pairing the real engine could never produce, because
+    // PHYSFS (the virtual filesystem `resourcemanager.cpp`'s `resolvePath` hands the path to)
+    // rejects a `..` component outright. A `RootDir`/`Prefix` component (an OS-absolute `rest`,
+    // e.g. `//abs/path` after the caller already stripped one leading `/`) is rejected for the
+    // same reason from the other direction: `root.join(mount).join(rest)` DISCARDS `root`/`mount`
+    // entirely when `rest` is itself absolute, so the join would resolve outside the client root
+    // too. The engine never produces an OS-absolute `fullPath` here either — it only ever
+    // collapses a doubled `/` (`stdext::replace_all(fullPath, "//", "/")`) before handing the
+    // (still virtual-root-relative) result to PHYSFS — so a `//`-prefixed literal is rejected
+    // rather than silently collapsed: it is not a shape seen anywhere in the real corpus, and
+    // refusing it is strictly safer than guessing at the engine's post-collapse target.
+    if Path::new(rest).components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+
     for root in client_roots {
         for mount in otui_core::links::ASSET_MOUNT_DIRS {
             let candidate = with_otui_extension(root.join(mount).join(rest));
@@ -7808,6 +7832,65 @@ end
         assert_eq!(
             resolve_vfs_rooted_otui("does/not/exist", std::slice::from_ref(&base)),
             None
+        );
+    }
+
+    #[test]
+    fn resolve_vfs_rooted_otui_rejects_a_parent_dir_escape_even_when_the_target_exists() {
+        // `g_ui.loadUI('/../../foreign/ui')` must never resolve, even when a file genuinely sits
+        // at the escaped location — the real engine's PHYSFS mount rejects a `..` component
+        // outright (see `resolve_vfs_rooted_otui`'s doc comment), so a resolution here would be a
+        // pairing the engine itself could never produce.
+        let base = std::env::temp_dir().join(format!(
+            "otui-resolve-vfs-rooted-parent-dir-{}",
+            std::process::id()
+        ));
+        let _cleanup = ModuleTestDir(base.clone());
+        let client_root = base.join("client");
+        std::fs::create_dir_all(client_root.join("modules")).expect("mkdir client/modules");
+        let foreign_dir = base.join("foreign");
+        std::fs::create_dir_all(&foreign_dir).expect("mkdir foreign");
+        std::fs::write(foreign_dir.join("ui.otui"), "Panel < UIWidget\n")
+            .expect("plant escape target");
+
+        assert_eq!(
+            resolve_vfs_rooted_otui("../../foreign/ui", std::slice::from_ref(&client_root)),
+            None,
+            "a `..` component must never resolve, even onto a real file"
+        );
+    }
+
+    #[test]
+    fn resolve_vfs_rooted_otui_rejects_a_double_slash_prefix() {
+        // `g_ui.loadUI('//abs/path')` leaves `rest = "/abs/path"` after the caller strips one
+        // leading `/`; `Path::join` with an OS-absolute `rest` DISCARDS the root/mount entirely,
+        // so resolving it would silently drop the client-root anchor. The real engine instead
+        // collapses the doubled `/` before handing a still virtual-root-relative path to PHYSFS
+        // (see `resolve_vfs_rooted_otui`'s doc comment) — never producing an OS-absolute lookup —
+        // so this shape is rejected rather than resolved.
+        let base = std::env::temp_dir().join(format!(
+            "otui-resolve-vfs-rooted-double-slash-{}",
+            std::process::id()
+        ));
+        let _cleanup = ModuleTestDir(base.clone());
+        std::fs::create_dir_all(base.join("modules")).expect("mkdir modules");
+        // Plant a file at the very absolute path a discarded-root join would land on (an
+        // OS-absolute `rest` inside our OWN temp tree, so the test needs no filesystem-root
+        // write permission), to prove this isn't merely "no file found" but an actual guard
+        // against the shape.
+        let escape_target = base.join("landed").join("path.otui");
+        std::fs::create_dir_all(escape_target.parent().unwrap()).expect("mkdir landed");
+        std::fs::write(&escape_target, "Panel < UIWidget\n").expect("plant escape target");
+        let rest = escape_target.with_extension("").display().to_string();
+        assert!(
+            rest.starts_with('/'),
+            "test target must itself be OS-absolute: {rest}"
+        );
+
+        assert_eq!(
+            resolve_vfs_rooted_otui(&rest, std::slice::from_ref(&base)),
+            None,
+            "an OS-absolute `rest` must never resolve, even onto a real file"
         );
     }
 
