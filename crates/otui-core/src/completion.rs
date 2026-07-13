@@ -1116,16 +1116,22 @@ Panel
     }
 
     #[test]
-    fn a_known_property_outside_the_curated_set_has_no_completion_documentation() {
+    fn a_known_property_outside_the_curated_set_still_gets_the_validation_note() {
         // `min-width` is known but neither curated nor enum-valued (mirrors
-        // `property_hover`'s equivalent hover test) — no documentation to surface.
+        // `property_hover`'s equivalent test): a known property always gets a body from the shared
+        // formatter now, at minimum the "silently ignored" validation note (`min-width` is not one
+        // of the validating families).
         let src = "Button\n  min-wid\n";
         let items = complete_at(src, at(src, "min-wid") + "min-wid".len());
         let min_width = items
             .iter()
             .find(|i| i.label == "min-width")
             .expect("min-width");
-        assert_eq!(min_width.documentation, None);
+        let doc = min_width
+            .documentation
+            .as_deref()
+            .expect("min-width has a doc");
+        assert!(doc.contains("silently ignored"), "{doc}");
     }
 
     #[test]
@@ -1586,13 +1592,14 @@ Window < UIWindow
     #[test]
     fn anchor_edge_and_shorthand_completions_carry_documentation() {
         // Anchor edges/shorthands are not catalog properties, but they get their own documentation
-        // from the shared `property_hover::documentation_body` formatter (Finding A: previously
-        // `None`).
+        // from the shared `property_hover::documentation_body` formatter, stating the precise
+        // resolution scope (spec §2.4): a direct sibling id or a magic pseudo-target only.
         let src = "Widget\n  anchors.\n";
         let items = complete_at(src, at(src, "anchors.") + "anchors.".len());
         let top = items.iter().find(|i| i.label == "top").expect("top edge");
         let top_doc = top.documentation.as_deref().expect("top has a doc");
         assert!(top_doc.contains("edge"), "{top_doc}");
+        assert!(top_doc.contains("direct sibling"), "{top_doc}");
 
         let fill = items.iter().find(|i| i.label == "fill").expect("fill");
         let fill_doc = fill.documentation.as_deref().expect("fill has a doc");
@@ -1600,6 +1607,7 @@ Window < UIWindow
             fill_doc.to_lowercase().contains("all four edges"),
             "{fill_doc}"
         );
+        assert!(fill_doc.contains("direct sibling"), "{fill_doc}");
 
         // An `@event` name gets no documentation — no curated note exists for those.
         let src = "Button\n  @onCl\n";

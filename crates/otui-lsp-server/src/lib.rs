@@ -7332,6 +7332,8 @@ end
         // Enum properties always append the full accepted value list.
         assert!(t.contains("One of:"), "{t}");
         assert!(t.contains("`flex`"), "{t}");
+        // `display` is one of the validating properties: the note says so.
+        assert!(t.contains("rejects an invalid value"), "{t}");
     }
 
     #[test]
@@ -7339,21 +7341,30 @@ end
         let t = property_hover_text("Panel\n  color: red\n", "color");
         // Curated behavior for color describes the draw color.
         assert!(t.contains("**`color`**") && t.contains("draw color"), "{t}");
+        // Every color-typed property validates (the engine's `Color(node->value())` throws).
+        assert!(t.contains("rejects an invalid value"), "{t}");
     }
 
     #[test]
-    fn hover_on_a_known_uncurated_property_uses_the_value_kind_fallback() {
-        // `min-width` is a real catalog property, no curated doc, Plain-valued: per
-        // `documentation_body`'s "Plain -> nothing extra" rule there is genuinely nothing beyond the
-        // bare name to say, so the header shows alone (no dangling " — ").
+    fn hover_on_a_known_uncurated_property_always_gets_a_body() {
+        // `min-width` is a real catalog property, no curated doc, Plain-valued: no curated prose and
+        // no value-kind sentence, but a KNOWN property's hover is never header-only — it always
+        // carries at least the validation note (spec §5.5: "whether it's one of the four
+        // hard-error-validating properties or silently-ignored-if-misspelled"). `min-width` is not
+        // one of those, so an invalid value is silently ignored.
         let t = property_hover_text("Panel\n  min-width: 10\n", "min-width");
-        assert_eq!(t, "**`min-width`**");
-        // `border-color-bottom` is a color property with no curated doc → the color-value fallback.
+        assert!(t.contains("**`min-width`**"), "{t}");
+        assert!(t.contains("silently ignored"), "{t}");
+        assert!(!t.contains("rejects an invalid value"), "{t}");
+
+        // `border-color-bottom` is a color property with no curated doc → the color-value sentence,
+        // plus the validating note (colors validate too — see `documentation_body`'s doc comment).
         let t2 = property_hover_text("Panel\n  border-color-bottom: red\n", "border-color-bottom");
         assert!(
             t2.contains("**`border-color-bottom`**") && t2.contains("Takes a color."),
             "{t2}"
         );
+        assert!(t2.contains("rejects an invalid value"), "{t2}");
     }
 
     /// The [`CodeAction`] inside a [`CodeActionOrCommand`] (panics if it is a bare command).
