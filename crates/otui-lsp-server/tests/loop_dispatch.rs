@@ -1046,16 +1046,25 @@ fn code_lens_reports_the_derived_count_on_the_style_name() {
         "title must report the exact derived count: {:?}",
         command.title
     );
-    // Deliberately inert, not a broken client-specific action: see `Backend::code_lens`'s doc
-    // comment for why. Pinned here so an accidental switch to a command id no generic LSP client
-    // can actually run (see that comment) fails a test instead of shipping silently.
+    // The command id is handled by the companion VS Code extension: see `Backend::code_lens`'s
+    // doc comment for why this isn't the built-in `editor.action.showReferences`. Pinned here so
+    // an accidental rename/regression back to an empty id fails a test instead of shipping
+    // silently.
     assert_eq!(
-        command.command, "",
-        "the lens command is deliberately empty (informative-only, inert on every client)"
+        command.command, "otui.showSubtypes",
+        "the lens command must be the namespaced id the extension registers"
     );
-    assert!(
-        command.arguments.is_none(),
-        "no command id means no arguments either"
+    let arguments = command
+        .arguments
+        .as_ref()
+        .expect("otui.showSubtypes carries [uri, position] arguments");
+    assert_eq!(
+        *arguments,
+        vec![
+            serde_json::to_value(&uri).expect("Uri serializes"),
+            serde_json::to_value(Position::new(0, 0)).expect("Position serializes"),
+        ],
+        "arguments must be the style declaration's document URI and the lens position"
     );
 
     shutdown_and_exit(&client, server_thread, 3);

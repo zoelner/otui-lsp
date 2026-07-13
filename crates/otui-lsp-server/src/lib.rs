@@ -2731,28 +2731,27 @@ impl Backend {
     /// `Name < Base` namespace is global, so a style's derivations can live in other documents).
     ///
     /// Eager, not lazy: `resolve_provider` is advertised `false`, so every `CodeLens` carries its
-    /// final `Command` up front. The lens is deliberately purely informative — an empty `command`
-    /// id, which every client renders as inert (unclickable) text — rather than wired to a "peek
-    /// the N derivations" action. This was considered and rejected, not overlooked:
+    /// final `Command` up front.
     ///
-    /// * There is no portable, editor-agnostic LSP command for "show these locations" — a
-    ///   client-registered command every client actually implements. The nearest thing, VS Code's
-    ///   built-in `editor.action.showReferences(uri, position, locations)`, is VS-Code-specific,
-    ///   which this project's target client is — so it is not ruled out on portability grounds
-    ///   alone.
-    /// * It IS ruled out on a plumbing ground specific to this repo, though: `Command.arguments` are
-    ///   forwarded to the client verbatim, as the raw LSP-JSON this handler serializes (see
-    ///   `vscode-languageclient`'s `asCommand`, which copies `item.arguments` through unconverted).
-    ///   `editor.action.showReferences` expects real `vscode.Uri`/`vscode.Position`/`vscode.Location`
-    ///   *class instances*, not their JSON shapes — every existing caller of it (e.g. rust-analyzer)
-    ///   gets there by registering an extension-side command that does that JSON→API conversion
-    ///   before forwarding to the built-in one. This repo is the language server only; the bridging
-    ///   command would have to live in the separate client extension repo, which is out of this
-    ///   node's (and this repo's) scope. Wiring the built-in command id directly from here would
-    ///   compile and look plausible, but throw at click-time in real VS Code.
+    /// There is no portable, editor-agnostic LSP command for "show these locations" — VS Code's
+    /// built-in `editor.action.showReferences(uri, position, locations)` was considered and
+    /// rejected, not overlooked: `Command.arguments` are forwarded to the client verbatim, as the
+    /// raw LSP-JSON this handler serializes (`vscode-languageclient`'s `asCommand` copies
+    /// `item.arguments` through unconverted), but `editor.action.showReferences` expects real
+    /// `vscode.Uri`/`vscode.Position`/`vscode.Location` *class instances*, not their JSON shapes.
+    /// Every existing caller of it (e.g. rust-analyzer) gets there by registering an
+    /// extension-side command that does that JSON→API conversion before forwarding to the built-in
+    /// one.
     ///
-    /// So: an informative lens, safely inert on every client, rather than a client-specific action
-    /// this repo cannot itself finish wiring.
+    /// So this server follows that same pattern: it emits its own namespaced command id,
+    /// `otui.showSubtypes`, with plain-JSON `arguments: [uri, position]` (the style declaration's
+    /// document and the lens's position). The companion VS Code extension registers
+    /// `otui.showSubtypes` and, on click, re-runs `textDocument/implementation` at that position
+    /// (which this server already answers from `subtypes`) and peeks the results — so the N
+    /// derivations are never collected server-side here, only recomputed on demand by the
+    /// extension. A client that has not registered the command renders the lens title and no-ops
+    /// on click: harmless, same as an inert lens, but forward-compatible once the extension half
+    /// ships.
     fn code_lens(&self, params: CodeLensParams) -> Option<Vec<CodeLens>> {
         let uri = params.text_document.uri;
         // Serve from the stored document text; an unknown document has no lenses, and (the
@@ -2771,12 +2770,16 @@ impl Backend {
                 } else {
                     format!("{n} widgets inherit this style")
                 };
+                let range = index.range(lens.name_span.start, lens.name_span.end, encoding);
                 CodeLens {
-                    range: index.range(lens.name_span.start, lens.name_span.end, encoding),
+                    range,
                     command: Some(Command {
                         title,
-                        command: String::new(),
-                        arguments: None,
+                        command: "otui.showSubtypes".to_owned(),
+                        arguments: Some(vec![
+                            serde_json::to_value(&uri).expect("Uri serializes"),
+                            serde_json::to_value(range.start).expect("Position serializes"),
+                        ]),
                     }),
                     data: None,
                 }
