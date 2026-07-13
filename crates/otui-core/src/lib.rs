@@ -11,7 +11,8 @@
 //! [`navigation`], [`references`], [`hierarchy`], [`format`], [`indent`], [`folding`], [`semantic`],
 //! [`colors`], [`links`], [`fixes`], [`lenses`], [`inlay`], plus the workspace-index building blocks
 //! ([`style_index`], [`lua_widgets`], [`lua_refs`], [`lua_ui_loads`], [`otmod`], [`widget_resolve`],
-//! [`ids`]) and the engine data ([`schema`], [`catalog`]).
+//! [`ids`]), the module-manifest-flavored diagnostics pass ([`manifest`]), and the engine data
+//! ([`schema`], [`catalog`]).
 //! The [`LanguageService`] trait
 //! and the inherent [`OtuiService`] methods below are the entry points the server drives.
 
@@ -32,6 +33,7 @@ pub mod links;
 pub mod lua_refs;
 pub mod lua_ui_loads;
 pub mod lua_widgets;
+pub mod manifest;
 pub mod navigation;
 mod otml_reparent;
 pub mod otmod;

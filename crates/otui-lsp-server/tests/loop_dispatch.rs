@@ -2436,3 +2436,243 @@ fn inlay_hint_shows_the_native_ancestor_and_filters_to_the_requested_range() {
 
     shutdown_and_exit(&client, server_thread, 5);
 }
+
+/// The regression this whole node exists to fix: opening a real-shaped `.otmod` module manifest
+/// must never publish a widget `unknown-property` diagnostic against its manifest keys
+/// (`name:`/`description:`/`scripts:`/`sandboxed:`/`@onLoad:`, …) — those are manifest metadata,
+/// not widget style properties, and the widget catalog was never meant to judge them (spec: this
+/// crate's `otui_core::manifest`, ground-truthed against `module.cpp`'s `Module::discover`).
+#[test]
+fn otmod_didopen_publishes_no_widget_unknown_property_diagnostics() {
+    let uri = Uri::from_str("file:///scratch/game_shop.otmod").expect("uri");
+    let source = "\
+Module
+  name: game_shop
+  description: In-game shop
+  author: someone
+  website: https://example.invalid
+  sandboxed: true
+  scripts: [ game_shop ]
+  @onLoad: init()
+  @onUnload: terminate()
+";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    // The client may send any of "otui"/"otml"/its own id for a `.otmod`, exactly
+                    // as it already does for a `.otui` (see `Language::classify`'s doc comment) —
+                    // the `.otmod` extension alone must be enough to route this correctly.
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: source.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+
+    let published = recv_diagnostics(&client, &uri);
+    assert!(
+        published
+            .diagnostics
+            .iter()
+            .all(|d| d.code != Some(NumberOrString::String("unknown-property".to_owned()))),
+        "a widget unknown-property diagnostic must never fire on a module manifest: {:#?}",
+        published.diagnostics
+    );
+    // Every key in this manifest is one `Module::discover` actually reads, so the well-formed
+    // manifest yields no diagnostics at all — not even a manifest-schema hint.
+    assert!(
+        published.diagnostics.is_empty(),
+        "a well-formed manifest should have no diagnostics: {:#?}",
+        published.diagnostics
+    );
+
+    shutdown_and_exit(&client, server_thread, 2);
+}
+
+/// A manifest key the engine never reads (`minClientVersion:` — observed verbatim in four real
+/// OTClient module manifests, none of which read it in `module.cpp` either) is a
+/// `unknown-manifest-key` **Hint**, never an Error and never a widget `unknown-property` — spec
+/// §2.10's posture, end to end through the real publish path.
+#[test]
+fn otmod_unknown_manifest_key_is_a_hint_not_an_error() {
+    let uri = Uri::from_str("file:///scratch/inspect.otmod").expect("uri");
+    let source = "Module\n  name: game_inspect\n  minClientVersion: 1511\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: source.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+
+    let published = recv_diagnostics(&client, &uri);
+    assert_eq!(
+        published.diagnostics.len(),
+        1,
+        "exactly one finding, the unknown key: {:#?}",
+        published.diagnostics
+    );
+    let diag = &published.diagnostics[0];
+    assert_eq!(diag.severity, Some(DiagnosticSeverity::HINT));
+    assert_eq!(
+        diag.code,
+        Some(NumberOrString::String("unknown-manifest-key".to_owned()))
+    );
+
+    shutdown_and_exit(&client, server_thread, 2);
+}
+
+/// Only the DIAGNOSTICS path changes for a `.otmod`: the purely syntactic surfaces (semantic
+/// tokens, folding) still run — a module manifest is OTML, and both operate on the shared grammar
+/// alone, never the widget-vs-manifest schema.
+#[test]
+fn semantic_tokens_and_folding_still_serve_a_otmod_document() {
+    let uri = Uri::from_str("file:///scratch/topmenu.otmod").expect("uri");
+    // A multi-line `@onLoad:` block scalar body gives folding something multi-line to collapse,
+    // exactly like the widget-`.otui` folding tests do for a block scalar.
+    let source = "\
+Module
+  name: client_topmenu
+  scripts: [ topmenu ]
+  @onLoad: |
+    init()
+    connect(g_game, { onGameStart = online })
+";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: source.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+    let _ = recv_diagnostics(&client, &uri);
+
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(2),
+            "textDocument/semanticTokens/full".to_owned(),
+            lsp_types::SemanticTokensParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            },
+        )))
+        .expect("send semanticTokens/full");
+    let resp = recv_response(&client, &RequestId::from(2));
+    assert!(resp.error.is_none(), "semanticTokens errored: {resp:?}");
+    let tokens: lsp_types::SemanticTokensResult =
+        serde_json::from_value(resp.result.expect("semanticTokens result present"))
+            .expect("deserialize SemanticTokensResult");
+    let lsp_types::SemanticTokensResult::Tokens(tokens) = tokens else {
+        panic!("expected the Tokens variant: {tokens:?}");
+    };
+    assert!(
+        !tokens.data.is_empty(),
+        "semantic tokens must still be produced for a .otmod document"
+    );
+
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(3),
+            "textDocument/foldingRange".to_owned(),
+            lsp_types::FoldingRangeParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            },
+        )))
+        .expect("send foldingRange");
+    let resp = recv_response(&client, &RequestId::from(3));
+    assert!(resp.error.is_none(), "foldingRange errored: {resp:?}");
+    let folds: Vec<lsp_types::FoldingRange> =
+        serde_json::from_value(resp.result.expect("foldingRange result present"))
+            .expect("deserialize Vec<FoldingRange>");
+    assert!(
+        !folds.is_empty(),
+        "the multi-line @onLoad block scalar body must still fold on a .otmod document"
+    );
+
+    shutdown_and_exit(&client, server_thread, 4);
+}
+
+/// A `.otfont` document is judged against the font-manifest schema, not the module one — `texture:`/
+/// `glyph-size:`/`height:` are real font keys, and neither must fire a widget `unknown-property` nor
+/// a `.otmod`-flavored diagnostic.
+#[test]
+fn otfont_didopen_publishes_no_widget_unknown_property_diagnostics() {
+    let uri = Uri::from_str("file:///scratch/small-9px.otfont").expect("uri");
+    // `data/fonts/otfont/small-9px.otfont`-style real shape.
+    let source = "\
+Font
+  name: small-9px
+  texture: small-9px
+  height: 9
+  glyph-size: 9 9
+  space-width: 3
+  spacing: 1 0
+";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: source.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+
+    let published = recv_diagnostics(&client, &uri);
+    assert!(
+        published.diagnostics.is_empty(),
+        "a well-formed font manifest should have no diagnostics: {:#?}",
+        published.diagnostics
+    );
+
+    shutdown_and_exit(&client, server_thread, 2);
+}
