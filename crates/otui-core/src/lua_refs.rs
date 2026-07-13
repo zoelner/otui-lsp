@@ -466,6 +466,23 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// The [`LuaIdRef`] whose span contains byte offset `offset` in `source`, or `None` when the cursor
+/// is not on any recognized reference form (spec §2.3) — the Lua-side counterpart of
+/// [`crate::links::asset_ref_at`]'s "what is the cursor on" selector, but over this module's
+/// byte-oriented scan rather than a tree-sitter grammar (there is no Lua grammar in this workspace).
+///
+/// Re-scans `source` on every call rather than caching, matching every other span locator in this
+/// crate (`asset_ref_at`, `id_at`) — a `references`/reverse-navigation request is user-initiated,
+/// not a hot path. `offset` is compared half-open (`span.start..span.end`), so a cursor sitting
+/// exactly on the span's end byte (immediately after the last character) does not match, consistent
+/// with every other byte-span containment check in this workspace.
+#[must_use]
+pub fn ref_at(source: &str, offset: usize) -> Option<LuaIdRef> {
+    scan_id_refs(source)
+        .into_iter()
+        .find(|r| r.span.start <= offset && offset < r.span.end)
+}
+
 /// The workspace-wide index of Lua `id:` references, aggregated per document.
 ///
 /// Mirrors [`StyleIndex`](crate::style_index::StyleIndex) and
@@ -876,5 +893,53 @@ mod tests {
         assert_eq!(removed.len(), 1);
         assert_eq!(index.document_count(), 1);
         assert!(index.remove_document(&DocId::new("b.lua")).is_none());
+    }
+
+    #[test]
+    fn ref_at_cursor_inside_the_id_token_returns_the_ref() {
+        let src = "widget:getChildById('closeButton')\n";
+        let offset = src.find("closeButton").expect("present") + 2; // mid-token
+        let r = ref_at(src, offset).expect("hit");
+        assert_eq!(r.id, "closeButton");
+        assert_eq!(r.kind, LuaIdRefKind::GetChildById);
+    }
+
+    #[test]
+    fn ref_at_cursor_at_the_start_of_the_span_matches() {
+        let src = "widget:recursiveGetChildById('closeButton')\n";
+        let offset = src.find("closeButton").expect("present");
+        let r = ref_at(src, offset).expect("hit at span start");
+        assert_eq!(r.id, "closeButton");
+    }
+
+    #[test]
+    fn ref_at_cursor_at_the_end_of_the_span_is_none() {
+        // Half-open: the byte immediately AFTER the last character of the token is not "on" it.
+        let src = "widget:getChildById('closeButton')\n";
+        let offset = src.find("closeButton").expect("present") + "closeButton".len();
+        assert!(ref_at(src, offset).is_none());
+    }
+
+    #[test]
+    fn ref_at_on_a_dot_ui_chain_segment_returns_it() {
+        let src = "controller.ui.closeButton:setText('x')\n";
+        let offset = src.find("closeButton").expect("present") + 3;
+        let r = ref_at(src, offset).expect("hit");
+        assert_eq!(r.id, "closeButton");
+        assert_eq!(r.kind, LuaIdRefKind::DotUi);
+    }
+
+    #[test]
+    fn ref_at_cursor_off_any_reference_is_none() {
+        let src = "widget:getChildById('closeButton')\n";
+        assert!(ref_at(src, 0).is_none(), "cursor on `widget`, not a ref");
+    }
+
+    #[test]
+    fn ref_at_inside_a_comment_is_none() {
+        // The excluded-range pre-pass must apply here exactly like it does to `scan_id_refs`.
+        let src = "-- widget:getChildById('closeButton')\n";
+        let offset = src.find("closeButton").expect("present");
+        assert!(ref_at(src, offset).is_none());
     }
 }

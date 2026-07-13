@@ -67,11 +67,13 @@ use lsp_types::{
 };
 use otui_core::fixes::Fix;
 use otui_core::hover::{Inheritance, StyleHover, StyleHoverKind};
+use otui_core::ids::{visible_ids, IdOrigin};
 use otui_core::inlay::ancestor_hints;
 use otui_core::lenses::style_lenses;
 use otui_core::links::{
     is_asset_sentinel_value, is_runtime_variable_path, resolve_asset_candidates, PathRef,
 };
+use otui_core::lua_refs::{scan_id_refs, LuaRefIndex};
 use otui_core::lua_widgets::LuaWidgetIndex;
 use otui_core::property_hover::{PropertyHover, PropertyValueKind};
 use otui_core::style_index::{is_native_base, DocId, StyleDef, StyleIndex};
@@ -234,6 +236,28 @@ pub struct Backend {
     /// open-buffer or disk-text tracking: Lua files are never opened as OTUI documents, so this index
     /// is fed only from disk. [`Arc`] so the background scan can write into it from a spawned task.
     lua_index: Arc<RwLock<LuaWidgetIndex>>,
+    /// The workspace-wide index of **Lua→OTUI id cross-references** (spec §2.3:
+    /// `getChildById`/`recursiveGetChildById`/`.ui.` chains), keyed by document URL string — the
+    /// other half of the OTUI↔Lua bridge alongside [`lua_index`](Self::lua_index) (which indexes
+    /// widget *definitions*, not id *references*). Populated at startup by scanning `*.lua` under
+    /// the workspace roots, kept in sync via file watching, and — unlike `lua_index` — ALSO fed from
+    /// an open `.lua` buffer's unsaved edits (see [`set_open_document`](Self::set_open_document)),
+    /// so an edited-but-unsaved controller still resolves the bridge. Consumed by
+    /// `textDocument/references`'s forward direction (an OTUI `id:` → its uses in the **paired**
+    /// `.lua` file — see [`Backend::lua_forward_references`]; scoped by
+    /// [`LuaRefIndex::document`], never the unscoped [`LuaRefIndex::lookup`], since an id repeats
+    /// freely across modules). [`Arc`] so the background scan can write into it from a spawned task.
+    lua_ref_index: Arc<RwLock<LuaRefIndex>>,
+    /// On-disk text of every **indexed closed** `.lua` file that contributed at least one entry to
+    /// [`lua_ref_index`](Self::lua_ref_index), keyed by its `file://` URL — the Lua-side counterpart
+    /// of [`disk_texts`](Self::disk_texts), needed for the same reason: turning a
+    /// [`LuaIdRef`](otui_core::lua_refs::LuaIdRef)'s byte span into an LSP `Location` requires the
+    /// declaring file's own text to build a [`LineIndex`]. An **open** `.lua` buffer is resolved
+    /// straight from [`documents`](Self::documents) instead (it may hold unsaved edits, authoritative
+    /// over this cache) — see [`Backend::lua_text_for`], the single seam both directions of the
+    /// bridge read a `.lua` file's text through. [`Arc`] so the background scan can populate it from
+    /// a spawned task.
+    lua_texts: Arc<RwLock<HashMap<Uri, String>>>,
     /// On-disk text of every **indexed closed** `.otui` file, keyed by its `file://` URL. This is
     /// the content store that lets the aggregators map a closed file's byte span → LSP range without
     /// the file being open. For any URI also present in [`documents`](Self::documents) the open
@@ -294,6 +318,8 @@ impl Backend {
             documents: Arc::new(RwLock::new(HashMap::new())),
             style_index: Arc::new(RwLock::new(StyleIndex::new())),
             lua_index: Arc::new(RwLock::new(LuaWidgetIndex::new())),
+            lua_ref_index: Arc::new(RwLock::new(LuaRefIndex::new())),
+            lua_texts: Arc::new(RwLock::new(HashMap::new())),
             disk_texts: Arc::new(RwLock::new(HashMap::new())),
             roots: Mutex::new(workspace_roots(params)),
             reindex_guard: Arc::new(Mutex::new(())),
@@ -496,7 +522,9 @@ impl Backend {
     /// same OTUI-only parser the analyzer uses, and running it over Lua source has no business
     /// writing into the workspace `StyleIndex` — even a spurious empty entry is scope creep for a
     /// document that was never meant to be indexed this way (`lua_index`, fed only from disk, is
-    /// the real workspace-wide Lua index; see its docs).
+    /// the real workspace-wide Lua index; see its docs). A `.lua` document IS, however, re-indexed
+    /// into [`lua_ref_index`](Self::lua_ref_index) from this same open-buffer text — the bridge's
+    /// reverse direction (Lua → OTUI) must see an unsaved edit, not just what is on disk.
     fn set_open_document(&self, uri: &Uri, text: &str, version: i32, language: Language) {
         let _guard = self.reindex_guard.lock().expect("reindex_guard poisoned");
         {
@@ -510,8 +538,9 @@ impl Backend {
                 },
             );
         }
-        if language == Language::Otui {
-            self.reindex_styles(uri, text);
+        match language {
+            Language::Otui => self.reindex_styles(uri, text),
+            Language::Lua => self.reindex_lua_refs_open(uri, text),
         }
     }
 
@@ -610,6 +639,71 @@ impl Backend {
             .write()
             .expect("lua_index lock poisoned")
             .remove_document(&DocId::from(uri.to_string()));
+    }
+
+    /// Re-index a `*.lua` file's id cross-references into [`lua_ref_index`](Self::lua_ref_index) from
+    /// its on-disk `text`, caching that text in [`lua_texts`](Self::lua_texts) so a closed file's ref
+    /// spans stay resolvable into an LSP `Location`. Shared by the initial scan, the file watcher, and
+    /// `did_close`'s disk re-sync (mirroring [`index_from_disk`](Self::index_from_disk) for the OTUI
+    /// side of the bridge).
+    fn index_lua_refs_from_disk(&self, uri: &Uri, text: String) {
+        let refs = scan_id_refs(&text);
+        self.lua_ref_index
+            .write()
+            .expect("lua_ref_index lock poisoned")
+            .set_document(DocId::from(uri.to_string()), refs);
+        self.lua_texts
+            .write()
+            .expect("lua_texts lock poisoned")
+            .insert(uri.clone(), text);
+    }
+
+    /// Re-index a `*.lua` OPEN buffer's id cross-references from its (possibly unsaved) `text`. Only
+    /// [`lua_ref_index`](Self::lua_ref_index) is touched here — the buffer's text itself is already
+    /// authoritative in [`documents`](Self::documents), which [`lua_text_for`](Self::lua_text_for)
+    /// consults first, so [`lua_texts`](Self::lua_texts) (the on-disk cache) is left alone.
+    fn reindex_lua_refs_open(&self, uri: &Uri, text: &str) {
+        let refs = scan_id_refs(text);
+        self.lua_ref_index
+            .write()
+            .expect("lua_ref_index lock poisoned")
+            .set_document(DocId::from(uri.to_string()), refs);
+    }
+
+    /// Drop `uri`'s cross-references from both [`lua_ref_index`](Self::lua_ref_index) and the
+    /// [`lua_texts`](Self::lua_texts) disk-text cache (a deleted Lua file).
+    fn deindex_lua_refs(&self, uri: &Uri) {
+        self.lua_ref_index
+            .write()
+            .expect("lua_ref_index lock poisoned")
+            .remove_document(&DocId::from(uri.to_string()));
+        self.lua_texts
+            .write()
+            .expect("lua_texts lock poisoned")
+            .remove(uri);
+    }
+
+    /// The text to resolve a `.lua` document's byte spans against, for either direction of the
+    /// OTUI↔Lua bridge: the OPEN buffer when `uri` is currently open (it may hold unsaved edits, and
+    /// is kept authoritative the same way [`merge_documents`] treats an open `.otui` buffer), else the
+    /// on-disk cache in [`lua_texts`](Self::lua_texts). `None` when neither has it — an unindexed,
+    /// unopened `.lua` file the bridge cannot resolve into.
+    fn lua_text_for(&self, uri: &Uri) -> Option<String> {
+        if let Some(doc) = self
+            .documents
+            .read()
+            .expect("documents lock poisoned")
+            .get(uri)
+        {
+            if doc.language == Language::Lua {
+                return Some(doc.text.clone());
+            }
+        }
+        self.lua_texts
+            .read()
+            .expect("lua_texts lock poisoned")
+            .get(uri)
+            .cloned()
     }
 }
 
@@ -779,6 +873,36 @@ fn uri_to_file_path(uri: &Uri) -> Option<PathBuf> {
 /// a `file:` URL. Mirror of [`uri_to_file_path`]; see it for why the `url` crate is used.
 fn uri_from_file_path(path: &Path) -> Option<Uri> {
     Uri::from_str(url::Url::from_file_path(path).ok()?.as_str()).ok()
+}
+
+/// The sibling `.otui`/`.lua` file paired with `uri` — same directory, same file stem, differing
+/// only in extension (spec §2.3: an OTUI module and its controller are paired "the same way OTClient
+/// pairs them: same directory, same name" — e.g. `login.otui` pairs with `login.lua`). This is the
+/// correctness boundary for the OTUI↔Lua bridge (both directions): an id repeats freely across the
+/// workspace, so `textDocument/references` must resolve against exactly this one sibling file, never
+/// fan out to every `.lua`/`.otui` that happens to mention the same id (see
+/// [`Backend::lua_forward_references`] and [`Backend::lua_references`]).
+///
+/// Goes through [`uri_to_file_path`] (which percent-*decodes*) rather than a raw string swap, so a
+/// URI carrying a space or an encoded character (`%20`, `foo%2Elua`) pairs the same file the reader
+/// that indexes it (`read_indexed_file`) would open — the two must never disagree about which file a
+/// URI names (see [`Language::from_uri`]'s doc comment for the class of bug that causes). `None` for
+/// a non-`file:` URI or one with no representable sibling path.
+///
+/// **Coverage.** This is exactly the pairing rule spec §2.3 specifies, and it is correct wherever a
+/// sibling exists — but not every controller has one. Measured on the real engine corpus (`otclient`):
+/// of the `.lua` files that call `getChildById`/`recursiveGetChildById` at all, only *roughly half*
+/// have a same-directory/same-stem `.otui` to pair with here. The rest keep their UI elsewhere — a
+/// `styles/` subdirectory (e.g. `game_rewardwall/game_rewardwall.lua` ↔
+/// `game_rewardwall/styles/style.otui`) or an altogether different filename/module layout (e.g.
+/// `game_wheel/classes/*`) — and for those the bridge is silently a no-op in **both** directions:
+/// [`Backend::lua_forward_references`]/[`Backend::lua_references`] simply find no paired document,
+/// same as any other file with no sibling. That is a real gap, not a bug in this rule: associating
+/// such a controller via its `.otmod`/`g_ui.displayUI(...)`/`importStyle(...)` declaration instead is
+/// a legitimate, larger follow-up, deliberately left out of this bridge.
+fn paired_uri(uri: &Uri, target_ext: &str) -> Option<Uri> {
+    let path = uri_to_file_path(uri)?;
+    uri_from_file_path(&path.with_extension(target_ext))
 }
 
 /// The two subdirectories that, together with `init.lua` itself, confirm a directory is the real
@@ -2401,6 +2525,8 @@ impl Backend {
         } else {
             let style_index = Arc::clone(&self.style_index);
             let lua_index = Arc::clone(&self.lua_index);
+            let lua_ref_index = Arc::clone(&self.lua_ref_index);
+            let lua_texts = Arc::clone(&self.lua_texts);
             let disk_texts = Arc::clone(&self.disk_texts);
             let documents = Arc::clone(&self.documents);
             let reindex_guard = Arc::clone(&self.reindex_guard);
@@ -2458,29 +2584,62 @@ impl Backend {
                         .insert(uri, text);
                     indexed += 1;
                 }
-                // Then scan `.lua` for widget definitions (custom style props + `extends` parents).
-                // No reindex guard, open-check, or disk-text cache: Lua is never an open OTUI
-                // document, so this index is fed purely from disk. Files that declare no widget
-                // contribute an empty result and are skipped to keep the index lean.
+                // Then scan `.lua` for widget definitions (custom style props + `extends` parents)
+                // AND id cross-references (spec §2.3: `getChildById`/.../`.ui.` — the other half of
+                // the OTUI↔Lua bridge). No reindex guard, open-check, or disk-text cache for the
+                // widget-def half: Lua is never an open OTUI document, so `lua_index` is fed purely
+                // from disk. Files that declare no widget contribute an empty result there and are
+                // skipped to keep that index lean.
+                //
+                // The two halves are indexed INDEPENDENTLY — a `.lua` file with refs but no widget
+                // defs (the common case: most controllers never define a custom widget type) must
+                // still land in `lua_ref_index`, so this is deliberately never a single `if
+                // defs.is_empty() { continue }` gate shared between them.
                 let mut lua_indexed = 0usize;
+                let mut lua_refs_indexed = 0usize;
                 for (uri, text) in scan_workspace_lua(&roots) {
                     if shutdown.load(Ordering::Relaxed) {
                         return;
                     }
                     let defs = service.lua_widgets(&text);
-                    if defs.is_empty() {
-                        continue;
+                    if !defs.is_empty() {
+                        lua_index
+                            .write()
+                            .expect("lua_index lock poisoned")
+                            .set_document(DocId::from(uri.to_string()), defs);
+                        lua_indexed += 1;
                     }
-                    lua_index
-                        .write()
-                        .expect("lua_index lock poisoned")
-                        .set_document(DocId::from(uri.to_string()), defs);
-                    lua_indexed += 1;
+                    // Unlike the widget-def half above, `lua_ref_index` IS open-buffer aware (see
+                    // `Backend::reindex_lua_refs_open`), so this write races against a concurrent
+                    // `didOpen`/`didChange` for the very same `.lua` file exactly like the `.otui`
+                    // loop above — and is guarded the same way: hold `reindex_guard` across the
+                    // open-check and the write, so an open buffer's fresher ref index can never be
+                    // clobbered by stale disk text found mid-scan.
+                    let refs = scan_id_refs(&text);
+                    if !refs.is_empty() {
+                        let _guard = reindex_guard.lock().expect("reindex_guard poisoned");
+                        if documents
+                            .read()
+                            .expect("documents lock poisoned")
+                            .contains_key(&uri)
+                        {
+                            continue;
+                        }
+                        lua_ref_index
+                            .write()
+                            .expect("lua_ref_index lock poisoned")
+                            .set_document(DocId::from(uri.to_string()), refs);
+                        lua_texts
+                            .write()
+                            .expect("lua_texts lock poisoned")
+                            .insert(uri, text);
+                        lua_refs_indexed += 1;
+                    }
                 }
                 // Progress on stderr, never the LSP channel.
                 eprintln!(
                     "otui-lsp: indexed {indexed} workspace .otui file(s), \
-                     {lua_indexed} .lua widget file(s)"
+                     {lua_indexed} .lua widget file(s), {lua_refs_indexed} .lua ref file(s)"
                 );
                 // Completion refresh: the indexes are now complete, so re-diagnose every open
                 // document to clear any stale widget-aware hint computed against a partial index
@@ -2611,13 +2770,35 @@ impl Backend {
         );
     }
 
-    /// Apply one watched-file change for a `.lua` module to the [`lua_index`](Self::lua_index): drop
-    /// it on delete, else re-scan it from disk. An unreadable/oversized/binary file is skipped.
+    /// Apply one watched-file change for a `.lua` module to both [`lua_index`](Self::lua_index)
+    /// (widget definitions) and [`lua_ref_index`](Self::lua_ref_index) (id cross-references, the
+    /// other half of the OTUI↔Lua bridge). An unreadable/oversized/binary file is skipped (logged
+    /// once, not twice).
+    ///
+    /// The two indexes are NOT treated the same here, mirroring how they already differ elsewhere:
+    /// [`lua_index`](Self::lua_index) is "fed only from disk" by design (see
+    /// [`index_lua_from_disk`](Self::index_lua_from_disk) — a `.lua` document's widget defs never
+    /// reflect an open buffer's unsaved edits), so a watch event always re-scans it from disk, open
+    /// or not. [`lua_ref_index`](Self::lua_ref_index)/[`lua_texts`](Self::lua_texts), in contrast,
+    /// DO track the open buffer (`set_open_document` → `reindex_lua_refs_open`) — the same "open
+    /// buffer wins" rule the OTUI branch of `did_change_watched_files` applies via `is_open` — so a
+    /// disk event for a currently open `.lua` file must skip touching them, on both change and
+    /// delete: reindexing from stale disk text would leave `lua_ref_index`'s spans mismatched with
+    /// [`lua_text_for`](Self::lua_text_for)'s buffer text, and deindexing on delete would erase the
+    /// open buffer's own entry out from under it. `did_close` re-syncs from disk once the buffer
+    /// goes away.
     fn apply_lua_watch_change(&self, uri: &Uri, typ: FileChangeType) {
+        let open = self.is_open(uri);
         if typ == FileChangeType::DELETED {
             self.deindex_lua(uri);
+            if !open {
+                self.deindex_lua_refs(uri);
+            }
         } else if let Some(text) = read_indexed_file(uri) {
             self.index_lua_from_disk(uri, &text);
+            if !open {
+                self.index_lua_refs_from_disk(uri, text);
+            }
         } else {
             self.log(
                 MessageType::INFO,
@@ -2986,14 +3167,29 @@ impl Backend {
         Some(resolve_subtypes(&index, &documents, &name, encoding))
     }
 
+    /// `textDocument/references`, in **both** directions of the OTUI↔Lua bridge (spec §2.3):
+    ///
+    /// * Cursor on an OTUI `id:` value → the usual document-local OTUI references, PLUS every use of
+    ///   that id in the **paired** `.lua` controller ([`lua_forward_references`](Self::lua_forward_references)).
+    /// * Cursor on a `getChildById`/`recursiveGetChildById`/`.ui.` token in a `.lua` document → the
+    ///   `id:` declaration site(s) in the paired `.otui` (and any inherited style body that declares
+    ///   it) — [`lua_references`](Self::lua_references).
+    ///
+    /// A style name's references are unaffected either way (they never cross into Lua).
     fn references(&self, params: ReferenceParams) -> Option<Vec<Location>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let include_declaration = params.context.include_declaration;
         let encoding = self.encoding();
 
-        // Read the request document's text (unknown document → nothing to resolve; the OTUI-only
-        // language guard applies the same "nothing" to a `.lua` document).
+        // Reverse direction: the request document is Lua, not OTUI — branch here rather than
+        // through `otui_document_text` (which is `None` for a `.lua` document by construction; see
+        // its doc comment).
+        if self.document_language(&uri) == Language::Lua {
+            return self.lua_references(&uri, position, encoding);
+        }
+
+        // Read the request document's text (unknown document → nothing to resolve).
         let text = self.otui_document_text(&uri)?;
 
         // Map the cursor Position to a byte offset, then classify what it is on. A cursor on neither
@@ -3004,7 +3200,7 @@ impl Backend {
         // Aggregate: style names fan out across the workspace; ids stay in the current document.
         let documents = self.merged_documents();
         let index = self.style_index.read().expect("style_index lock poisoned");
-        let locations = collect_references(
+        let mut locations = collect_references(
             &target,
             &uri,
             &documents,
@@ -3013,7 +3209,106 @@ impl Backend {
             include_declaration,
             encoding,
         );
+
+        // Forward direction: append the id's uses in the paired `.lua` controller, scoped to that
+        // single file — never the workspace-wide `LuaRefIndex::lookup` (see `paired_uri`'s doc
+        // comment on why fanning out across every `.lua` mentioning the same id string would be
+        // noise, not signal).
+        if let ReferenceTarget::Id(id) = &target {
+            locations.extend(self.lua_forward_references(&uri, id, encoding));
+        }
         Some(locations)
+    }
+
+    /// The forward half of the OTUI↔Lua bridge: every use of `id` in `otui_uri`'s **paired** `.lua`
+    /// controller ([`paired_uri`]), as LSP [`Location`]s in that file.
+    ///
+    /// Scoped by [`LuaRefIndex::document`] — the paired document only — never the unscoped
+    /// [`LuaRefIndex::lookup`] (see [`lua_ref_index`](Self::lua_ref_index)'s doc comment: an id like
+    /// `closeButton` repeats across dozens of unrelated modules in a real workspace). Every ref kind
+    /// (`GetChildById`, `RecursiveGetChildById`, `DotUi`) is included on the same terms: each
+    /// candidate is already filtered to `ref.id == id`, so a `DotUi` hit is, by construction, "a
+    /// chain segment whose text equals this id" — the best-effort rule
+    /// [`otui_core::lua_refs`] documents for that ambiguous form; nothing widens it further (e.g. no
+    /// attempt to also fall back to a chain PREFIX or a differently-cased match). Empty when the
+    /// paired file has no on-disk/open text, is not indexed, or contributes no matching ref.
+    fn lua_forward_references(
+        &self,
+        otui_uri: &Uri,
+        id: &str,
+        encoding: PositionEncoding,
+    ) -> Vec<Location> {
+        let Some(lua_uri) = paired_uri(otui_uri, "lua") else {
+            return Vec::new();
+        };
+        let Some(lua_text) = self.lua_text_for(&lua_uri) else {
+            return Vec::new();
+        };
+        let doc_id = DocId::from(lua_uri.to_string());
+        let index = self
+            .lua_ref_index
+            .read()
+            .expect("lua_ref_index lock poisoned");
+        let Some(doc_refs) = index.document(&doc_id) else {
+            return Vec::new();
+        };
+        doc_refs
+            .iter()
+            .filter(|r| r.id == id)
+            .map(|r| convert::location_of(lua_uri.clone(), &lua_text, r.span, encoding))
+            .collect()
+    }
+
+    /// The reverse half of the OTUI↔Lua bridge: the cursor sits in `lua_uri` on a
+    /// `getChildById`/`recursiveGetChildById`/`.ui.` token — resolve it back to the `id:`
+    /// declaration site(s) in the **paired** `.otui` (spec §2.3), including any inherited style body
+    /// that declares it ([`visible_ids`]).
+    ///
+    /// `None` when the cursor is not on any recognized reference form ([`lua_refs::ref_at`]) — "not
+    /// applicable here", the same answer every other OTUI-only handler gives for an unrelated
+    /// position. Once a ref IS found, this always returns `Some` — an empty vec is a legitimate
+    /// answer ("no declaration found"), matching the forward direction's `Some(locations)` shape.
+    ///
+    /// [`visible_ids`] is sound only for "might this id exist" (see its doc comment's
+    /// over-approximation warning) — that is exactly the right shape for offering navigation
+    /// targets, never for suppressing them, so every match it returns becomes a candidate `Location`
+    /// here without further filtering.
+    fn lua_references(
+        &self,
+        lua_uri: &Uri,
+        position: lsp_types::Position,
+        encoding: PositionEncoding,
+    ) -> Option<Vec<Location>> {
+        let text = self.lua_text_for(lua_uri)?;
+        let offset = LineIndex::new(&text).offset_at(position, encoding);
+        let target_ref = otui_core::lua_refs::ref_at(&text, offset)?;
+
+        let mut out = Vec::new();
+        if let Some(otui_uri) = paired_uri(lua_uri, "otui") {
+            let documents = self.merged_documents();
+            if let Some(otui_doc) = documents.get(&otui_uri) {
+                let styles = self.style_index.read().expect("style_index lock poisoned");
+                let lua_widgets = self.lua_index.read().expect("lua_index lock poisoned");
+                let visible = visible_ids(&otui_doc.text, &styles, &lua_widgets);
+                for v in visible.iter().filter(|v| v.id == target_ref.id) {
+                    let loc = match &v.origin {
+                        IdOrigin::Document => Some(convert::location_of(
+                            otui_uri.clone(),
+                            &otui_doc.text,
+                            v.span,
+                            encoding,
+                        )),
+                        IdOrigin::InheritedStyle { doc, .. } => {
+                            resolve_location(doc, v.span, &documents, encoding)
+                        }
+                    };
+                    if let Some(loc) = loc {
+                        out.push(loc);
+                    }
+                }
+            }
+        }
+        Some(out)
     }
 
     fn document_highlight(
@@ -3387,27 +3682,31 @@ impl Backend {
         // anything stale, whatever the language.
         self.send_diagnostics(uri.clone(), Vec::new(), None);
 
-        // (The OTUI-only language guard.) A `.lua` document was never fed into the OTUI
-        // `StyleIndex` on open (`set_open_document` skips it), so there is nothing OTUI-specific
-        // to re-sync from disk here either — closing it is a pure no-op beyond the diagnostics
-        // clear above.
-        if language != Language::Otui {
-            return;
-        }
-
         // Semantics change (workspace index): closing a file no longer drops it from the index.
-        // Under open-only indexing that was correct; now a closed `.otui` still lives on disk and
-        // must stay indexed as a closed file. Re-read it from disk (inline — the single-threaded loop
+        // Under open-only indexing that was correct; now a closed file still lives on disk and must
+        // stay indexed as a closed file. Re-read it from disk (inline — the single-threaded loop
         // makes a sync read fine) and re-index from that text (the buffer's unsaved edits, if any,
         // are discarded on close — disk is now authoritative). If the disk read fails (the file was
-        // deleted while open), drop it from the index + cache instead.
+        // deleted while open), drop it from the relevant index + cache instead.
         //
         // The old post-await open-state re-check is gone: with a single-threaded loop this handler
         // runs to completion before the next message is read, so no concurrent `did_open` can slip in
         // between the read and the index write. The race is impossible.
-        match read_indexed_file(&uri) {
-            Some(text) => self.index_from_disk(&uri, text),
-            None => self.deindex(&uri),
+        //
+        // (The OTUI-only language guard, narrowed.) A `.lua` document was never fed into the OTUI
+        // `StyleIndex` on open (`set_open_document` skips it), so there is nothing to re-sync THERE —
+        // but it WAS fed into `lua_ref_index` from its open-buffer text (the bridge's reverse
+        // direction), and that index must not go stale (or keep referencing unsaved-then-discarded
+        // spans) once the buffer closes, exactly like the OTUI branch below re-syncs `style_index`.
+        match language {
+            Language::Otui => match read_indexed_file(&uri) {
+                Some(text) => self.index_from_disk(&uri, text),
+                None => self.deindex(&uri),
+            },
+            Language::Lua => match read_indexed_file(&uri) {
+                Some(text) => self.index_lua_refs_from_disk(&uri, text),
+                None => self.deindex_lua_refs(&uri),
+            },
         }
     }
 }
@@ -5345,6 +5644,64 @@ end
         // Both locations are in a.otui only: the declaration and the anchor reference.
         assert!(locs.iter().all(|l| l.uri.as_str() == "file:///a.otui"));
         assert_eq!(locs.len(), 2);
+    }
+
+    #[test]
+    fn paired_uri_swaps_the_extension_in_place() {
+        let otui = Uri::from_str("file:///ws/modules/login/login.otui").expect("uri");
+        let lua = paired_uri(&otui, "lua").expect("paired");
+        assert_eq!(lua.as_str(), "file:///ws/modules/login/login.lua");
+
+        // And the reverse direction.
+        let back = paired_uri(&lua, "otui").expect("paired back");
+        assert_eq!(back.as_str(), otui.as_str());
+    }
+
+    #[test]
+    fn paired_uri_preserves_a_stem_that_itself_contains_dots() {
+        // `with_extension` must only ever touch the LAST extension — a real corpus filename
+        // (`30-miniwindow.otui`) has a dot in its stem, and swapping the whole thing after the
+        // first dot would pair it with the wrong (nonexistent) file.
+        let otui = Uri::from_str("file:///ws/styles/30-miniwindow.otui").expect("uri");
+        let lua = paired_uri(&otui, "lua").expect("paired");
+        assert_eq!(lua.as_str(), "file:///ws/styles/30-miniwindow.lua");
+    }
+
+    #[test]
+    fn paired_uri_round_trips_a_percent_encoded_space_in_the_directory() {
+        // A workspace path containing a space (`%20`) is ordinary and legal; pairing must decode it
+        // the same way the reader that indexes the file does (`uri_to_file_path`), not disagree with
+        // it — see `paired_uri`'s doc comment.
+        let otui =
+            Uri::from_str("file:///Users/dev/My%20Client/modules/login/login.otui").expect("uri");
+        let lua = paired_uri(&otui, "lua").expect("paired");
+        // Re-encoded back through the `url` crate, so compare the decoded path, not the raw string
+        // (which may legally re-encode the space differently, e.g. as `%20` either way).
+        let path = uri_to_file_path(&lua).expect("decodes");
+        assert_eq!(
+            path,
+            PathBuf::from("/Users/dev/My Client/modules/login/login.lua")
+        );
+    }
+
+    #[test]
+    fn paired_uri_handles_a_percent_encoded_dot_in_the_original_name() {
+        // `%2E` is a legal percent-encoding of a literal `.`; the pairing must decode it before
+        // splitting on the extension, exactly like `Language::from_uri` must (see its doc comment
+        // for the bug class this guards against: a raw-string test disagreeing with the decoding
+        // reader).
+        let otui = Uri::from_str("file:///ws/login%2Eotui").expect("uri");
+        let lua = paired_uri(&otui, "lua").expect("paired");
+        assert_eq!(
+            uri_to_file_path(&lua).expect("decodes"),
+            PathBuf::from("/ws/login.lua")
+        );
+    }
+
+    #[test]
+    fn paired_uri_is_none_for_a_non_file_scheme() {
+        let untitled = Uri::from_str("untitled:Untitled-1").expect("uri");
+        assert!(paired_uri(&untitled, "lua").is_none());
     }
 
     #[test]
