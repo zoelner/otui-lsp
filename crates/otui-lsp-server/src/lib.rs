@@ -269,6 +269,12 @@ pub struct Backend {
     /// the plain label — see [`convert::completion_item_to_lsp`]. Defaults to `false` (the LSP
     /// default when the capability is absent). Guarded like [`encoding`].
     snippet_support: Mutex<bool>,
+    /// Whether the client advertised `MarkupKind::Markdown` in
+    /// `textDocument.completion.completionItem.documentationFormat` during `initialize`; gates
+    /// whether a `textDocument/completion` item's `documentation` is rendered as Markdown or plain
+    /// text — see [`convert::completion_item_to_lsp`]. Defaults to `false` (the LSP default when the
+    /// capability is absent). Guarded like [`encoding`].
+    markdown_docs: Mutex<bool>,
     /// Whether the client advertised `workspace.codeLens.refreshSupport` during `initialize`;
     /// gates whether a workspace-index mutation (a watched-file change, or the initial scan's
     /// completion — see [`republish_open_documents`](Self::republish_open_documents) and
@@ -407,6 +413,7 @@ impl Backend {
             encoding: Mutex::new(negotiate_encoding(params)),
             hierarchical_symbols: Mutex::new(client_supports_hierarchical_symbols(params)),
             snippet_support: Mutex::new(client_supports_snippets(params)),
+            markdown_docs: Mutex::new(client_supports_markdown_docs(params)),
             code_lens_refresh_support: Mutex::new(client_supports_code_lens_refresh(params)),
             inlay_hint_refresh_support: Mutex::new(client_supports_inlay_hint_refresh(params)),
             documents: Arc::new(RwLock::new(HashMap::new())),
@@ -480,6 +487,13 @@ impl Backend {
             .snippet_support
             .lock()
             .expect("snippet_support mutex poisoned")
+    }
+
+    fn markdown_docs(&self) -> bool {
+        *self
+            .markdown_docs
+            .lock()
+            .expect("markdown_docs mutex poisoned")
     }
 
     fn code_lens_refresh_support(&self) -> bool {
@@ -2865,6 +2879,22 @@ fn client_supports_snippets(params: &InitializeParams) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the client can render Markdown in a completion item's `documentation`. Per LSP 3.17, a
+/// client lists its preferred formats (in order) via
+/// `textDocument.completion.completionItem.documentationFormat`; this is `true` when `Markdown`
+/// appears anywhere in that list. When the capability is absent the default is plain text — see
+/// [`convert::completion_item_to_lsp`] for where this is enforced.
+fn client_supports_markdown_docs(params: &InitializeParams) -> bool {
+    params
+        .capabilities
+        .text_document
+        .as_ref()
+        .and_then(|td| td.completion.as_ref())
+        .and_then(|c| c.completion_item.as_ref())
+        .and_then(|ci| ci.documentation_format.as_ref())
+        .is_some_and(|formats| formats.contains(&MarkupKind::Markdown))
+}
+
 /// Whether the client can be asked to refresh its code lenses via a server-initiated
 /// `workspace/codeLens/refresh` request. Per LSP 3.17, a client signals this via
 /// `workspace.codeLens.refreshSupport`; when the capability is absent the default is `false` — a
@@ -4350,6 +4380,7 @@ impl Backend {
                     .service
                     .complete_with_widgets(&text, offset, &styles, &lua),
                 self.snippet_support(),
+                self.markdown_docs(),
             )
         };
         Some(CompletionResponse::Array(items))
@@ -4854,6 +4885,67 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let backend = Backend::new(tx, &InitializeParams::default());
         assert!(!backend.snippet_support());
+    }
+
+    fn params_with_documentation_format(formats: Option<Vec<MarkupKind>>) -> InitializeParams {
+        InitializeParams {
+            capabilities: ClientCapabilities {
+                text_document: Some(TextDocumentClientCapabilities {
+                    completion: Some(CompletionClientCapabilities {
+                        completion_item: Some(CompletionItemCapability {
+                            documentation_format: formats,
+                            ..CompletionItemCapability::default()
+                        }),
+                        ..CompletionClientCapabilities::default()
+                    }),
+                    ..TextDocumentClientCapabilities::default()
+                }),
+                ..ClientCapabilities::default()
+            },
+            ..InitializeParams::default()
+        }
+    }
+
+    #[test]
+    fn markdown_docs_default_false_when_client_is_silent() {
+        // No textDocument capabilities at all → the LSP default (plain text) applies.
+        assert!(!client_supports_markdown_docs(&InitializeParams::default()));
+        // completion/completionItem present but the format list omitted → still the default.
+        assert!(!client_supports_markdown_docs(
+            &params_with_documentation_format(None)
+        ));
+    }
+
+    #[test]
+    fn markdown_docs_true_only_when_markdown_is_in_the_advertised_list() {
+        assert!(client_supports_markdown_docs(
+            &params_with_documentation_format(Some(vec![MarkupKind::Markdown]))
+        ));
+        // Markdown anywhere in the list (not necessarily first) still counts.
+        assert!(client_supports_markdown_docs(
+            &params_with_documentation_format(Some(vec![
+                MarkupKind::PlainText,
+                MarkupKind::Markdown
+            ]))
+        ));
+        // A list that never mentions Markdown stays plain text.
+        assert!(!client_supports_markdown_docs(
+            &params_with_documentation_format(Some(vec![MarkupKind::PlainText]))
+        ));
+    }
+
+    #[test]
+    fn backend_new_reads_markdown_docs_from_init_params() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let backend = Backend::new(
+            tx,
+            &params_with_documentation_format(Some(vec![MarkupKind::Markdown])),
+        );
+        assert!(backend.markdown_docs());
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let backend = Backend::new(tx, &InitializeParams::default());
+        assert!(!backend.markdown_docs());
     }
 
     fn params_with_refresh_support(

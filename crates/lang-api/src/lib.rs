@@ -262,6 +262,11 @@ pub struct CompletionItem {
     pub insert_text: Option<String>,
     /// How `insert_text` is interpreted. `Plain` unless `insert_text` carries snippet syntax.
     pub insert_format: InsertFormat,
+    /// A longer, Markdown-formatted description of the candidate (the curated property doc, a named
+    /// color's hex value, …), or `None` when there is nothing beyond `detail` to say. Protocol-agnostic
+    /// Markdown text — the server maps this onto `lsp_types::Documentation`, downgrading to plain text
+    /// for a client that never advertised Markdown support.
+    pub documentation: Option<String>,
 }
 
 /// The contract every language backend implements. Kept intentionally minimal for now; symbols,
