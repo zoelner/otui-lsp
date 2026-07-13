@@ -3786,10 +3786,24 @@ impl Backend {
     }
 
     /// The reverse half of the OTUI↔Lua bridge: the cursor sits in `lua_uri` on a
-    /// `getChildById`/`recursiveGetChildById`/`.ui.` token — resolve it back to the `id:`
-    /// declaration site(s) in every `.otui` file associated with `lua_uri`
-    /// ([`Backend::associated_uris`]; spec §2.3), including any inherited style body that declares
-    /// it ([`visible_ids`]).
+    /// `getChildById`/`recursiveGetChildById`/`.ui.` token — resolve it back to:
+    ///
+    /// 1. The `id:` declaration site(s) in every `.otui` file associated with `lua_uri`
+    ///    ([`Backend::associated_uris`]; spec §2.3), including any inherited style body that
+    ///    declares it ([`visible_ids`]).
+    /// 2. Every `setId("id")` call **in this same `.lua` document** ([`lua_refs::scan_id_defs`]) —
+    ///    the id's real, runtime declaration site: a widget created and id'd purely in Lua has no
+    ///    `.otui id:` at all, so without this a `getChildById('x')` immediately preceded by that
+    ///    same file's own `x:setId('x')` would resolve to nothing. Scanned on demand directly from
+    ///    the text already in hand here (the open buffer or [`lua_texts`](Self::lua_texts)'s cached
+    ///    disk read) — no persistent index, no extra freshness plumbing, since this document's text
+    ///    is never stale relative to itself.
+    ///
+    /// Both candidate sources are offered TOGETHER, never one suppressing the other: an id can, in
+    /// principle, be both declared in an `.otui` file and `setId`'d at runtime (e.g. a
+    /// `.otui`-declared placeholder whose id is reassigned in code), and go-to-definition/references
+    /// is navigation, not a uniqueness claim — surfacing every candidate site is strictly more useful
+    /// than picking one and hiding the rest.
     ///
     /// `None` when the cursor is not on any recognized reference form ([`lua_refs::ref_at`]) — "not
     /// applicable here", the same answer every other OTUI-only handler gives for an unrelated
@@ -3799,7 +3813,8 @@ impl Backend {
     /// [`visible_ids`] is sound only for "might this id exist" (see its doc comment's
     /// over-approximation warning) — that is exactly the right shape for offering navigation
     /// targets, never for suppressing them, so every match it returns becomes a candidate `Location`
-    /// here without further filtering.
+    /// here without further filtering. A `setId` literal match, in contrast, is EXACT — the literal
+    /// IS the declaration — so it carries zero false-positive risk of its own.
     fn lua_references(
         &self,
         lua_uri: &Uri,
@@ -3836,6 +3851,14 @@ impl Backend {
                 }
             }
         }
+        // Additional candidates: this SAME `.lua` document's own `setId("id")` declarations (see
+        // this method's doc comment) — added alongside, never instead of, the `.otui` matches above.
+        out.extend(
+            otui_core::lua_refs::scan_id_defs(&text)
+                .into_iter()
+                .filter(|d| d.id == target_ref.id)
+                .map(|d| convert::location_of(lua_uri.clone(), &text, d.span, encoding)),
+        );
         Some(out)
     }
 

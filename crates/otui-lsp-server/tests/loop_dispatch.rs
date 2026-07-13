@@ -49,6 +49,22 @@ fn position_of(text: &str, needle: &str) -> Position {
     Position::new(line, (idx - line_start) as u32)
 }
 
+/// [`position_of`]'s counterpart for the LAST occurrence of `needle` in `text` — needed when the
+/// same id string legitimately appears twice (e.g. a `setId('x')` definition followed by a
+/// `getChildById('x')` reference to it) and the cursor must land on the second one specifically.
+fn position_of_last(text: &str, needle: &str) -> Position {
+    let idx = text.rfind(needle).expect("needle present in text");
+    let mut line = 0u32;
+    let mut line_start = 0usize;
+    for (i, ch) in text[..idx].char_indices() {
+        if ch == '\n' {
+            line += 1;
+            line_start = i + 1;
+        }
+    }
+    Position::new(line, (idx - line_start) as u32)
+}
+
 /// RAII guard that removes its directory (recursively) on drop — including on an unwinding panic
 /// from a failed assertion, unlike a trailing `std::fs::remove_dir_all` call, which is never reached
 /// once an earlier assertion panics and leaks the temp directory.
@@ -1609,6 +1625,87 @@ fn vfs_rooted_load_ui_path_does_not_pair_without_a_detected_client_root() {
     );
 
     shutdown_and_exit(&client, server_thread, next_id);
+}
+
+/// The reverse bridge must ALSO resolve a `getChildById` reference against a `setId` call **in the
+/// same `.lua` document** (node `bridge-exact-resolution`, commit 2) — the id's real, runtime
+/// declaration site for a widget created and id'd purely in Lua, which has no `.otui id:` at all.
+/// The paired `.otui` here deliberately does NOT declare `bidButton` (the real-corpus shape:
+/// `game_cyclopedia/tab/house/house.lua`'s `button:setId('bidButton')`), so any resolution found
+/// must have come from the `setId` scan, not `visible_ids`.
+///
+/// No workspace root at all (mirrors `forward_references_see_an_unsaved_lua_buffer_edit`): both
+/// documents are open buffers, same stem/directory, so `paired_uri`'s fast path alone associates
+/// them — no background scan to race against.
+#[test]
+fn reverse_references_resolve_a_set_id_call_in_the_same_lua_document() {
+    let panel_otui_src = "Panel < UIWidget\n  Button\n    id: closeButton\n";
+    let panel_otui_uri = Uri::from_str("file:///scratch/set-id/panel.otui").expect("uri");
+    let panel_lua_uri = Uri::from_str("file:///scratch/set-id/panel.lua").expect("uri");
+    let panel_lua_src = "function onCreate(w)\n  \
+                          local button = g_ui.createWidget('Button', w)\n  \
+                          button:setId('bidButton')\n  \
+                          local btn = w:getChildById('bidButton')\nend\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: panel_otui_uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: panel_otui_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen otui");
+    let _ = recv_diagnostics(&client, &panel_otui_uri);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: panel_lua_uri.clone(),
+                    language_id: "lua".to_owned(),
+                    version: 1,
+                    text: panel_lua_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen lua");
+    let _ = recv_diagnostics(&client, &panel_lua_uri);
+
+    // Cursor on the getChildById('bidButton') reference — the LAST "bidButton" occurrence (the
+    // FIRST is the setId definition itself, which `ref_at` does not recognize as a reference form).
+    let reverse = send_references(
+        &client,
+        2,
+        &panel_lua_uri,
+        position_of_last(panel_lua_src, "bidButton"),
+        true,
+    )
+    .expect("references present");
+    assert_eq!(
+        reverse.len(),
+        1,
+        "exactly one declaration site, resolved via the same-document setId call: {reverse:#?}"
+    );
+    assert_eq!(reverse[0].uri, panel_lua_uri);
+    assert_eq!(
+        reverse[0].range,
+        range_of(panel_lua_src, "bidButton"),
+        "must land on the setId literal (the FIRST occurrence — its own definition site)"
+    );
+
+    shutdown_and_exit(&client, server_thread, 3);
 }
 
 /// The forward direction of the bridge must see an **unsaved** edit to an open `.lua` buffer — not
