@@ -49,6 +49,22 @@ fn position_of(text: &str, needle: &str) -> Position {
     Position::new(line, (idx - line_start) as u32)
 }
 
+/// [`position_of`]'s counterpart for the LAST occurrence of `needle` in `text` — needed when the
+/// same id string legitimately appears twice (e.g. a `setId('x')` definition followed by a
+/// `getChildById('x')` reference to it) and the cursor must land on the second one specifically.
+fn position_of_last(text: &str, needle: &str) -> Position {
+    let idx = text.rfind(needle).expect("needle present in text");
+    let mut line = 0u32;
+    let mut line_start = 0usize;
+    for (i, ch) in text[..idx].char_indices() {
+        if ch == '\n' {
+            line += 1;
+            line_start = i + 1;
+        }
+    }
+    Position::new(line, (idx - line_start) as u32)
+}
+
 /// RAII guard that removes its directory (recursively) on drop — including on an unwinding panic
 /// from a failed assertion, unlike a trailing `std::fs::remove_dir_all` call, which is never reached
 /// once an earlier assertion panics and leaks the temp directory.
@@ -1434,6 +1450,394 @@ fn module_association_pairs_a_controller_with_a_differently_named_and_located_ui
     shutdown_and_exit(&client, server_thread, next_id);
 }
 
+/// The `/`-rooted (VFS-absolute) `loadUI` half of the module-association bridge (node
+/// `bridge-exact-resolution`, commit 1): a controller's `g_ui.loadUI('/modules/othermod/styles/ui')`
+/// names its `.otui` by a complete, VFS-absolute literal, resolved against the mounted OTClient
+/// virtual filesystem (the detected client root's `mods`/`modules`/`data` overlay, then the bare
+/// root — `resolve_vfs_rooted_otui`'s doc comment cites the engine's `resourcemanager.cpp`
+/// `resolvePath`) rather than a plain directory join. The target sits in a DIFFERENT module's
+/// directory than the controller (`othermod`, not `mymodule`) — the shape neither `paired_uri`'s
+/// same-stem fast path nor a plain relative join could ever resolve.
+///
+/// Mirrors `module_association_pairs_a_controller_with_a_differently_named_and_located_ui_file`'s
+/// shape: reverse, polled to convergence via [`references_until`] (module_ui_index is the third,
+/// strictly-later scan phase, so "any `Some`" is not a safe readiness signal here — only
+/// non-emptiness is, for the same reason that test's doc comment explains).
+#[test]
+fn vfs_rooted_load_ui_path_pairs_with_a_style_in_a_different_module_directory() {
+    let base = std::env::temp_dir().join(format!(
+        "otui-vfs-rooted-pairing-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _cleanup = TempDirGuard(base.clone());
+    // A real OTClient install root: `init.lua` + `data/` + `modules/` (`mark_as_client_root`) — the
+    // mount set a `/`-rooted `loadUI` argument resolves against.
+    mark_as_client_root(&base);
+
+    let my_module_dir = base.join("modules").join("mymodule");
+    std::fs::create_dir_all(&my_module_dir).expect("mkdir mymodule");
+    std::fs::write(
+        my_module_dir.join("mymodule.otmod"),
+        "Module\n  name: mymodule\n  scripts: [ ctrl ]\n",
+    )
+    .expect("write mymodule.otmod");
+    let ctrl_lua_src = "function onCreate(w)\n  g_ui.loadUI('/modules/othermod/styles/ui')\n  \
+                        local btn = w:getChildById('x')\nend\n";
+    let ctrl_lua_path = my_module_dir.join("ctrl.lua");
+    std::fs::write(&ctrl_lua_path, ctrl_lua_src).expect("write ctrl.lua");
+
+    let other_module_styles_dir = base.join("modules").join("othermod").join("styles");
+    std::fs::create_dir_all(&other_module_styles_dir).expect("mkdir othermod/styles");
+    let ui_otui_src = "MainWindow < UIWidget\n  Button\n    id: x\n";
+    let ui_otui_path = other_module_styles_dir.join("ui.otui");
+    std::fs::write(&ui_otui_path, ui_otui_src).expect("write ui.otui");
+
+    let ctrl_lua_uri = file_uri(&ctrl_lua_path);
+    let ui_otui_uri = file_uri(&ui_otui_path);
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+
+    #[allow(deprecated)]
+    client_handshake_with_params(
+        &client,
+        InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: file_uri(&base),
+                name: "ws".to_owned(),
+            }]),
+            ..InitializeParams::default()
+        },
+    );
+
+    // Open only `ui.otui` — never `ctrl.lua`/`mymodule.otmod` — so the reverse resolution below can
+    // only have come from the background disk scan's VFS-rooted module-association resolution.
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: ui_otui_uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: ui_otui_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+
+    let mut next_id = 2i32;
+
+    // Reverse: ctrl.lua's getChildById('x') -> ui.otui's id: x, resolved purely via the `/`-rooted
+    // loadUI path against the detected client root. Polled to convergence (non-empty), not "any
+    // Some" — see this test's doc comment.
+    let reverse = references_until(
+        &client,
+        &mut next_id,
+        &ctrl_lua_uri,
+        position_of(ctrl_lua_src, "x"),
+        true,
+        |locs: &[Location]| !locs.is_empty(),
+    );
+    assert_eq!(
+        reverse.len(),
+        1,
+        "exactly one declaration site, resolved via the VFS-rooted loadUI path: {reverse:#?}"
+    );
+    assert_eq!(reverse[0].uri, ui_otui_uri);
+    assert_eq!(reverse[0].range, range_of(ui_otui_src, "x"));
+
+    shutdown_and_exit(&client, server_thread, next_id);
+}
+
+/// Negative case for the test above: with NO detected OTClient install root (no `init.lua` +
+/// `data`/`modules` siblings anywhere above the module directory), a `/`-rooted `loadUI` argument
+/// must NOT pair — silently, never a guess (mirrors `detect_client_roots`'/`resolve_asset_candidates`'
+/// existing "no root, no resolution" contract for an ordinary asset path). The exact same layout as
+/// the positive test above, minus the client-root markers, PLUS a second, plain-relative `loadUI` in
+/// the same controller (`local.otui`/id `y`) that the same `scan_module_dir` call for `mymodule`
+/// pairs unconditionally (no client root needed).
+///
+/// That second pairing is the readiness proof this test needs: `lua_ref_index` is populated by the
+/// background scan strictly BEFORE `module_ui_index` (see `references_until`'s doc comment), so
+/// `lua_references` answering `Some([])` for the rooted id is not, by itself, distinguishable from
+/// "the scan hasn't reached `module_ui_index` for this module yet" — a regression that wrongly added
+/// the rooted pairing later would still, in that intermediate window, make this assertion pass. Polling
+/// the KNOWN relative pairing to convergence first proves `set_module` has already run for `mymodule`
+/// — the very same call that would also have produced the rooted pairing, had one existed — so the
+/// direct (unpolled) query for the rooted id right after is checking settled state, not a race.
+#[test]
+fn vfs_rooted_load_ui_path_does_not_pair_without_a_detected_client_root() {
+    let base = std::env::temp_dir().join(format!(
+        "otui-vfs-rooted-no-root-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _cleanup = TempDirGuard(base.clone());
+    // Deliberately NOT `mark_as_client_root(&base)`: no `init.lua`, no `data/` — so no ancestor walk
+    // from the module directory ever finds a client root.
+
+    let my_module_dir = base.join("modules").join("mymodule");
+    std::fs::create_dir_all(&my_module_dir).expect("mkdir mymodule");
+    std::fs::write(
+        my_module_dir.join("mymodule.otmod"),
+        "Module\n  name: mymodule\n  scripts: [ ctrl ]\n",
+    )
+    .expect("write mymodule.otmod");
+    let ctrl_lua_src = "function onCreate(w)\n  g_ui.loadUI('/modules/othermod/styles/ui')\n  \
+                        g_ui.loadUI('local')\n  \
+                        local btn = w:getChildById('x')\n  \
+                        local known = w:getChildById('z')\nend\n";
+    let ctrl_lua_path = my_module_dir.join("ctrl.lua");
+    std::fs::write(&ctrl_lua_path, ctrl_lua_src).expect("write ctrl.lua");
+
+    let other_module_styles_dir = base.join("modules").join("othermod").join("styles");
+    std::fs::create_dir_all(&other_module_styles_dir).expect("mkdir othermod/styles");
+    let ui_otui_src = "MainWindow < UIWidget\n  Button\n    id: x\n";
+    let ui_otui_path = other_module_styles_dir.join("ui.otui");
+    // The target genuinely exists on disk — proves the negative result comes from "no client root
+    // to resolve against", not "the file happens to be missing".
+    std::fs::write(&ui_otui_path, ui_otui_src).expect("write ui.otui");
+
+    // The known, plain-relative pairing, resolved from `ctrl.lua`'s own directory — no client root
+    // needed, so `scan_module_dir` always produces it once it runs for `mymodule`.
+    let local_otui_src = "MainWindow < UIWidget\n  Button\n    id: z\n";
+    let local_otui_path = my_module_dir.join("local.otui");
+    std::fs::write(&local_otui_path, local_otui_src).expect("write local.otui");
+
+    let ctrl_lua_uri = file_uri(&ctrl_lua_path);
+    let local_otui_uri = file_uri(&local_otui_path);
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+
+    #[allow(deprecated)]
+    client_handshake_with_params(
+        &client,
+        InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: file_uri(&base),
+                name: "ws".to_owned(),
+            }]),
+            ..InitializeParams::default()
+        },
+    );
+
+    let mut next_id = 2i32;
+
+    // Readiness proof: poll the KNOWN relative pairing to convergence (non-empty) — see this test's
+    // doc comment for why "any `Some`" would not be a safe signal for the rooted query below.
+    let known = references_until(
+        &client,
+        &mut next_id,
+        &ctrl_lua_uri,
+        position_of(ctrl_lua_src, "z"),
+        true,
+        |locs: &[Location]| !locs.is_empty(),
+    );
+    assert_eq!(
+        known.len(),
+        1,
+        "the plain-relative pairing must resolve once module_ui_index has run for mymodule: {known:#?}"
+    );
+    assert_eq!(known[0].uri, local_otui_uri);
+
+    // Now that `set_module` has run for `mymodule` (proven above), the rooted query is checked once,
+    // unpolled: a `Some([])` here is settled state, not an intermediate scan window.
+    let reverse = send_references(
+        &client,
+        next_id,
+        &ctrl_lua_uri,
+        position_of(ctrl_lua_src, "x"),
+        true,
+    )
+    .expect("references for the rooted id");
+    next_id += 1;
+    assert!(
+        reverse.is_empty(),
+        "a /-rooted loadUI path must never pair without a detected client root: {reverse:#?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, next_id);
+}
+
+/// The reverse bridge (`lua_references`) must honor `ReferenceContext::include_declaration` the same
+/// way `collect_references` already does for the OTUI-local `Id` case (spec §5.4): a `getChildById`
+/// reference's candidate resolutions — the paired `.otui`'s `id:` declaration AND this same `.lua`
+/// document's own `setId(...)` call — are both DECLARATION sites (an `id:` and a `setId` equally
+/// *define* the id), so `include_declaration = false` must suppress both, not just one or neither.
+/// This id is deliberately declared BOTH ways (`.otui id: closeButton` and Lua `setId('closeButton')`)
+/// so the assertion exercises both candidate sources at once, unlike
+/// `reverse_references_resolve_a_set_id_call_in_the_same_lua_document`'s Lua-only id.
+#[test]
+fn reverse_references_honor_include_declaration() {
+    let panel_otui_src = "Panel < UIWidget\n  Button\n    id: closeButton\n";
+    let panel_otui_uri = Uri::from_str("file:///scratch/include-decl/panel.otui").expect("uri");
+    let panel_lua_uri = Uri::from_str("file:///scratch/include-decl/panel.lua").expect("uri");
+    let panel_lua_src = "function onCreate(w)\n  \
+                          local button = g_ui.createWidget('Button', w)\n  \
+                          button:setId('closeButton')\n  \
+                          local btn = w:getChildById('closeButton')\nend\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: panel_otui_uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: panel_otui_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen otui");
+    let _ = recv_diagnostics(&client, &panel_otui_uri);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: panel_lua_uri.clone(),
+                    language_id: "lua".to_owned(),
+                    version: 1,
+                    text: panel_lua_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen lua");
+    let _ = recv_diagnostics(&client, &panel_lua_uri);
+
+    // Cursor on the getChildById('closeButton') reference (the LAST occurrence — `ref_at` does not
+    // recognize the setId literal itself as a reference form).
+    let position = position_of_last(panel_lua_src, "closeButton");
+
+    // include_declaration = false: both declaration-class candidates are suppressed.
+    let excluded = send_references(&client, 2, &panel_lua_uri, position, false)
+        .expect("references present (empty, not null)");
+    assert!(
+        excluded.is_empty(),
+        "include_declaration = false must suppress both the .otui id: and the setId declaration \
+         sites: {excluded:#?}"
+    );
+
+    // include_declaration = true: both declaration-class candidates are present.
+    let included =
+        send_references(&client, 3, &panel_lua_uri, position, true).expect("references present");
+    assert_eq!(
+        included.len(),
+        2,
+        "include_declaration = true must surface both the .otui id: declaration and the setId \
+         declaration: {included:#?}"
+    );
+    assert!(
+        included
+            .iter()
+            .any(|loc| loc.uri == panel_otui_uri
+                && loc.range == range_of(panel_otui_src, "closeButton")),
+        "missing the .otui id: declaration site: {included:#?}"
+    );
+    assert!(
+        included
+            .iter()
+            .any(|loc| loc.uri == panel_lua_uri
+                && loc.range == range_of(panel_lua_src, "closeButton")),
+        "missing the setId declaration site (the FIRST occurrence, its own definition): {included:#?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 4);
+}
+
+/// The reverse bridge must ALSO resolve a `getChildById` reference against a `setId` call **in the
+/// same `.lua` document** (node `bridge-exact-resolution`, commit 2) — the id's real, runtime
+/// declaration site for a widget created and id'd purely in Lua, which has no `.otui id:` at all.
+/// The paired `.otui` here deliberately does NOT declare `bidButton` (the real-corpus shape:
+/// `game_cyclopedia/tab/house/house.lua`'s `button:setId('bidButton')`), so any resolution found
+/// must have come from the `setId` scan, not `visible_ids`.
+///
+/// No workspace root at all (mirrors `forward_references_see_an_unsaved_lua_buffer_edit`): both
+/// documents are open buffers, same stem/directory, so `paired_uri`'s fast path alone associates
+/// them — no background scan to race against.
+#[test]
+fn reverse_references_resolve_a_set_id_call_in_the_same_lua_document() {
+    let panel_otui_src = "Panel < UIWidget\n  Button\n    id: closeButton\n";
+    let panel_otui_uri = Uri::from_str("file:///scratch/set-id/panel.otui").expect("uri");
+    let panel_lua_uri = Uri::from_str("file:///scratch/set-id/panel.lua").expect("uri");
+    let panel_lua_src = "function onCreate(w)\n  \
+                          local button = g_ui.createWidget('Button', w)\n  \
+                          button:setId('bidButton')\n  \
+                          local btn = w:getChildById('bidButton')\nend\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: panel_otui_uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: panel_otui_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen otui");
+    let _ = recv_diagnostics(&client, &panel_otui_uri);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: panel_lua_uri.clone(),
+                    language_id: "lua".to_owned(),
+                    version: 1,
+                    text: panel_lua_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen lua");
+    let _ = recv_diagnostics(&client, &panel_lua_uri);
+
+    // Cursor on the getChildById('bidButton') reference — the LAST "bidButton" occurrence (the
+    // FIRST is the setId definition itself, which `ref_at` does not recognize as a reference form).
+    let reverse = send_references(
+        &client,
+        2,
+        &panel_lua_uri,
+        position_of_last(panel_lua_src, "bidButton"),
+        true,
+    )
+    .expect("references present");
+    assert_eq!(
+        reverse.len(),
+        1,
+        "exactly one declaration site, resolved via the same-document setId call: {reverse:#?}"
+    );
+    assert_eq!(reverse[0].uri, panel_lua_uri);
+    assert_eq!(
+        reverse[0].range,
+        range_of(panel_lua_src, "bidButton"),
+        "must land on the setId literal (the FIRST occurrence — its own definition site)"
+    );
+
+    shutdown_and_exit(&client, server_thread, 3);
+}
+
 /// The forward direction of the bridge must see an **unsaved** edit to an open `.lua` buffer — not
 /// just what is on disk — so a controller mid-edit still resolves. Exercises
 /// `Backend::reindex_lua_refs_open` (wired from `did_open`/`did_change`) with no workspace root at
@@ -1927,6 +2331,164 @@ fn watched_delete_drops_the_lua_ref_index_entry() {
     );
 
     shutdown_and_exit(&client, server_thread, 4);
+}
+
+/// A `/`-rooted `loadUI` target can live in a DIFFERENT module directory than its controller
+/// (`vfs_rooted_load_ui_path_pairs_with_a_style_in_a_different_module_directory`). This test proves
+/// `update_module_index_for` keeps that pairing FRESH when the target itself is created or deleted
+/// after the initial scan — not just re-derived from whichever module owns the changed file (that
+/// scoped rebuild would silently miss a cross-module rooted target, per this node's Finding 3): a
+/// watched `.otui` `CREATED`/`DELETED` event triggers a full [`build_module_index`] rebuild instead.
+///
+/// The controller's module also declares a plain-relative `loadUI('local')`/id `z` pairing, present
+/// from the start — the SAME readiness anchor `vfs_rooted_load_ui_path_does_not_pair_without_a_
+/// detected_client_root` uses: polling it to convergence proves the ONE-TIME background scan has
+/// already written `module_ui_index` once, after which every further mutation is this test's own
+/// synchronous `workspace/didChangeWatchedFiles` notification, processed by the single-threaded
+/// dispatch loop strictly before the next request — so every assertion after that point is a single,
+/// unpolled query on settled state, never a race.
+#[test]
+fn watched_otui_create_and_delete_refreshes_a_cross_module_rooted_pairing() {
+    let base = std::env::temp_dir().join(format!(
+        "otui-vfs-rooted-watch-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _cleanup = TempDirGuard(base.clone());
+    mark_as_client_root(&base);
+
+    let my_module_dir = base.join("modules").join("mymodule");
+    std::fs::create_dir_all(&my_module_dir).expect("mkdir mymodule");
+    std::fs::write(
+        my_module_dir.join("mymodule.otmod"),
+        "Module\n  name: mymodule\n  scripts: [ ctrl ]\n",
+    )
+    .expect("write mymodule.otmod");
+    let ctrl_lua_src = "function onCreate(w)\n  g_ui.loadUI('/modules/othermod/styles/ui')\n  \
+                        g_ui.loadUI('local')\n  \
+                        local btn = w:getChildById('x')\n  \
+                        local known = w:getChildById('z')\nend\n";
+    let ctrl_lua_path = my_module_dir.join("ctrl.lua");
+    std::fs::write(&ctrl_lua_path, ctrl_lua_src).expect("write ctrl.lua");
+
+    let local_otui_src = "MainWindow < UIWidget\n  Button\n    id: z\n";
+    std::fs::write(my_module_dir.join("local.otui"), local_otui_src).expect("write local.otui");
+
+    let other_module_styles_dir = base.join("modules").join("othermod").join("styles");
+    std::fs::create_dir_all(&other_module_styles_dir).expect("mkdir othermod/styles");
+    let ui_otui_src = "MainWindow < UIWidget\n  Button\n    id: x\n";
+    let ui_otui_path = other_module_styles_dir.join("ui.otui");
+    // Deliberately not written yet: the rooted target does not exist at initial-scan time.
+
+    let ctrl_lua_uri = file_uri(&ctrl_lua_path);
+    let ui_otui_uri = file_uri(&ui_otui_path);
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+
+    #[allow(deprecated)]
+    client_handshake_with_params(
+        &client,
+        InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: file_uri(&base),
+                name: "ws".to_owned(),
+            }]),
+            ..InitializeParams::default()
+        },
+    );
+
+    let mut next_id = 2i32;
+
+    // Readiness anchor: poll the known relative pairing to convergence (see this test's doc
+    // comment for why this makes every later assertion a single, unpolled, race-free query).
+    let known = references_until(
+        &client,
+        &mut next_id,
+        &ctrl_lua_uri,
+        position_of(ctrl_lua_src, "z"),
+        true,
+        |locs: &[Location]| !locs.is_empty(),
+    );
+    assert_eq!(known.len(), 1, "readiness anchor must resolve: {known:#?}");
+
+    // Before creation: the rooted target does not exist on disk yet, so no pairing.
+    let before = send_references(
+        &client,
+        next_id,
+        &ctrl_lua_uri,
+        position_of(ctrl_lua_src, "x"),
+        true,
+    )
+    .expect("references present (empty, not null)");
+    next_id += 1;
+    assert!(
+        before.is_empty(),
+        "the rooted target does not exist yet; must not pair: {before:#?}"
+    );
+
+    // Create the rooted target on disk, then deliver the watched CREATED event.
+    std::fs::write(&ui_otui_path, ui_otui_src).expect("write ui.otui");
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "workspace/didChangeWatchedFiles".to_owned(),
+            DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: ui_otui_uri.clone(),
+                    typ: FileChangeType::CREATED,
+                }],
+            },
+        )))
+        .expect("send didChangeWatchedFiles created");
+
+    let after_create = send_references(
+        &client,
+        next_id,
+        &ctrl_lua_uri,
+        position_of(ctrl_lua_src, "x"),
+        true,
+    )
+    .expect("references present");
+    next_id += 1;
+    assert_eq!(
+        after_create.len(),
+        1,
+        "creating the rooted target must refresh the cross-module pairing: {after_create:#?}"
+    );
+    assert_eq!(after_create[0].uri, ui_otui_uri);
+    assert_eq!(after_create[0].range, range_of(ui_otui_src, "x"));
+
+    // Delete the rooted target, then deliver the watched DELETED event.
+    std::fs::remove_file(&ui_otui_path).expect("remove ui.otui");
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "workspace/didChangeWatchedFiles".to_owned(),
+            DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: ui_otui_uri.clone(),
+                    typ: FileChangeType::DELETED,
+                }],
+            },
+        )))
+        .expect("send didChangeWatchedFiles deleted");
+
+    let after_delete = send_references(
+        &client,
+        next_id,
+        &ctrl_lua_uri,
+        position_of(ctrl_lua_src, "x"),
+        true,
+    )
+    .expect("references present (empty, not null)");
+    next_id += 1;
+    assert!(
+        after_delete.is_empty(),
+        "deleting the rooted target must clear the stale cross-module pairing: {after_delete:#?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, next_id);
 }
 
 /// A watched-file `CHANGED` event for a `.lua` module that is **currently open** must not clobber

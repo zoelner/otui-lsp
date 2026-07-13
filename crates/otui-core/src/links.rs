@@ -242,6 +242,52 @@ pub fn resolve_asset_candidates(raw: &str, doc_dir: &Path, roots: &[PathBuf]) ->
     bases.into_iter().flat_map(asset_probe_variants).collect()
 }
 
+/// Compute the ordered candidate filesystem paths a **VFS-rooted `loadUI`/`displayUI`/`importStyle`
+/// script argument** could resolve to, **without** touching the filesystem (no existence check —
+/// that stays with the caller, exactly like [`resolve_asset_candidates`]).
+///
+/// `rest` is the literal with its leading `/` already stripped by the caller. This mirrors the same
+/// mount overlay [`resolve_asset_candidates`] probes for an ordinary `/`-rooted asset path — each of
+/// `roots` joined with [`ASSET_MOUNT_DIRS`] (`mods`/`modules`/`data`, highest priority first, per
+/// `ASSET_MOUNT_DIRS`'s doc comment for the full mount trace), then the bare root itself (the
+/// always-mounted, lowest-priority search path) — the two are kept as separate functions rather than
+/// one, because a script load target's default extension (`.otui`) and an image asset's
+/// (`.png`, via [`asset_probe_variants`]'s single-concatenation rule) are unrelated engine behaviors
+/// that happen to share a mount model, not one behavior with two extensions.
+///
+/// `default_extension` (no leading dot, e.g. `"otui"`) is appended only when `rest`'s final path
+/// component has no extension of its own — a `loadUI` argument that already names a `.otui` file
+/// literally is left untouched, matching the plain-relative branch's own `p.extension().is_none()`
+/// check at the server's `scan_module_dir` call site this mirrors.
+///
+/// Returns the candidates in probe order; the caller keeps the first that exists on disk. An empty
+/// `roots` yields no candidates — there is no trustworthy mount set to resolve against.
+#[must_use]
+pub fn vfs_rooted_candidates(
+    rest: &str,
+    roots: &[PathBuf],
+    default_extension: &str,
+) -> Vec<PathBuf> {
+    fn with_default_extension(mut p: PathBuf, default_extension: &str) -> PathBuf {
+        if p.extension().is_none() {
+            p.set_extension(default_extension);
+        }
+        p
+    }
+
+    let mut out = Vec::new();
+    for root in roots {
+        for mount in ASSET_MOUNT_DIRS {
+            out.push(with_default_extension(
+                root.join(mount).join(rest),
+                default_extension,
+            ));
+        }
+        out.push(with_default_extension(root.join(rest), default_extension));
+    }
+    out
+}
+
 /// A path value containing `$` is an OTML runtime-resolved variable (`otmlparser.cpp` substitutes
 /// `$name` from an alias/Lua-field map when the *document* is parsed at runtime), not a literal
 /// filesystem path — the server has no way to know what it resolves to, so it must never be
@@ -684,6 +730,41 @@ mod tests {
         // Offline, a `/`-rooted path has no data root to resolve against when no workspace is open.
         let candidates = resolve_asset_candidates("/images/x.png", Path::new("/project/sub"), &[]);
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn vfs_rooted_candidates_probes_the_overlay_before_the_bare_root_and_infers_the_extension() {
+        let roots = vec![PathBuf::from("/client-root")];
+        let candidates = vfs_rooted_candidates("modules/othermod/ui", &roots, "otui");
+        let overlay = candidates
+            .iter()
+            .position(|c| c == &PathBuf::from("/client-root/mods/modules/othermod/ui.otui"))
+            .expect("mods overlay candidate present, with .otui inferred");
+        let bare = candidates
+            .iter()
+            .position(|c| c == &PathBuf::from("/client-root/modules/othermod/ui.otui"))
+            .expect("bare-root candidate present, with .otui inferred");
+        assert!(
+            overlay < bare,
+            "the mods overlay must be probed before the bare root: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn vfs_rooted_candidates_keeps_an_explicit_extension_as_is() {
+        let roots = vec![PathBuf::from("/client-root")];
+        let candidates = vfs_rooted_candidates("scripts/init.lua", &roots, "otui");
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c == &PathBuf::from("/client-root/scripts/init.lua")),
+            "an already-extensioned target must not gain a second extension: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn vfs_rooted_candidates_with_no_roots_yields_nothing() {
+        assert!(vfs_rooted_candidates("ui", &[], "otui").is_empty());
     }
 
     #[test]
