@@ -7,7 +7,7 @@
 
 use tree_sitter_language::LanguageFn;
 
-extern "C" {
+unsafe extern "C" {
     fn tree_sitter_otui() -> *const ();
 }
 

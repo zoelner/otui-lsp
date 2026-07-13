@@ -105,46 +105,127 @@ pub fn property_doc(name: &str) -> Option<&'static str> {
 /// base/image/text properties; per-widget style tags (a `UITable`'s `column-style`, `UIItem`'s
 /// `item-id`, …) are not here. **Kept sorted by key** for the binary search in [`property_doc`].
 pub static PROPERTY_DOCS: &[(&str, &str)] = &[
-    ("background", "Filled background color drawn behind the widget."),
-    ("background-color", "Filled background color drawn behind the widget."),
-    ("border", "Border shorthand: a width and a color (or `none`)."),
+    (
+        "background",
+        "Filled background color drawn behind the widget.",
+    ),
+    (
+        "background-color",
+        "Filled background color drawn behind the widget.",
+    ),
+    (
+        "border",
+        "Border shorthand: a width and a color (or `none`).",
+    ),
     ("border-color", "Border color on all four edges."),
-    ("checked", "The widget's checked state (checkboxes, radio-like widgets)."),
+    (
+        "checked",
+        "The widget's checked state (checkboxes, radio-like widgets).",
+    ),
     ("clipping", "Clip the widget's children to its own rect."),
     ("color", "Foreground/text draw color."),
-    ("display", "CSS-style display / layout mode (`flex`, `grid`, `table`, `none`, …); drives the flexbox/grid layout."),
-    ("draggable", "Whether the widget can be dragged with the mouse."),
-    ("enabled", "Whether the widget is interactive (a disabled widget is greyed and ignores input)."),
-    ("fixed-size", "Lock the widget's size so a parent layout cannot resize it."),
-    ("focusable", "Whether the widget can receive keyboard focus."),
+    (
+        "display",
+        "CSS-style display / layout mode (`flex`, `grid`, `table`, `none`, …); drives the flexbox/grid layout.",
+    ),
+    (
+        "draggable",
+        "Whether the widget can be dragged with the mouse.",
+    ),
+    (
+        "enabled",
+        "Whether the widget is interactive (a disabled widget is greyed and ignores input).",
+    ),
+    (
+        "fixed-size",
+        "Lock the widget's size so a parent layout cannot resize it.",
+    ),
+    (
+        "focusable",
+        "Whether the widget can receive keyboard focus.",
+    ),
     ("font", "The text font by name (resolved via `g_fonts`)."),
-    ("height", "Height as a CSS-like dimension: a bare number is pixels, or `%` / `em` / `auto`."),
-    ("icon", "Icon texture path (extension optional; `.png` assumed)."),
+    (
+        "height",
+        "Height as a CSS-like dimension: a bare number is pixels, or `%` / `em` / `auto`.",
+    ),
+    (
+        "icon",
+        "Icon texture path (extension optional; `.png` assumed).",
+    ),
     ("icon-color", "Tint color applied to the icon."),
-    ("icon-source", "Icon texture path (extension optional; `.png` assumed)."),
-    ("image-clip", "Source rect (`x y w h`) clipped out of the image texture."),
+    (
+        "icon-source",
+        "Icon texture path (extension optional; `.png` assumed).",
+    ),
+    (
+        "image-clip",
+        "Source rect (`x y w h`) clipped out of the image texture.",
+    ),
     ("image-color", "Tint color multiplied into the image."),
-    ("image-fixed-ratio", "Keep the image's aspect ratio when scaling."),
-    ("image-repeated", "Tile (repeat) the image instead of stretching it."),
-    ("image-source", "Background texture path (extension optional; `.png` assumed)."),
-    ("layout", "Layout manager for the children: `verticalBox`, `horizontalBox`, `grid`, or `anchor`."),
-    ("margin", "Outer spacing shorthand (1–4 values: all / v h / t h b / t r b l)."),
+    (
+        "image-fixed-ratio",
+        "Keep the image's aspect ratio when scaling.",
+    ),
+    (
+        "image-repeated",
+        "Tile (repeat) the image instead of stretching it.",
+    ),
+    (
+        "image-source",
+        "Background texture path (extension optional; `.png` assumed).",
+    ),
+    (
+        "layout",
+        "Layout manager for the children: `verticalBox`, `horizontalBox`, `grid`, or `anchor`.",
+    ),
+    (
+        "margin",
+        "Outer spacing shorthand (1–4 values: all / v h / t h b / t r b l).",
+    ),
     ("opacity", "Opacity from 0 (transparent) to 1 (opaque)."),
-    ("padding", "Inner spacing shorthand (1–4 values: all / v h / t h b / t r b l)."),
-    ("phantom", "Make the widget ignore mouse events (pass-through); alias `pointer-events: none`."),
-    ("pos", "Absolute position as `x y` (same coordinate space as `rect`)."),
+    (
+        "padding",
+        "Inner spacing shorthand (1–4 values: all / v h / t h b / t r b l).",
+    ),
+    (
+        "phantom",
+        "Make the widget ignore mouse events (pass-through); alias `pointer-events: none`.",
+    ),
+    (
+        "pos",
+        "Absolute position as `x y` (same coordinate space as `rect`).",
+    ),
     ("rect", "Absolute rect as `x y w h`."),
     ("rotation", "Rotation in degrees."),
-    ("shader", "Named GPU shader applied when drawing the widget."),
+    (
+        "shader",
+        "Named GPU shader applied when drawing the widget.",
+    ),
     ("size", "Fixed size as `w h`, in pixels."),
     ("text", "The widget's displayed text."),
-    ("text-align", "Text alignment: `center`, `left`, `right`, `top`, `bottom`, `topleft`, …"),
-    ("text-auto-resize", "Resize the widget to fit its text on both axes."),
+    (
+        "text-align",
+        "Text alignment: `center`, `left`, `right`, `top`, `bottom`, `topleft`, …",
+    ),
+    (
+        "text-auto-resize",
+        "Resize the widget to fit its text on both axes.",
+    ),
     ("text-wrap", "Wrap the text to the widget's width."),
     ("visible", "Whether the widget is shown."),
-    ("width", "Width as a CSS-like dimension: a bare number is pixels, or `%` / `em` / `auto`."),
-    ("x", "Absolute X position (same coordinate space as `rect`)."),
-    ("y", "Absolute Y position (same coordinate space as `rect`)."),
+    (
+        "width",
+        "Width as a CSS-like dimension: a bare number is pixels, or `%` / `em` / `auto`.",
+    ),
+    (
+        "x",
+        "Absolute X position (same coordinate space as `rect`).",
+    ),
+    (
+        "y",
+        "Absolute Y position (same coordinate space as `rect`).",
+    ),
 ];
 
 /// Classify a property's expected value from the catalog/schema metadata. The single audited source

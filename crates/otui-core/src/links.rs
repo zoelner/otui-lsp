@@ -97,10 +97,10 @@ pub fn asset_ref_at(source: &str, offset: usize) -> Option<PathRef> {
 
 /// Pre-order walk emitting a [`PathRef`] for every path-valued `property` under `node`.
 fn collect(node: Node<'_>, source: &str, out: &mut Vec<PathRef>) {
-    if node.kind() == "property" {
-        if let Some(path_ref) = path_ref(node, source) {
-            out.push(path_ref);
-        }
+    if node.kind() == "property"
+        && let Some(path_ref) = path_ref(node, source)
+    {
+        out.push(path_ref);
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -310,10 +310,11 @@ pub fn is_asset_sentinel_value(key: &str, raw: &str) -> bool {
     if unquoted.is_empty() || unquoted == "none" {
         return true;
     }
-    if let Some((scheme, rest)) = unquoted.split_once(':') {
-        if scheme == "base64" && !rest.is_empty() {
-            return true;
-        }
+    if let Some((scheme, rest)) = unquoted.split_once(':')
+        && scheme == "base64"
+        && !rest.is_empty()
+    {
+        return true;
     }
     false
 }

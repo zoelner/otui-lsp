@@ -76,10 +76,10 @@ pub fn style_type_at(source: &str, offset: usize) -> Option<StyleRef> {
             continue;
         }
         for field in ["name", "base"] {
-            if let Some(node) = child.child_by_field_name(field) {
-                if let Some(hit) = ref_if_inside(node, source, offset) {
-                    return Some(hit);
-                }
+            if let Some(node) = child.child_by_field_name(field)
+                && let Some(hit) = ref_if_inside(node, source, offset)
+            {
+                return Some(hit);
             }
         }
     }
@@ -90,12 +90,11 @@ pub fn style_type_at(source: &str, offset: usize) -> Option<StyleRef> {
 
 /// Recursively find the `container` tag under `offset` (widget instances nest at any depth).
 fn container_tag_at(node: Node<'_>, source: &str, offset: usize) -> Option<StyleRef> {
-    if node.kind() == "container" {
-        if let Some(tag) = node.child_by_field_name("tag") {
-            if let Some(hit) = ref_if_inside(tag, source, offset) {
-                return Some(hit);
-            }
-        }
+    if node.kind() == "container"
+        && let Some(tag) = node.child_by_field_name("tag")
+        && let Some(hit) = ref_if_inside(tag, source, offset)
+    {
+        return Some(hit);
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {

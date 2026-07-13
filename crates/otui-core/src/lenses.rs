@@ -11,7 +11,7 @@
 //! Pure: byte offsets only, no I/O, no `lsp-types`. The server turns each [`StyleLens`]'s
 //! `name_span` into an LSP `Range` and formats the count into a `Command` title.
 
-use crate::style_index::{extract_style_defs, StyleIndex};
+use crate::style_index::{StyleIndex, extract_style_defs};
 use crate::syntax::SyntaxTree;
 use lang_api::ByteSpan;
 

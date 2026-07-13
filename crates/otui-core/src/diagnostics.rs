@@ -34,11 +34,11 @@
 
 use crate::catalog;
 use crate::indent::{
-    is_block_scalar_marker, is_comment, leading_spaces, line_value, split_lines, Line,
+    Line, is_block_scalar_marker, is_comment, leading_spaces, line_value, split_lines,
 };
 use crate::lua_widgets::LuaWidgetIndex;
 use crate::schema;
-use crate::style_index::{is_native_base, StyleIndex};
+use crate::style_index::{StyleIndex, is_native_base};
 use crate::syntax::SyntaxTree;
 use crate::widget_resolve;
 use lang_api::{ByteSpan, Diagnostic, Severity};
@@ -871,12 +871,11 @@ fn check_property(
     }
     // Widget-aware acceptance: a catalog-unknown key that the enclosing widget (or a Lua ancestor)
     // declares is a valid Lua-added property, not an unknown one.
-    if let (Some(ctx), Some(widget)) = (ctx, enclosing) {
-        if widget_resolve::resolve_ancestry(widget, ctx.styles, ctx.lua)
+    if let (Some(ctx), Some(widget)) = (ctx, enclosing)
+        && widget_resolve::resolve_ancestry(widget, ctx.styles, ctx.lua)
             .declares_custom_property(ctx.lua, name)
-        {
-            return;
-        }
+    {
+        return;
     }
     out.push(Diagnostic {
         severity: Severity::Hint,
@@ -919,28 +918,26 @@ fn check_property_value(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>)
     };
     match slice(source, key) {
         "display" => {
-            if let Some((text, span)) = leaf_value(node, source) {
-                if !schema::is_display_value(text) {
-                    push_invalid_value(
-                        out,
-                        format!("`{text}` is not a valid `display` value"),
-                        span,
-                    );
-                }
+            if let Some((text, span)) = leaf_value(node, source)
+                && !schema::is_display_value(text)
+            {
+                push_invalid_value(
+                    out,
+                    format!("`{text}` is not a valid `display` value"),
+                    span,
+                );
             }
         }
         "layout" => check_layout_value(node, source, out),
         "border" => {
-            if let Some((text, span)) = leaf_value(node, source) {
-                if !schema::is_valid_border(text) {
-                    push_invalid_value(
-                        out,
-                        format!(
-                            "`{text}` is not a valid `border` value: expected a width and a color"
-                        ),
-                        span,
-                    );
-                }
+            if let Some((text, span)) = leaf_value(node, source)
+                && !schema::is_valid_border(text)
+            {
+                push_invalid_value(
+                    out,
+                    format!("`{text}` is not a valid `border` value: expected a width and a color"),
+                    span,
+                );
             }
         }
         // Every color-typed property (`color`, `background`, `background-color`, `icon-color`,
@@ -955,15 +952,15 @@ fn check_property_value(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>)
         // `[...]` token) flagging it is faithful, matching how `border`/`display`/`layout` treat a
         // list too.
         k if catalog::COLOR_PROPERTIES.contains(&k) => {
-            if let Some((text, span)) = leaf_value(node, source) {
-                if !schema::is_border_color_value(text) {
-                    let message = if text.starts_with('[') {
-                        format!("`{text}`: a color property takes a single color, not a list")
-                    } else {
-                        format!("`{text}` is not a valid color")
-                    };
-                    push_invalid_value(out, message, span);
-                }
+            if let Some((text, span)) = leaf_value(node, source)
+                && !schema::is_border_color_value(text)
+            {
+                let message = if text.starts_with('[') {
+                    format!("`{text}`: a color property takes a single color, not a list")
+                } else {
+                    format!("`{text}` is not a valid color")
+                };
+                push_invalid_value(out, message, span);
             }
         }
         _ => {}
@@ -994,10 +991,10 @@ fn check_layout_value(node: Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
         if slice(source, child_key) != "type" {
             continue;
         }
-        if let Some((text, span)) = leaf_value(child, source) {
-            if !schema::is_layout_type(text) {
-                push_invalid_value(out, format!("`{text}` is not a valid `layout` type"), span);
-            }
+        if let Some((text, span)) = leaf_value(child, source)
+            && !schema::is_layout_type(text)
+        {
+            push_invalid_value(out, format!("`{text}` is not a valid `layout` type"), span);
         }
         return;
     }
@@ -2210,8 +2207,8 @@ Panel
 
     // --- widget-aware unknown property (Lua-added style properties) ----------------------------
 
-    use crate::lua_widgets::{scan_widgets, LuaWidgetIndex};
-    use crate::style_index::{extract_style_defs, StyleIndex};
+    use crate::lua_widgets::{LuaWidgetIndex, scan_widgets};
+    use crate::style_index::{StyleIndex, extract_style_defs};
 
     /// A [`StyleIndex`] built from `(doc, otui_source)` pairs.
     fn styles(docs: &[(&str, &str)]) -> StyleIndex {

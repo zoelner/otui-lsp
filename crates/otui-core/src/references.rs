@@ -65,15 +65,15 @@ pub fn style_name_occurrences(source: &str, name: &str) -> StyleNameOccurrences 
         if child.kind() != "style_header" {
             continue;
         }
-        if let Some(node) = child.child_by_field_name("name") {
-            if slice(source, node) == name {
-                out.declarations.push(SyntaxTree::span_of(node));
-            }
+        if let Some(node) = child.child_by_field_name("name")
+            && slice(source, node) == name
+        {
+            out.declarations.push(SyntaxTree::span_of(node));
         }
-        if let Some(node) = child.child_by_field_name("base") {
-            if slice(source, node) == name {
-                out.base_refs.push(SyntaxTree::span_of(node));
-            }
+        if let Some(node) = child.child_by_field_name("base")
+            && slice(source, node) == name
+        {
+            out.base_refs.push(SyntaxTree::span_of(node));
         }
     }
     out
@@ -117,10 +117,11 @@ pub fn id_occurrences(source: &str, id: &str) -> IdOccurrences {
 fn collect_id_occurrences(node: Node<'_>, source: &str, id: &str, out: &mut IdOccurrences) {
     match node.kind() {
         "id_property" => {
-            if let Some(value) = node.child_by_field_name("value") {
-                if out.declaration.is_none() && slice(source, value) == id {
-                    out.declaration = Some(SyntaxTree::span_of(value));
-                }
+            if let Some(value) = node.child_by_field_name("value")
+                && out.declaration.is_none()
+                && slice(source, value) == id
+            {
+                out.declaration = Some(SyntaxTree::span_of(value));
             }
         }
         "anchor_target" => {
