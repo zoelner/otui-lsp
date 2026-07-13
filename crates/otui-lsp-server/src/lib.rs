@@ -1156,7 +1156,11 @@ fn collect_module_dirs(dir: &Path, out: &mut HashSet<PathBuf>) {
         }
         if meta.is_dir() {
             subdirs.push(path);
-        } else if meta.is_file() && path.extension().is_some_and(|e| e == "otmod") {
+        } else if meta.is_file()
+            && path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("otmod"))
+        {
             has_otmod = true;
         }
     }
@@ -1261,6 +1265,23 @@ fn scan_module_dir(module_dir: &Path) -> Vec<(Uri, Uri)> {
                 // `image-source`/`icon` asset paths, but doing so here would need this function to
                 // also carry a confirmed client-install root per controller. Rare in the real corpus
                 // (4 complete-literal calls total) — best-effort: skip rather than guess.
+                continue;
+            }
+            if Path::new(&load.path)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                // A `..` component would let a complete-literal `g_ui.loadUI('../otherModule/ui')`
+                // resolve, through a plain `Path::join` + `is_file()` check, straight into a
+                // FOREIGN module's directory — a false controller<->UI pairing. The real engine
+                // never does that walk-up: `resolvePath` does not collapse `..`, and PhysFS (the
+                // virtual filesystem OTClient mounts `data`/`modules` through) rejects a path
+                // containing one outright, so the engine itself would never load such a target.
+                // Zero occurrences of a *complete-literal* `..` argument in the real corpus today
+                // (every `..` there comes from a runtime string concatenation, which
+                // `scan_ui_loads` already drops as a non-literal argument) — this is a defensive
+                // guard against the worst-outcome class this whole mechanism exists to avoid, not a
+                // fix for an observed false pairing.
                 continue;
             }
             let mut p = controller_dir.join(&load.path);
@@ -7529,6 +7550,39 @@ end
     }
 
     #[test]
+    fn scan_module_dir_ignores_a_load_ui_argument_that_walks_up_with_dotdot() {
+        // A complete-literal `g_ui.loadUI('../otherModule/ui')` must never pair, even when the
+        // target genuinely exists on disk in the foreign module directory — the engine's own
+        // `resolvePath` does not collapse `..`, and PhysFS rejects a path containing one, so the
+        // real engine would never load this target. Resolving it here via a plain `Path::join` +
+        // `is_file()` check (pre-fix behavior) would produce exactly the false controller<->UI
+        // pairing this whole mechanism exists to prevent.
+        let base =
+            std::env::temp_dir().join(format!("otui-module-scan-dotdot-{}", std::process::id()));
+        let _cleanup = ModuleTestDir(base.clone());
+        let module_dir = base.join("moduleA");
+        let other_dir = base.join("otherModule");
+        std::fs::create_dir_all(&module_dir).expect("mkdir moduleA");
+        std::fs::create_dir_all(&other_dir).expect("mkdir otherModule");
+        std::fs::write(
+            module_dir.join("moduleA.otmod"),
+            "Module\n  scripts: [ ctrl ]\n",
+        )
+        .expect("write otmod");
+        std::fs::write(
+            module_dir.join("ctrl.lua"),
+            "g_ui.loadUI('../otherModule/ui')\n",
+        )
+        .expect("write ctrl.lua");
+        std::fs::write(other_dir.join("ui.otui"), "Panel < UIWidget\n").expect("write ui.otui");
+
+        assert!(
+            scan_module_dir(&module_dir).is_empty(),
+            "a `..`-walking argument must never be resolved, even if the target exists on disk"
+        );
+    }
+
+    #[test]
     fn scan_module_dir_resolves_a_wildcard_scripts_entry() {
         // `scripts: [*]` (module doc comment / `otmod_scripts`'s doc comment): every `.lua` directly
         // reachable under the module directory, recursively. The `loadUI`-style target resolves
@@ -7614,6 +7668,25 @@ end
         std::fs::create_dir_all(&module_dir).expect("mkdir");
         std::fs::write(module_dir.join("nested_module.otmod"), "Module\n").expect("write otmod");
         std::fs::create_dir_all(base.join("modules").join("no_otmod_here")).expect("mkdir");
+
+        let root = uri_from_file_path(&base).expect("root uri");
+        let dirs = find_module_dirs(&[root]);
+        assert_eq!(dirs, vec![module_dir]);
+    }
+
+    #[test]
+    fn find_module_dirs_matches_an_uppercase_otmod_extension() {
+        // `is_otmod_uri`/`dir_has_otmod`/`scan_module_dir` all match `.otmod` case-insensitively —
+        // the initial discovery walk (`collect_module_dirs`) must too, or a `.OTMOD` module would be
+        // invisible until a watcher event fires for it.
+        let base = std::env::temp_dir().join(format!(
+            "otui-find-modules-uppercase-{}",
+            std::process::id()
+        ));
+        let _cleanup = ModuleTestDir(base.clone());
+        let module_dir = base.join("modules").join("upper_module");
+        std::fs::create_dir_all(&module_dir).expect("mkdir");
+        std::fs::write(module_dir.join("upper_module.OTMOD"), "Module\n").expect("write otmod");
 
         let root = uri_from_file_path(&base).expect("root uri");
         let dirs = find_module_dirs(&[root]);
