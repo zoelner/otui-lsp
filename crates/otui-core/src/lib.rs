@@ -324,6 +324,15 @@ impl OtuiService {
         fixes::quick_fixes(source, range)
     }
 
+    /// Like [`quick_fixes`](Self::quick_fixes), but for a `.otmod`/`.otfont` manifest: restricted
+    /// to the schema-agnostic structural fixes (tabs→spaces, odd-indentation rounding) instead of
+    /// the widget-aware "did you mean" suggestions, which can misfire on a manifest's own keys —
+    /// see [`fixes::structural_quick_fixes`]'s doc comment for why.
+    #[must_use]
+    pub fn quick_fixes_structural(&self, source: &str, range: ByteSpan) -> Vec<Fix> {
+        fixes::structural_quick_fixes(source, range)
+    }
+
     /// Format the whole document (spec §8): return the canonical, whitespace-normalized text, or
     /// [`None`] when the source does not parse cleanly (parse failure, or any `ERROR` / `MISSING`
     /// node) — in which case the server returns no edits and the document is left untouched.

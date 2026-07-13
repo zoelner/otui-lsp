@@ -79,6 +79,41 @@ pub fn quick_fixes(source: &str, range: ByteSpan) -> Vec<Fix> {
     out
 }
 
+/// Like [`quick_fixes`], but restricted to the **schema-agnostic** structural diagnostics
+/// ([`diagnostics::structural_diagnostics`]: tab/odd-indentation) instead of the full widget-aware
+/// [`diagnostics::analyze`].
+///
+/// A `.otmod`/`.otfont` manifest ([`crate::manifest::analyze_manifest`]/
+/// [`crate::manifest::analyze_font_manifest`]) parses through the same OTML grammar an `.otui` does,
+/// so the same tab/odd-indentation quick-fixes correct it too — but its top-level keys
+/// (`scripts:`, `sandboxed:`, a font's `space-width:`, …) belong to a completely different, much
+/// smaller schema than the widget property catalog [`quick_fixes`]'s "did you mean" suggestions are
+/// drawn from. That catalog search can land within its edit-distance threshold of a real manifest
+/// key by pure coincidence — a font manifest's `space-width` (11 chars) is distance 3 from the
+/// widget catalog's `image-width`, exactly [`closest`]'s threshold for an 11-character word — so
+/// running the full [`quick_fixes`] over manifest text would occasionally offer a "Did you mean
+/// `image-width`?" fix that is flatly wrong for it (verified against the real
+/// `data/fonts/otfont/*.otfont` corpus). [`structural_diagnostics`](diagnostics::structural_diagnostics)
+/// never emits a widget-catalog-derived diagnostic in the first place — only the two indentation
+/// checks the OTML *parser* itself performs, identical for any OTML document regardless of which
+/// schema its keys belong to — so building fixes from it instead keeps a manifest's code actions to
+/// the structural corrections alone.
+///
+/// The server calls this for a manifest document; [`quick_fixes`] remains the widget-aware entry
+/// point for an ordinary `.otui`.
+#[must_use]
+pub fn structural_quick_fixes(source: &str, range: ByteSpan) -> Vec<Fix> {
+    let tree = crate::syntax::SyntaxTree::parse(source);
+    let mut out = Vec::new();
+    for diag in diagnostics::structural_diagnostics(source, tree.as_ref()) {
+        if !overlaps(diag.span, range) {
+            continue;
+        }
+        fixes_for(source, &diag, &mut out);
+    }
+    out
+}
+
 /// Whether two half-open byte spans touch or overlap. Boundary-inclusive so a zero-width cursor
 /// range at the very start or end of a diagnostic still counts, matching editor expectations for
 /// "the caret is on this squiggle".
@@ -518,5 +553,58 @@ mod tests {
         let src = "x: [a, b\n";
         let fixes = quick_fixes(src, whole(src));
         assert!(fixes.is_empty(), "syntax errors are not fixable: {fixes:?}");
+    }
+
+    // --- structural_quick_fixes (manifest-safe) ------------------------------------------------
+
+    #[test]
+    fn structural_quick_fixes_still_offers_the_tab_fix() {
+        // A `.otmod`-shaped tab-indentation error: the structural fix applies just as much to a
+        // manifest as to an ordinary `.otui`.
+        let src = "Module\n\tname: test\n";
+        let fixes = structural_quick_fixes(src, whole(src));
+        assert_eq!(titles(&fixes), vec!["Convert tabs to spaces"]);
+        assert_eq!(fixes[0].fixes_code, diagnostics::TAB_INDENTATION);
+    }
+
+    #[test]
+    fn structural_quick_fixes_still_offers_the_odd_indentation_fix() {
+        let src = "Module\n   name: test\n";
+        let fixes = structural_quick_fixes(src, whole(src));
+        assert_eq!(titles(&fixes), vec!["Fix indentation to 2 spaces"]);
+        assert_eq!(fixes[0].fixes_code, diagnostics::ODD_INDENTATION);
+    }
+
+    #[test]
+    fn structural_quick_fixes_never_suggests_a_widget_property_for_a_manifest_key() {
+        // Regression: the full widget-aware `quick_fixes` can accidentally land within its
+        // edit-distance threshold of a real manifest key (see this function's doc comment —
+        // `space-width` vs. the widget catalog's `image-width`, verified against the real
+        // `data/fonts/otfont/*.otfont` corpus). `structural_quick_fixes` must never do that: it
+        // does not even compute `unknown-property`, so there is nothing to suggest a fix for.
+        let src = "Font\n  name: verdana-10px\n  space-width: 4\n";
+        let fixes = structural_quick_fixes(src, whole(src));
+        assert!(
+            fixes.is_empty(),
+            "a manifest key must never surface a widget-property suggestion: {fixes:?}"
+        );
+    }
+
+    #[test]
+    fn structural_quick_fixes_ignores_diagnostics_outside_the_range() {
+        let src = "Module\n\tname: test\n  description: x\n";
+        let name = at(src, "name");
+        // A range over the second (clean) line only.
+        let description = at(src, "description");
+        let range = ByteSpan::new(description, description + "description".len());
+        let fixes = structural_quick_fixes(src, range);
+        assert!(
+            fixes.is_empty(),
+            "the tab fix on the first line must not leak into an unrelated range: {fixes:?}"
+        );
+        // Sanity: the same document DOES yield the tab fix when the range covers it.
+        let range = ByteSpan::new(name, name + "name".len());
+        let fixes = structural_quick_fixes(src, range);
+        assert_eq!(titles(&fixes), vec!["Convert tabs to spaces"]);
     }
 }

@@ -2697,9 +2697,52 @@ fn build_code_actions(
     context: &[LspDiagnostic],
     encoding: PositionEncoding,
 ) -> Vec<CodeActionOrCommand> {
+    actions_from_fixes(
+        service.quick_fixes(text, range),
+        uri,
+        text,
+        context,
+        encoding,
+    )
+}
+
+/// Like [`build_code_actions`], but for a `.otmod`/`.otfont` manifest: fixes come from
+/// [`OtuiService::quick_fixes_structural`] rather than [`OtuiService::quick_fixes`], so only the
+/// schema-agnostic structural corrections (tabs→spaces, odd-indentation rounding) are ever offered
+/// — never a widget-catalog "did you mean" suggestion, which judges a manifest's own keys
+/// (`scripts:`, `sandboxed:`, a font's `space-width:`, …) against the wrong schema entirely and can
+/// suggest a flatly incorrect fix (see [`quick_fixes_structural`](OtuiService::quick_fixes_structural)'s
+/// doc comment for a real corpus example). Used by [`Backend::code_action`] for
+/// [`Language::Manifest`].
+fn build_manifest_code_actions(
+    service: &OtuiService,
+    uri: &Uri,
+    text: &str,
+    range: ByteSpan,
+    context: &[LspDiagnostic],
+    encoding: PositionEncoding,
+) -> Vec<CodeActionOrCommand> {
+    actions_from_fixes(
+        service.quick_fixes_structural(text, range),
+        uri,
+        text,
+        context,
+        encoding,
+    )
+}
+
+/// Map already-computed engine [`Fix`]es onto `quickfix` [`CodeAction`]s for `uri`, linking each to
+/// whichever of `context`'s client diagnostics it corrects. Shared by [`build_code_actions`] and
+/// [`build_manifest_code_actions`], which differ only in *which* fixes they compute.
+fn actions_from_fixes(
+    fixes: Vec<Fix>,
+    uri: &Uri,
+    text: &str,
+    context: &[LspDiagnostic],
+    encoding: PositionEncoding,
+) -> Vec<CodeActionOrCommand> {
     let line_index = LineIndex::new(text);
-    service
-        .quick_fixes(text, range)
+    fixes
         .into_iter()
         .map(|fix| {
             let edits: Vec<TextEdit> = fix
@@ -4302,9 +4345,15 @@ impl Backend {
         let uri = params.text_document.uri;
         let encoding = self.encoding();
 
-        // Serve from the stored document text; an unknown document has nothing to fix, and (the
-        // OTUI-only language guard) neither does a `.lua` one.
-        let text = self.otui_document_text(&uri)?;
+        // A module/font manifest is still OTML syntactically, so it is served here via
+        // `otml_document_text` (not `otui_document_text`) — the tabs→spaces / odd-indentation
+        // quick-fixes correct exactly the structural diagnostics
+        // `compute_and_send_manifest_diagnostics` already publishes for it (spec: the OTML
+        // *parser*'s own indentation rule, not the widget style resolver). An unknown document has
+        // nothing to fix, and (the OTUI-only language guard) neither does a `.lua` one —
+        // `otml_document_text` returns `None` for both.
+        let language = self.document_language(&uri);
+        let text = self.otml_document_text(&uri)?;
 
         // Map the requested LSP range to a byte span, then let the engine compute the fixes that
         // overlap it. An empty list is a valid answer (nothing fixable here); return it as such.
@@ -4313,14 +4362,28 @@ impl Backend {
             line_index.offset_at(params.range.start, encoding),
             line_index.offset_at(params.range.end, encoding),
         );
-        let actions = build_code_actions(
-            &self.service,
-            &uri,
-            &text,
-            range,
-            &params.context.diagnostics,
-            encoding,
-        );
+        // A manifest's own keys belong to a different, much smaller schema than the widget property
+        // catalog the ordinary path's "did you mean" suggestions draw from — routed through
+        // `build_manifest_code_actions` so only the schema-agnostic structural fixes are ever
+        // offered for it (see that function's doc comment).
+        let actions = match language {
+            Language::Manifest(_) => build_manifest_code_actions(
+                &self.service,
+                &uri,
+                &text,
+                range,
+                &params.context.diagnostics,
+                encoding,
+            ),
+            _ => build_code_actions(
+                &self.service,
+                &uri,
+                &text,
+                range,
+                &params.context.diagnostics,
+                encoding,
+            ),
+        };
         Some(actions)
     }
 
