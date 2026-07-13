@@ -2,24 +2,81 @@
 //! [`lsp_server::Connection`] (no stdio), proving `initialize → didOpen → hover → shutdown/exit`
 //! works through `Backend::handle_request`/`handle_notification`.
 
+use std::path::Path;
 use std::str::FromStr;
 use std::thread;
+use std::time::Duration;
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
-    DidOpenTextDocumentParams, HoverParams, InitializeParams, InitializedParams, Position,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Uri,
-    WorkDoneProgressParams,
+    DiagnosticSeverity, DidOpenTextDocumentParams, HoverParams, InitializeParams,
+    InitializedParams, NumberOrString, Position, PublishDiagnosticsParams, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentPositionParams, Uri, WorkDoneProgressParams, WorkspaceFolder,
 };
 use otui_lsp_server::{serve, Backend, Termination};
 
+/// Build a `file:` [`Uri`] from a filesystem path via the `url` crate's percent-encoding — never by
+/// hand-formatting `format!("file://{}", path.display())`, which leaves reserved characters (a
+/// space, `#`, `?`, …) unencoded and produces an invalid/misinterpreted URI. Mirrors the server's own
+/// `uri_from_file_path` (private to the crate, so this is a test-local equivalent, not a second
+/// implementation the server itself relies on).
+fn file_uri(path: &Path) -> Uri {
+    Uri::from_str(
+        url::Url::from_file_path(path)
+            .expect("valid file path")
+            .as_str(),
+    )
+    .expect("uri")
+}
+
+/// The zero-based LSP [`Position`] of the first occurrence of `needle` in `text`. Test-only, and
+/// deliberately simple: every text passed to it here is ASCII, so a UTF-8 byte offset and a UTF-16
+/// code-unit column coincide.
+fn position_of(text: &str, needle: &str) -> Position {
+    let idx = text.find(needle).expect("needle present in text");
+    let mut line = 0u32;
+    let mut line_start = 0usize;
+    for (i, ch) in text[..idx].char_indices() {
+        if ch == '\n' {
+            line += 1;
+            line_start = i + 1;
+        }
+    }
+    Position::new(line, (idx - line_start) as u32)
+}
+
+/// RAII guard that removes its directory (recursively) on drop — including on an unwinding panic
+/// from a failed assertion, unlike a trailing `std::fs::remove_dir_all` call, which is never reached
+/// once an earlier assertion panics and leaks the temp directory.
+struct TempDirGuard(std::path::PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// How long [`recv_response`]/[`recv_diagnostics`] wait for the expected message before giving up.
+/// Generous for a fully in-memory, single-process test (no real network), but bounded: a blocking
+/// `recv()` here would hang the *whole test binary* — every test after it too, since `cargo test`
+/// only reports a suite-wide timeout, never which test stalled — if publication ever regresses or
+/// the server thread dies without sending what the test is waiting for (CodeRabbit Finding 5 on
+/// PR #51).
+const RECV_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Read from the client end until the [`Response`] for `id` arrives, skipping anything else the
 /// server pushed in the meantime (log notifications, `client/registerCapability` requests, …).
+///
+/// Bounded by [`RECV_TIMEOUT`] (see its doc comment for why a blocking `recv()` here is not safe).
 fn recv_response(client: &Connection, id: &RequestId) -> Response {
     loop {
-        match client.receiver.recv().expect("server channel open") {
-            Message::Response(resp) if &resp.id == id => return resp,
-            _ => continue,
+        match client.receiver.recv_timeout(RECV_TIMEOUT) {
+            Ok(Message::Response(resp)) if &resp.id == id => return resp,
+            Ok(_) => continue,
+            Err(e) => panic!(
+                "timed out after {RECV_TIMEOUT:?} waiting for a response to request {id:?} \
+                 (server channel: {e})"
+            ),
         }
     }
 }
@@ -46,14 +103,46 @@ fn run_server(server: Connection) -> Termination {
     serve(&backend, &server).expect("serve loop")
 }
 
+/// Read from the client end until a `textDocument/publishDiagnostics` notification for `uri`
+/// arrives, skipping anything else in between (log notifications, `client/registerCapability`
+/// requests, a diagnostics push for some other document, …).
+///
+/// Bounded by [`RECV_TIMEOUT`] (see its doc comment): a blocking `recv()` here would hang the whole
+/// suite the moment `publishDiagnostics` ever regressed or the server thread died mid-test, instead
+/// of failing just this one test with a readable message (CodeRabbit Finding 5 on PR #51).
+fn recv_diagnostics(client: &Connection, uri: &Uri) -> PublishDiagnosticsParams {
+    loop {
+        match client.receiver.recv_timeout(RECV_TIMEOUT) {
+            Ok(Message::Notification(n)) if n.method == "textDocument/publishDiagnostics" => {
+                let params: PublishDiagnosticsParams =
+                    serde_json::from_value(n.params).expect("deserialize PublishDiagnosticsParams");
+                if &params.uri == uri {
+                    return params;
+                }
+            }
+            Ok(_) => continue,
+            Err(e) => panic!(
+                "timed out after {RECV_TIMEOUT:?} waiting for publishDiagnostics for {uri:?} \
+                 (server channel: {e})"
+            ),
+        }
+    }
+}
+
 /// Drive the client half of the handshake: `initialize` request/response, then `initialized`.
 fn client_handshake(client: &Connection) {
+    client_handshake_with_params(client, InitializeParams::default());
+}
+
+/// Like [`client_handshake`], but with caller-supplied `InitializeParams` — for tests that need a
+/// real workspace root (e.g. so `/`-rooted asset paths have a data root to resolve against).
+fn client_handshake_with_params(client: &Connection, params: InitializeParams) {
     client
         .sender
         .send(Message::Request(Request::new(
             RequestId::from(1),
             "initialize".to_owned(),
-            InitializeParams::default(),
+            params,
         )))
         .expect("send initialize");
     let init_resp = recv_response(client, &RequestId::from(1));
@@ -198,4 +287,679 @@ fn standalone_exit_terminates_with_nonzero_status() {
     let termination = server_thread.join().expect("server thread joined");
     assert_eq!(termination, Termination::Aborted);
     assert_eq!(termination.exit_code(), 1);
+}
+
+/// Send `shutdown` (request id `id`), wait for its response, then send a bare `exit` and join the
+/// server thread — the closing dance every test below shares once its own assertions are done.
+fn shutdown_and_exit(client: &Connection, server_thread: thread::JoinHandle<Termination>, id: i32) {
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(id),
+            "shutdown".to_owned(),
+            serde_json::Value::Null,
+        )))
+        .expect("send shutdown");
+    let _ = recv_response(client, &RequestId::from(id));
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "exit".to_owned(),
+            serde_json::Value::Null,
+        )))
+        .expect("send exit");
+    server_thread.join().expect("server thread joined");
+}
+
+/// Mark `dir` as a detected OTClient install root (see `find_client_root`/`CLIENT_ROOT_MARKERS`):
+/// an `init.lua` file plus `data/` and `modules/` subdirectories. Every `missing-asset` test below
+/// needs this — without a detected client root the diagnostic is silent by design (Finding 2), so a
+/// bare temp directory with no such markers is no longer enough to exercise the rule.
+fn mark_as_client_root(dir: &Path) {
+    std::fs::create_dir_all(dir).expect("mkdir client root");
+    std::fs::write(dir.join("init.lua"), b"-- stand-in for the real init.lua\n").expect("init.lua");
+    std::fs::create_dir_all(dir.join("data")).expect("mkdir data");
+    std::fs::create_dir_all(dir.join("modules")).expect("mkdir modules");
+}
+
+/// `missing-asset` end-to-end, over real files: a `.png` that exists on disk must stay silent, and
+/// one that does not must produce exactly one Warning pointing at the offending path.
+///
+/// This drives the whole seam — workspace root capture at `initialize`, client-root detection, the
+/// document's own directory, `resolve_asset_candidates`' probe variants, the `.is_file()` check —
+/// because that is where the rule can actually break. A test of the pure part would prove nothing
+/// about the disk.
+#[test]
+fn missing_asset_diagnostic_fires_only_for_the_absent_file() {
+    let base = std::env::temp_dir().join(format!("otui-missing-asset-{}", std::process::id()));
+    let _cleanup = TempDirGuard(base.clone());
+    let images = base.join("images");
+    std::fs::create_dir_all(&images).expect("mkdir");
+    // The asset that exists. `resolve_asset_candidates` probes the `.png` form of an extensionless
+    // path, so `/images/present` must find this file and stay quiet.
+    std::fs::write(images.join("present.png"), b"png").expect("write asset");
+    // The workspace root must be a *detected* OTClient install root (Finding 2) — otherwise a
+    // `/`-rooted path has no data root the rule trusts, and nothing is diagnosed at all.
+    mark_as_client_root(&base);
+
+    let doc_path = base.join("widget.otui");
+    let source = "\
+Panel < UIWidget
+  image-source: /images/present
+  icon: /images/absent
+";
+    std::fs::write(&doc_path, source).expect("write doc");
+
+    let root = file_uri(&base);
+    let uri = file_uri(&doc_path);
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+
+    #[allow(deprecated)]
+    client_handshake_with_params(
+        &client,
+        InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: root,
+                name: "ws".to_owned(),
+            }]),
+            ..InitializeParams::default()
+        },
+    );
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: source.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+
+    let diags = recv_diagnostics(&client, &uri);
+    let missing: Vec<_> = diags
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == Some(NumberOrString::String("missing-asset".to_owned())))
+        .collect();
+
+    assert_eq!(
+        missing.len(),
+        1,
+        "exactly one asset is absent; got {missing:#?}"
+    );
+    let d = missing[0];
+    assert_eq!(d.severity, Some(DiagnosticSeverity::WARNING));
+    assert!(
+        d.message.contains("/images/absent"),
+        "message must name the unresolved path: {}",
+        d.message
+    );
+    // Line 2 (0-based) is the `icon:` line — the Warning sits on the value, not the whole document.
+    assert_eq!(
+        d.range.start.line, 2,
+        "range must point at the `icon:` line"
+    );
+
+    shutdown_and_exit(&client, server_thread, 2);
+}
+
+/// Finding 1 on PR #51, pinned end-to-end: a workspace holding **two** unrelated OTClient install
+/// roots (two client checkouts opened as separate workspace folders — not contrived; e.g. comparing
+/// a fork against upstream) must resolve each document against **its own** root only. An asset that
+/// exists only under the *other* root must never rescue a `missing-asset` finding for a document that
+/// has nothing to do with that other install.
+#[test]
+fn missing_asset_diagnostic_is_not_rescued_by_an_unrelated_second_client_root() {
+    let base = std::env::temp_dir().join(format!(
+        "otui-two-client-roots-e2e-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _cleanup = TempDirGuard(base.clone());
+    let root_a = base.join("client-a");
+    let root_b = base.join("client-b");
+    mark_as_client_root(&root_a);
+    mark_as_client_root(&root_b);
+    // The asset exists only under root B's `data/` overlay — never under root A.
+    let images_b = root_b.join("data").join("images");
+    std::fs::create_dir_all(&images_b).expect("mkdir");
+    std::fs::write(images_b.join("shared.png"), b"png").expect("write asset");
+
+    let doc_path = root_a.join("widget.otui");
+    let source = "\
+Panel < UIWidget
+  icon: /images/shared
+";
+    std::fs::write(&doc_path, source).expect("write doc");
+
+    let uri = file_uri(&doc_path);
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+
+    // Both roots opened as workspace folders — root A (the document's own tree) first, root B
+    // second, so an implementation that naively concatenated every workspace root's client root
+    // (the pre-fix behavior) would have found the asset via B and wrongly stayed silent.
+    #[allow(deprecated)]
+    client_handshake_with_params(
+        &client,
+        InitializeParams {
+            workspace_folders: Some(vec![
+                WorkspaceFolder {
+                    uri: file_uri(&root_a),
+                    name: "client-a".to_owned(),
+                },
+                WorkspaceFolder {
+                    uri: file_uri(&root_b),
+                    name: "client-b".to_owned(),
+                },
+            ]),
+            ..InitializeParams::default()
+        },
+    );
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: source.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+
+    let diags = recv_diagnostics(&client, &uri);
+    let missing: Vec<_> = diags
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == Some(NumberOrString::String("missing-asset".to_owned())))
+        .collect();
+    assert_eq!(
+        missing.len(),
+        1,
+        "root B's asset must not rescue a document that belongs to root A — got {missing:#?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 2);
+}
+
+/// Pinned end-to-end, corrected after verifying against the real engine: a CodeRabbit review of this
+/// crate (PR #51, Finding 2) claimed `init.lua` mounts only the overlay directories (`data/`,
+/// `modules/`, `mods/`) and never the install root itself, and asked for a test proving a file at
+/// `<installroot>/foo.png` must NOT satisfy `/foo.png`. That claim does not hold: `main.cpp`
+/// unconditionally calls `g_resources.discoverWorkDir("init.lua")` before any Lua runs;
+/// `ResourceManager::discoverWorkDir` (`resourcemanager.cpp`) mounts the install root via
+/// `PHYSFS_mount` and — on the candidate directory that has `init.lua` — breaks out of its loop
+/// *without* ever unmounting it, so the bare install root stays mounted for the whole session. This
+/// pins the corrected, verified behavior instead: a file sitting directly at the install root DOES
+/// satisfy a `/`-rooted reference, so `missing-asset` must stay silent for it. Real, shipped,
+/// autoloaded OTClient modules depend on exactly this (see `otui_core::links::ASSET_MOUNT_DIRS`'s
+/// doc comment for the on-disk corpus evidence).
+#[test]
+fn missing_asset_diagnostic_is_silent_for_a_file_sitting_directly_at_the_install_root() {
+    let base = std::env::temp_dir().join(format!(
+        "otui-root-itself-is-mounted-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _cleanup = TempDirGuard(base.clone());
+    mark_as_client_root(&base);
+    // Present directly at the install root, not under `mods/`/`modules/`/`data/` — exactly the
+    // shape `discoverWorkDir`'s always-on mount serves.
+    std::fs::write(base.join("foo.png"), b"png").expect("write asset");
+
+    let doc_path = base.join("widget.otui");
+    let source = "\
+Panel < UIWidget
+  icon: /foo
+";
+    std::fs::write(&doc_path, source).expect("write doc");
+
+    let root = file_uri(&base);
+    let uri = file_uri(&doc_path);
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+
+    #[allow(deprecated)]
+    client_handshake_with_params(
+        &client,
+        InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: root,
+                name: "ws".to_owned(),
+            }]),
+            ..InitializeParams::default()
+        },
+    );
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: source.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+
+    let diags = recv_diagnostics(&client, &uri);
+    let missing: Vec<_> = diags
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == Some(NumberOrString::String("missing-asset".to_owned())))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "a file at the bare install root must satisfy a `/`-rooted path — got {missing:#?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 2);
+}
+
+/// Finding 2, pinned end-to-end: a workspace root that is a **standalone module directory** — no
+/// `init.lua`/`data/`/`modules/` anywhere above it, exactly the shape of a module or mod repository
+/// opened on its own (the ordinary unit of distribution, and what the separate VS Code extension
+/// will typically be pointed at) — must produce **zero** `missing-asset` diagnostics, even though
+/// the document references an asset that is genuinely absent from disk. The old behavior (joining a
+/// `/`-rooted path directly onto whatever the editor happened to open) would have flagged this; the
+/// fix requires a *detected* client root before claiming anything is missing.
+#[test]
+fn missing_asset_diagnostic_is_silent_in_a_standalone_module_workspace() {
+    let base = std::env::temp_dir().join(format!(
+        "otui-standalone-module-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _cleanup = TempDirGuard(base.clone());
+    // A module's own directory, opened as the workspace root — no `init.lua`, no sibling `data/` or
+    // `modules/` anywhere above it. Deliberately does NOT call `mark_as_client_root`.
+    let module_dir = base.join("client_topmenu");
+    std::fs::create_dir_all(&module_dir).expect("mkdir");
+
+    let doc_path = module_dir.join("topmenu.otui");
+    let source = "\
+TopMenu < UIWidget
+  image-source: /images/topbuttons/audio
+";
+    std::fs::write(&doc_path, source).expect("write doc");
+
+    let root = file_uri(&module_dir);
+    let uri = file_uri(&doc_path);
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+
+    #[allow(deprecated)]
+    client_handshake_with_params(
+        &client,
+        InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: root,
+                name: "ws".to_owned(),
+            }]),
+            ..InitializeParams::default()
+        },
+    );
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: source.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+
+    let diags = recv_diagnostics(&client, &uri);
+    let missing: Vec<_> = diags
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == Some(NumberOrString::String("missing-asset".to_owned())))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "no client root is reachable from a standalone module workspace, so nothing may be \
+         claimed missing — got {missing:#?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 2);
+}
+
+/// Finding 3, end-to-end: with a `*.otpkg` archive mounted anywhere under the detected client root,
+/// `missing-asset` must stay silent workspace-wide — the engine resolves file existence through
+/// `PHYSFS_exists` over every mounted archive, never a raw OS `is_file()`, so an asset shipped inside
+/// the package is invisible to our probe and must not be flagged as broken.
+#[test]
+fn missing_asset_diagnostic_is_silent_when_an_otpkg_archive_is_mounted() {
+    let base = std::env::temp_dir().join(format!(
+        "otui-otpkg-suppression-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _cleanup = TempDirGuard(base.clone());
+    mark_as_client_root(&base);
+    // The mounted archive; its contents are never inspected (out of scope — see
+    // `otpkg_present_under`'s doc comment), only its presence.
+    let mods = base.join("mods");
+    std::fs::create_dir_all(&mods).expect("mkdir mods");
+    std::fs::write(mods.join("bundle.otpkg"), b"not a real zip").expect("write otpkg");
+
+    let doc_path = base.join("widget.otui");
+    let source = "\
+Panel < UIWidget
+  icon: /images/definitely-missing
+";
+    std::fs::write(&doc_path, source).expect("write doc");
+
+    let root = file_uri(&base);
+    let uri = file_uri(&doc_path);
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+
+    #[allow(deprecated)]
+    client_handshake_with_params(
+        &client,
+        InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: root,
+                name: "ws".to_owned(),
+            }]),
+            ..InitializeParams::default()
+        },
+    );
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: source.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+
+    let diags = recv_diagnostics(&client, &uri);
+    let missing: Vec<_> = diags
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == Some(NumberOrString::String("missing-asset".to_owned())))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "a mounted .otpkg suppresses missing-asset workspace-wide — got {missing:#?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 2);
+}
+
+/// Hover Blocker 1, end-to-end: a resolved asset file whose name contains a literal `)` must not
+/// truncate the hover's Markdown image destination. `url::Url::from_file_path` does not
+/// percent-encode `(`/`)` (verified independently — they are RFC 3986 sub-delims, outside the
+/// WHATWG path percent-encode set), so a raw `![](file:///…)` destination closes early at the first
+/// `)` — this is the common case too: any workspace living under a directory like
+/// `Program Files (x86)` would break on every asset hover, not just a deliberately hostile filename.
+#[test]
+fn hover_sprite_preview_wraps_a_path_containing_parentheses_in_angle_brackets() {
+    let base = std::env::temp_dir().join(format!(
+        "otui-hover-parens-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _cleanup = TempDirGuard(base.clone());
+    std::fs::create_dir_all(&base).expect("mkdir");
+    // The asset's own filename carries the `)` — the exact shape that closes an unwrapped Markdown
+    // image destination early.
+    let asset_path = base.join("evil).png");
+    std::fs::write(&asset_path, b"png").expect("write asset");
+
+    let doc_path = base.join("widget.otui");
+    let source = "Panel < UIWidget\n  image-source: evil).png\n";
+    std::fs::write(&doc_path, source).expect("write doc");
+
+    let uri = file_uri(&doc_path);
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: source.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+    // Drain the diagnostics push before issuing the hover request.
+    let _ = recv_diagnostics(&client, &uri);
+
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(2),
+            "textDocument/hover".to_owned(),
+            HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: position_of(source, "evil).png"),
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            },
+        )))
+        .expect("send hover");
+    let hover_resp = recv_response(&client, &RequestId::from(2));
+    assert!(hover_resp.error.is_none(), "hover errored: {hover_resp:?}");
+    let value = hover_markdown(&hover_resp);
+
+    let expected_target = url::Url::from_file_path(&asset_path)
+        .expect("valid file path")
+        .to_string();
+    let expected_image_line = format!("![](<{expected_target}>)");
+    assert!(
+        value.contains(&expected_image_line),
+        "image destination must be angle-bracket-wrapped and unbroken by the `)`: {value:?}"
+    );
+    // The failure mode this test exists to catch: an *unwrapped* destination that closes at `evil`,
+    // leaking `.png)` as trailing literal text right after it.
+    assert!(
+        !value.contains("![](file://"),
+        "the image destination must never be emitted unwrapped: {value:?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 3);
+}
+
+/// Hover Blocker 2, end-to-end: a backtick inside the raw path *value* text (fully attacker-
+/// controlled document content — no asset on disk, no workspace root needed) must not close the
+/// hover's Markdown code span early and let the remainder render as live Markdown/HTML.
+#[test]
+fn hover_sprite_preview_fences_a_backtick_in_the_path_value() {
+    let uri = Uri::from_str("file:///scratch/backtick.otui").expect("uri");
+    // A single backtick would close a naive `` `{value}` `` span right after `x`, letting
+    // `<b>BOLD</b> [click](https://evil.example)` render as live content.
+    let source =
+        "Panel < UIWidget\n  image-source: x` <b>BOLD</b> [click](https://evil.example) `y\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: source.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+    let _ = recv_diagnostics(&client, &uri);
+
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(2),
+            "textDocument/hover".to_owned(),
+            HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: position_of(source, "x` <b>"),
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            },
+        )))
+        .expect("send hover");
+    let hover_resp = recv_response(&client, &RequestId::from(2));
+    assert!(hover_resp.error.is_none(), "hover errored: {hover_resp:?}");
+    let value = hover_markdown(&hover_resp);
+
+    // The full hostile text must appear *inside* a code span, not escape into live Markdown: the
+    // fence must be strictly longer than any backtick run the value itself carries (here, one), so
+    // count how many consecutive backticks open the code span right after "**Asset** " and confirm
+    // it is more than the one embedded in the value.
+    let after_label = value
+        .split_once("**Asset** ")
+        .map(|(_, rest)| rest)
+        .unwrap_or(&value);
+    let fence_len = after_label.chars().take_while(|&c| c == '`').count();
+    assert!(
+        fence_len >= 2,
+        "the fence must be longer than the value's own single backtick, got {fence_len} in {value:?}"
+    );
+    // The whole hostile payload must appear literally inside the span — proof the fence did not
+    // simply drop content — and it must not appear a second time outside the span (which would mean
+    // it also escaped).
+    let occurrences = value.matches("[click](https://evil.example)").count();
+    assert_eq!(
+        occurrences, 1,
+        "the payload must appear exactly once, fenced inside the code span: {value:?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 3);
+}
+
+/// Hover Blocker 2, blank-line variant: a Markdown code span cannot contain a blank line — the fence
+/// is left open and everything after the blank line renders as a live paragraph. Backtick fencing
+/// does not close this; only flattening the value to a single line does. A block-scalar value (`|`)
+/// is how a blank line reaches `path_ref.path` from attacker-controlled document content, and the
+/// cursor must be in the block *body* (not the `|` header line) for the value to be read.
+#[test]
+fn hover_sprite_preview_flattens_a_blank_line_in_a_block_scalar_path_value() {
+    let uri = Uri::from_str("file:///scratch/blankline.otui").expect("uri");
+    // The `|` block value carries its indented body — including the blank line — into the raw path
+    // text. Without flattening, the hover markdown would contain `\n\n`, orphaning the code fence and
+    // rendering `<b>PWN</b> [click](https://evil.example)` as a live paragraph.
+    let source =
+        "Panel < UIWidget\n  image-source: |\n    x\n\n    <b>PWN</b> [click](https://evil.example)\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: source.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+    let _ = recv_diagnostics(&client, &uri);
+
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(2),
+            "textDocument/hover".to_owned(),
+            HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    // Cursor in the block body, where `asset_ref_at` reads the multi-line value.
+                    position: position_of(source, "    x"),
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            },
+        )))
+        .expect("send hover");
+    let hover_resp = recv_response(&client, &RequestId::from(2));
+    assert!(hover_resp.error.is_none(), "hover errored: {hover_resp:?}");
+    let value = hover_markdown(&hover_resp);
+
+    // The payload must be present (proof the value was read, not a vacuous pass) and the whole hover
+    // must stay on a single paragraph: a blank line means the fence broke and the tail escaped into
+    // live Markdown. This is the load-bearing assertion.
+    assert!(
+        value.contains("PWN"),
+        "the block-scalar value must reach the hover: {value:?}"
+    );
+    assert!(
+        !value.contains("\n\n"),
+        "a blank line in the fenced value orphans the code span: {value:?}"
+    );
+    assert_eq!(
+        value.matches("[click](https://evil.example)").count(),
+        1,
+        "the payload must appear exactly once, fenced, not escaped: {value:?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 3);
+}
+
+/// The Markdown string of a hover [`Response`]'s `contents.value` (panics on any other shape —
+/// every hover the server emits is `MarkupContent`).
+fn hover_markdown(resp: &Response) -> String {
+    let result = resp.result.clone().expect("hover result present");
+    result
+        .get("contents")
+        .and_then(|c| c.get("value"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("expected markup hover contents, got {result}"))
+        .to_owned()
 }

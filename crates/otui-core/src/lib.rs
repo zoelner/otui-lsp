@@ -129,6 +129,37 @@ impl OtuiService {
         diagnostics::analyze_with_widgets(source, &diagnostics::WidgetContext { styles, lua })
     }
 
+    /// Like [`diagnostics_with_widgets`](Self::diagnostics_with_widgets), but also returns the
+    /// document's asset-path links ([`document_links`](Self::document_links)'s data), parsing
+    /// `source` exactly **once** and sharing the resulting tree between both passes.
+    ///
+    /// Exists for a caller (the server's missing-asset diagnostic) that would otherwise need both
+    /// results for the same document on every keystroke: calling
+    /// [`diagnostics_with_widgets`](Self::diagnostics_with_widgets) and
+    /// [`document_links`](Self::document_links) separately parses `source` twice for one request.
+    ///
+    /// Inherent (not on the [`LanguageService`] trait) for the same reason as
+    /// [`diagnostics_with_widgets`](Self::diagnostics_with_widgets): it consumes server-owned
+    /// workspace state.
+    #[must_use]
+    pub fn diagnostics_with_widgets_and_links(
+        &self,
+        source: &str,
+        styles: &StyleIndex,
+        lua: &LuaWidgetIndex,
+    ) -> (Vec<Diagnostic>, Vec<links::PathRef>) {
+        let tree = SyntaxTree::parse(source);
+        let diags = diagnostics::analyze_with_widgets_from_tree(
+            source,
+            tree.as_ref(),
+            &diagnostics::WidgetContext { styles, lua },
+        );
+        let asset_links = tree.as_ref().map_or_else(Vec::new, |tree| {
+            links::document_links_from_tree(source, tree)
+        });
+        (diags, asset_links)
+    }
+
     /// Locate the top-level `Name < Base` base reference under `offset`, if any (spec §5.3).
     ///
     /// Returns the base token's name + span when the cursor sits on the `Base` of a top-level
@@ -375,6 +406,19 @@ impl OtuiService {
     #[must_use]
     pub fn document_links(&self, source: &str) -> Vec<links::PathRef> {
         links::document_links(source)
+    }
+
+    /// Point-locate the file-path-valued property value under `offset` (hover's sprite-preview
+    /// case): `None` unless the cursor sits inside the trimmed path text of a `property` whose key
+    /// is in [`schema::PATH_PROPERTIES`]. Complements [`document_links`](Self::document_links)'s
+    /// bulk sweep with a single-cursor query.
+    ///
+    /// Inherent (not on the [`LanguageService`] trait) so the protocol-agnostic trait stays minimal,
+    /// mirroring [`document_links`](Self::document_links). Kept **pure** — resolving the path against
+    /// the filesystem is the server's job.
+    #[must_use]
+    pub fn asset_ref_at(&self, source: &str, offset: usize) -> Option<links::PathRef> {
+        links::asset_ref_at(source, offset)
     }
 }
 

@@ -39,29 +39,31 @@ use lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
     CodeActionProviderCapability, CodeActionResponse, ColorInformation, ColorPresentation,
     ColorPresentationParams, ColorProviderCapability, CompletionOptions, CompletionParams,
-    CompletionResponse, Diagnostic as LspDiagnostic, DidChangeTextDocumentParams,
-    DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentColorParams,
-    DocumentFormattingParams, DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
-    DocumentLink, DocumentLinkOptions, DocumentLinkParams, DocumentOnTypeFormattingOptions,
-    DocumentOnTypeFormattingParams, DocumentRangeFormattingParams, DocumentSymbolParams,
-    DocumentSymbolResponse, FileChangeType, FileSystemWatcher, FoldingRange, FoldingRangeParams,
-    FoldingRangeProviderCapability, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse,
-    Hover, HoverContents, HoverParams, HoverProviderCapability, ImplementationProviderCapability,
-    InitializeParams, InitializeResult, Location, LogMessageParams, MarkupContent, MarkupKind,
-    MessageType, NumberOrString, OneOf, PositionEncodingKind, PrepareRenameResponse,
-    PublishDiagnosticsParams, ReferenceParams, Registration, RegistrationParams, RenameOptions,
-    RenameParams, SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions,
-    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, ServerInfo, SymbolInformation, SymbolKind, TextDocumentPositionParams,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, TypeDefinitionProviderCapability,
-    TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
-    TypeHierarchySupertypesParams, Uri, WorkDoneProgressOptions, WorkspaceEdit,
-    WorkspaceSymbolParams,
+    CompletionResponse, Diagnostic as LspDiagnostic, DiagnosticSeverity,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DocumentColorParams, DocumentFormattingParams, DocumentHighlight,
+    DocumentHighlightKind, DocumentHighlightParams, DocumentLink, DocumentLinkOptions,
+    DocumentLinkParams, DocumentOnTypeFormattingOptions, DocumentOnTypeFormattingParams,
+    DocumentRangeFormattingParams, DocumentSymbolParams, DocumentSymbolResponse, FileChangeType,
+    FileSystemWatcher, FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability,
+    GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
+    Location, LogMessageParams, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf,
+    PositionEncodingKind, PrepareRenameResponse, PublishDiagnosticsParams, ReferenceParams,
+    Registration, RegistrationParams, RenameOptions, RenameParams, SemanticTokens,
+    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SymbolInformation,
+    SymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextEdit, TypeDefinitionProviderCapability, TypeHierarchyItem, TypeHierarchyPrepareParams,
+    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri, WorkDoneProgressOptions,
+    WorkspaceEdit, WorkspaceSymbolParams,
 };
 use otui_core::fixes::Fix;
 use otui_core::hover::{Inheritance, StyleHover, StyleHoverKind};
-use otui_core::links::PathRef;
+use otui_core::links::{
+    is_asset_sentinel_value, is_runtime_variable_path, resolve_asset_candidates, PathRef,
+};
 use otui_core::lua_widgets::LuaWidgetIndex;
 use otui_core::property_hover::{PropertyHover, PropertyValueKind};
 use otui_core::style_index::{is_native_base, DocId, StyleDef, StyleIndex};
@@ -218,10 +220,14 @@ pub struct Backend {
     /// buffer wins (it may have unsaved edits); see [`merge_documents`]. [`Arc`] so the background
     /// scan can populate it from a spawned task.
     disk_texts: Arc<RwLock<HashMap<Uri, String>>>,
-    /// The workspace root URLs captured during `initialize` (`workspace_folders`, else `root_uri`),
-    /// consumed once by the background scan in `run_initialized`. Empty when the client opened no
-    /// folder — the server then falls back to open-docs-only indexing. Guarded by a [`Mutex`]
-    /// because it is written once and read once.
+    /// The workspace root URLs captured during `initialize` (`workspace_folders`, else `root_uri`).
+    /// Written once, then read by the background scan in `run_initialized` and by every handler that
+    /// resolves a `/`-rooted asset path against the data root (`document_link`, `hover`'s asset
+    /// preview, the missing-asset diagnostic — see [`Backend::workspace_root_paths`]). Empty when the
+    /// client opened no folder — the server then falls back to open-docs-only indexing (and asset
+    /// resolution / the missing-asset diagnostic conservatively produce nothing). Guarded by a
+    /// [`Mutex`] because it is written once and read many times, never mutated concurrently with a
+    /// read.
     roots: Mutex<Vec<Uri>>,
     /// Serializes the "check whether a URI is open, then write its index entry" critical section so
     /// an open buffer's index always wins over stale disk text. The background scan
@@ -240,6 +246,12 @@ pub struct Backend {
     /// set, skips the remaining work and its completion refresh — so dropping the backend and joining
     /// the I/O threads never waits for a full scan. [`Arc`] so the scan thread holds a clone.
     shutdown: Arc<AtomicBool>,
+    /// Memoized `.otpkg`-under-root presence, keyed by detected client root (see
+    /// [`otpkg_present_under_cached`]) — Finding 3: without this, `missing_asset_diagnostics` would
+    /// re-walk the entire client tree on every diagnostics pass over a document with a missing asset.
+    /// [`Arc`] so the scan thread's completion refresh (which runs without a `&Backend`) shares the
+    /// same cache as request-driven diagnostics, rather than warming a second one from scratch.
+    otpkg_cache: Arc<RwLock<HashMap<PathBuf, bool>>>,
 }
 
 /// Largest `.otui` file the workspace scan / watcher will read into the index. A style file is a few
@@ -264,6 +276,7 @@ impl Backend {
             roots: Mutex::new(workspace_roots(params)),
             reindex_guard: Arc::new(Mutex::new(())),
             shutdown: Arc::new(AtomicBool::new(false)),
+            otpkg_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -283,6 +296,38 @@ impl Backend {
             .hierarchical_symbols
             .lock()
             .expect("hierarchical_symbols mutex poisoned")
+    }
+
+    /// The current workspace roots as filesystem paths — the raw candidates a `/`-rooted OTUI asset
+    /// path might be relative to before any client-root detection (see [`resolve_asset_candidates`],
+    /// [`detect_client_roots`]).
+    fn workspace_root_paths(&self) -> Vec<PathBuf> {
+        self.roots
+            .lock()
+            .expect("roots mutex poisoned")
+            .iter()
+            .filter_map(uri_to_file_path)
+            .collect()
+    }
+
+    /// Best-effort data roots for `document_link` and the hover sprite preview: the detected
+    /// OTClient install root(s) ([`detect_client_roots`]) when one is found, else the raw workspace
+    /// roots as a fallback. Unlike the missing-asset diagnostic, neither of these features makes an
+    /// accusation — an absent link or a plain (imageless) hover is harmless — so they degrade to the
+    /// pre-Finding-2 heuristic instead of going silent when no client root can be confirmed.
+    ///
+    /// [`resolve_asset_candidates`] treats a confirmed install root and a raw workspace-root fallback
+    /// identically: the engine always mounts the install root itself, ahead of anything `init.lua`
+    /// mounts (see [`otui_core::links::ASSET_MOUNT_DIRS`]'s doc comment), so there is no narrower
+    /// probe shape to switch to for the confirmed case.
+    fn asset_data_roots(&self, doc_dir: &Path) -> Vec<PathBuf> {
+        let workspace_roots = self.workspace_root_paths();
+        let client_roots = detect_client_roots(Some(doc_dir), &workspace_roots);
+        if client_roots.is_empty() {
+            workspace_roots
+        } else {
+            client_roots
+        }
     }
 
     fn snippet_support(&self) -> bool {
@@ -344,6 +389,10 @@ impl Backend {
         let encoding = self.encoding();
         let styles = self.style_index.read().expect("style_index lock poisoned");
         let lua = self.lua_index.read().expect("lua_index lock poisoned");
+        // Same asset resolution as `document_link` (§ missing-asset diagnostic): the current
+        // document's directory (for relative paths) and the workspace roots (for `/`-rooted ones).
+        let doc_dir = uri_to_file_path(&uri).and_then(|p| p.parent().map(Path::to_path_buf));
+        let workspace_roots = self.workspace_root_paths();
         compute_and_send_diagnostics(
             &self.sender,
             &self.service,
@@ -354,6 +403,9 @@ impl Backend {
             uri,
             text,
             version,
+            doc_dir.as_deref(),
+            &workspace_roots,
+            &self.otpkg_cache,
         );
     }
 
@@ -545,9 +597,23 @@ fn compute_and_send_diagnostics(
     uri: Uri,
     text: &str,
     version: i32,
+    doc_dir: Option<&Path>,
+    workspace_roots: &[PathBuf],
+    otpkg_cache: &RwLock<HashMap<PathBuf, bool>>,
 ) {
-    let core_diags = service.diagnostics_with_widgets(text, styles, lua);
-    let lsp_diags = convert::all_to_lsp(text, &core_diags, encoding);
+    // One parse serves both passes (see `OtuiService::diagnostics_with_widgets_and_links`'s doc
+    // comment): computing the widget diagnostics and the asset-path links separately would parse
+    // `text` twice for this single request, on every keystroke.
+    let (core_diags, asset_links) = service.diagnostics_with_widgets_and_links(text, styles, lua);
+    let mut lsp_diags = convert::all_to_lsp(text, &core_diags, encoding);
+    lsp_diags.extend(missing_asset_diagnostics(
+        asset_links,
+        text,
+        doc_dir,
+        workspace_roots,
+        otpkg_cache,
+        encoding,
+    ));
     let latest = documents
         .read()
         .expect("documents lock poisoned")
@@ -639,53 +705,228 @@ fn uri_from_file_path(path: &Path) -> Option<Uri> {
     Uri::from_str(url::Url::from_file_path(path).ok()?.as_str()).ok()
 }
 
-/// Compute the candidate filesystem paths a raw OTUI asset path could resolve to, **without**
-/// touching the filesystem (no existence check — that stays in the handler).
+/// The two subdirectories that, together with `init.lua` itself, confirm a directory is the real
+/// OTClient **install root** — the `getWorkDir()` `init.lua` mounts `data/`, `modules/` and `mods/`
+/// under (see [`otui_core::links::ASSET_MOUNT_DIRS`]'s doc comment for the full `init.lua` trace).
+/// `mods/` is deliberately not required here: it is created lazily by the client and is commonly
+/// absent from a freshly cloned tree, while `init.lua` + `data/` + `modules/` are always present
+/// together at the repository root.
+const CLIENT_ROOT_MARKERS: [&str; 2] = ["data", "modules"];
+
+/// Walk up from `start` (inclusive of `start` itself) looking for the real OTClient install root — a
+/// directory containing `init.lua` plus both of [`CLIENT_ROOT_MARKERS`] as subdirectories. Returns
+/// the first (innermost) such ancestor, or `None` if the walk reaches the filesystem root without
+/// finding one.
 ///
-/// This mirrors OTClient's path model heuristically: the real data root is configurable, so the best
-/// the server can do offline is treat the workspace root(s) as the data root.
-///
-/// * A **`/`-rooted** path is an OTClient "absolute" path — relative to the *data root*, not the OS
-///   root. The leading `/` is stripped and the remainder joined onto each workspace root candidate
-///   (there may be several workspace folders, or none — in which case a `/`-rooted path yields no
-///   candidates offline).
-/// * Any **other** (relative) path is resolved against the current document's directory.
-/// * **Extensionless** paths get a `.png` variant probed first: OTClient's texture loader appends
-///   `.png` to a source with no extension, and OTUI authors almost always omit it
-///   (`image-source: /images/ui/button` → `button.png` on disk). Without this the link would never
-///   resolve for the overwhelmingly common extensionless form. See [`asset_probe_variants`].
-///
-/// Returns the candidates in probe order; the caller keeps the first that exists.
-fn resolve_asset_candidates(
-    raw: &str,
-    doc_dir: &Path,
-    workspace_roots: &[PathBuf],
-) -> Vec<PathBuf> {
-    let path = raw.trim();
-    if path.is_empty() {
-        return Vec::new();
+/// This exists because **the workspace root the editor opened is not the client root** (Finding 2):
+/// `/`-rooted OTUI asset paths are relative to `getWorkDir()`, the client install's own directory —
+/// which has nothing to do with the folder a developer happened to open. A workspace opened on a
+/// single module or mod repository (the ordinary unit of distribution) has no `data/`/`modules/`
+/// siblings at all, so joining a `/`-rooted path directly onto that root (the pre-fix behavior) does
+/// not approximate the engine — it guesses, and guesses wrong for the overwhelming majority of
+/// `/`-rooted paths in that shape of workspace.
+fn find_client_root(start: &Path) -> Option<PathBuf> {
+    let mut dir = Some(start);
+    while let Some(d) = dir {
+        if d.join("init.lua").is_file() && CLIENT_ROOT_MARKERS.iter().all(|m| d.join(m).is_dir()) {
+            return Some(d.to_path_buf());
+        }
+        dir = d.parent();
     }
-    let bases: Vec<PathBuf> = if let Some(rest) = path.strip_prefix('/') {
-        // OTClient "absolute" = relative to the data root; approximate the data root as each
-        // workspace root. Strip the leading `/` so `join` does not discard the root.
-        workspace_roots.iter().map(|root| root.join(rest)).collect()
-    } else {
-        vec![doc_dir.join(path)]
-    };
-    bases.into_iter().flat_map(asset_probe_variants).collect()
+    None
 }
 
-/// Expand one resolved base path into the on-disk variants to probe, mirroring OTClient's texture
-/// loader. A path that already carries an extension (`window.png`) is probed as-is. An
-/// **extensionless** path (`.../button`) probes its `.png` form first — the engine's default for a
-/// source with no extension — then the literal as a harmless fallback (an extensionless file on disk
-/// is unusual but not impossible).
-fn asset_probe_variants(base: PathBuf) -> Vec<PathBuf> {
-    if base.extension().is_some() {
-        vec![base]
-    } else {
-        vec![base.with_extension("png"), base]
+/// Detect the OTClient install root(s) that should back a `/`-rooted asset path's resolution.
+///
+/// When `doc_dir` itself sits inside (or at) a confirmed install root, **only that root** is
+/// returned — a client installation reachable from some *other*, unrelated workspace root is never
+/// folded in. Mixing them together let an asset that happens to exist under an unrelated client
+/// install elsewhere in the workspace suppress a legitimate `missing-asset` finding for a document
+/// that has nothing to do with that install, or make hover/document-link resolve against the wrong
+/// tree entirely (CodeRabbit Finding 1 on PR #51) — a workspace can legitimately contain more than
+/// one OTClient checkout (e.g. two client forks side by side), and each document's assets must
+/// resolve against *its own* install, not whichever one the scan happened to find first.
+///
+/// Only when `doc_dir` has **no** client root anywhere above it does this fall back to scanning every
+/// `workspace_roots` entry for a client root of its own (deduplicated) — the pre-existing behavior,
+/// still needed for the request paths that have no single document to anchor on (the workspace-scan
+/// completion refresh; see its caller in `run_initialized`). Empty when no client root is found
+/// anywhere — the signal [`missing_asset_diagnostics`] uses to stay silent instead of guessing
+/// (Finding 2, the original one).
+///
+/// `pub` for the same reason as [`otui_core::links::is_runtime_variable_path`]: `xtask corpus` reuses
+/// this guard, so its `missing-asset` count cannot silently drift from what the real diagnostic would
+/// report.
+#[must_use]
+pub fn detect_client_roots(doc_dir: Option<&Path>, workspace_roots: &[PathBuf]) -> Vec<PathBuf> {
+    if let Some(root) = doc_dir.and_then(find_client_root) {
+        return vec![root];
     }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for start in workspace_roots {
+        if let Some(root) = find_client_root(start) {
+            if !out.contains(&root) {
+                out.push(root);
+            }
+        }
+    }
+    out
+}
+
+/// Whether a `*.otpkg` archive exists anywhere under `dir` (recursive; stops at the first match).
+///
+/// OTClient mounts every `.otpkg` under the data root as a transparent virtual-filesystem overlay at
+/// startup (`init.lua`'s `g_resources.searchAndAddPackages('/', '.otpkg', true)` →
+/// `ResourceManager::searchAndAddPackages` → `addSearchPath` → `PHYSFS_mount`,
+/// `resourcemanager.cpp`), and every engine existence check goes through `PHYSFS_exists`
+/// (`ResourceManager::fileExists`), never the raw OS filesystem. An asset shipped inside one is
+/// therefore invisible to our `Path::is_file()` probe — a guaranteed false positive we cannot
+/// resolve without unpacking the archive (out of scope; not attempted). The real engine call only
+/// lists the *immediate* entries of the mounted virtual root (not a deep walk) — this walk is
+/// deliberately broader (any depth, any subdirectory) than that single call, since suppressing too
+/// eagerly is the safe direction for a diagnostic and a shallower check could still miss an `.otpkg`
+/// sitting one level differently than the engine's exact listing.
+///
+/// Also documents a hole this crate cannot close statically: `addSearchPath` is itself bound to Lua
+/// (`g_resources.addSearchPath`, `src/framework/luafunctions.cpp`), so a module can mount an
+/// arbitrary extra root *at runtime* — no static analysis of `.otui`/`.lua` text can predict that.
+///
+/// Only called once [`missing_asset_diagnostics`] already has a real candidate finding to confirm or
+/// suppress, so this recursive walk is never paid for the overwhelmingly common case where nothing
+/// would be flagged anyway. Recursive and uncached in itself — see [`Backend::otpkg_cache`] for why
+/// the *server's* diagnostics path never actually re-walks the same root twice (Finding 3).
+///
+/// `pub` for the same reason as [`detect_client_roots`]: `xtask corpus` reuses this guard.
+#[must_use]
+pub fn otpkg_present_under(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = path.symlink_metadata() else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            if otpkg_present_under(&path) {
+                return true;
+            }
+        } else if meta.is_file() && path.extension().is_some_and(|e| e == "otpkg") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Memoized [`otpkg_present_under`] lookup, keyed by client root.
+///
+/// [`missing_asset_diagnostics`] re-derives the same install root(s) on **every** diagnostics pass
+/// (every keystroke in an open document with at least one missing asset), and the diagnostics loop
+/// runs synchronously on the single-threaded LSP main loop — without this memoization,
+/// `otpkg_present_under`'s recursive walk of the *entire* client tree would be repeated on every one
+/// of those passes, freezing typing on a large client tree (CodeRabbit Finding 3 on PR #51; a prior
+/// measurement found ~4ms for a 62MB engine tree, and a full asset-laden client install is far
+/// bigger).
+///
+/// Populated lazily, once per distinct root, and kept for the life of the [`Backend`]: `.otpkg`
+/// archives are shipped, packaged build artifacts, not files a developer edits during a session, and
+/// — unlike `.otui`/`.lua` — nothing watches for `.otpkg` changes (`run_initialized`'s dynamic
+/// watcher registration only asks for `**/*.otui` and `**/*.lua`), so there is no live-invalidation
+/// signal to hook this into. A server restart re-derives it fresh. This is the smaller of the two
+/// fixes Finding 3 offered ("compute once … and store it on the `Backend`"): the walk itself is
+/// unchanged, only ever repeated once per root instead of once per keystroke.
+fn otpkg_present_under_cached(cache: &RwLock<HashMap<PathBuf, bool>>, root: &Path) -> bool {
+    if let Some(&present) = cache.read().expect("otpkg_cache lock poisoned").get(root) {
+        return present;
+    }
+    let present = otpkg_present_under(root);
+    cache
+        .write()
+        .expect("otpkg_cache lock poisoned")
+        .insert(root.to_path_buf(), present);
+    present
+}
+
+/// Compute the `missing-asset` diagnostics for `text`: a **warning** (never an error — spec §2.10,
+/// the LSP is never stricter than the engine) on every path-valued property whose target does not
+/// resolve to a file on disk, via the exact same walk `document_link` uses
+/// ([`resolve_asset_candidates`] and the `is_file()` probe) — over `asset_links`, the document's
+/// asset-path links the caller already extracted (see
+/// [`OtuiService::diagnostics_with_widgets_and_links`]; not re-parsed here, so this document is
+/// never parsed twice for one diagnostics pass).
+///
+/// Guards that keep this from being a false-positive machine (the whole risk of the rule):
+/// * a path containing `$` is a runtime-resolved OTML variable ([`is_runtime_variable_path`]) —
+///   never diagnosed, since the server cannot know what it resolves to;
+/// * an explicit "no image" sentinel value on `image-source` specifically ([`is_asset_sentinel_value`]:
+///   `""` / `none` / an inline `base64:` image, after the engine's double-quote stripping) is not a
+///   broken reference — never diagnosed. `icon`/`icon-source` have no such engine-verified
+///   short-circuit and are never treated as sentinels, however they are spelled — see
+///   [`is_asset_sentinel_value`]'s doc comment;
+/// * with **no** `doc_dir` (a non-`file:` document) — nothing is resolvable, so nothing is
+///   diagnosed;
+/// * with **no detected OTClient install root** ([`detect_client_roots`]) — a `/`-rooted path has no
+///   trustworthy data root to resolve against (the workspace root the editor opened is *not* the
+///   client root; see [`find_client_root`]'s doc comment), so nothing is claimed missing at all
+///   (Finding 2 — silence, not noise, exactly like the no-workspace-root case it replaces);
+/// * a workspace containing any mounted `*.otpkg` archive ([`otpkg_present_under_cached`]) — an
+///   asset shipped inside one is invisible to the raw filesystem probe, so the whole document's
+///   findings are suppressed rather than risk flagging an asset that does exist, just not where we
+///   can see it (Finding 3).
+fn missing_asset_diagnostics(
+    asset_links: Vec<PathRef>,
+    text: &str,
+    doc_dir: Option<&Path>,
+    workspace_roots: &[PathBuf],
+    otpkg_cache: &RwLock<HashMap<PathBuf, bool>>,
+    encoding: PositionEncoding,
+) -> Vec<LspDiagnostic> {
+    let Some(doc_dir) = doc_dir else {
+        return Vec::new();
+    };
+    let client_roots = detect_client_roots(Some(doc_dir), workspace_roots);
+    if client_roots.is_empty() {
+        return Vec::new();
+    }
+
+    let missing: Vec<PathRef> = asset_links
+        .into_iter()
+        .filter(|link| !is_runtime_variable_path(&link.path))
+        .filter(|link| !is_asset_sentinel_value(link.key, &link.path))
+        .filter(|link| {
+            !resolve_asset_candidates(&link.path, doc_dir, &client_roots)
+                .into_iter()
+                .any(|candidate| candidate.is_file())
+        })
+        .collect();
+    if missing.is_empty() {
+        return Vec::new();
+    }
+    if client_roots
+        .iter()
+        .any(|root| otpkg_present_under_cached(otpkg_cache, root))
+    {
+        return Vec::new();
+    }
+
+    let index = LineIndex::new(text);
+    missing
+        .into_iter()
+        .map(|link| LspDiagnostic {
+            range: index.range(link.span.start, link.span.end, encoding),
+            severity: Some(DiagnosticSeverity::WARNING),
+            code: Some(NumberOrString::String("missing-asset".to_owned())),
+            code_description: None,
+            source: Some(convert::DIAGNOSTIC_SOURCE.to_owned()),
+            message: format!("Asset not found on disk: {}", link.path),
+            related_information: None,
+            tags: None,
+            data: None,
+        })
+        .collect()
 }
 
 /// Read an indexable file (`.otui` or `.lua`) from disk, or `None` when it cannot / should not be
@@ -1435,6 +1676,79 @@ fn render_property_hover(
     }
 }
 
+/// Format a [`PathRef`] (an asset path *value* under the cursor) into an LSP Markdown [`Hover`] —
+/// the sprite-preview hover. `resolved` is the on-disk target file, already found by the caller via
+/// [`resolve_asset_candidates`] (the same resolution `document_link` and the missing-asset
+/// diagnostic use); `None` when it could not be resolved, in which case only the path text is
+/// shown — no image, no "not found" note (that claim belongs to the missing-asset diagnostic, which
+/// unlike this hover only fires with a workspace root to back it).
+///
+/// **Client-dependent rendering, by design**: this embeds the resolved file as Markdown image
+/// syntax (`![](<file:///…>)`). Whether the connected editor actually renders that inline (as
+/// opposed to a plain link, or nothing) is entirely up to the client's Markdown renderer — this
+/// crate has no way to verify it, and no test here proves an image appears on screen. The
+/// `![]( … )` line is isolated to the branch below so swapping it for a plain clickable link
+/// (`[Open asset](<file:///…>)`) — the safe fallback if a target client does not render inline
+/// images from hover Markdown — is a one-line change.
+///
+/// **The destination is wrapped in `<…>`** (CommonMark's angle-bracket link-destination form),
+/// deliberately: `url::Url::from_file_path` does not percent-encode `(`/`)` (they are RFC 3986
+/// sub-delims, outside the WHATWG path percent-encode set — confirmed empirically, not assumed), so
+/// a raw `![](file:///…)` destination closes early at the first `)` in the path — whether that `)`
+/// comes from a hostile file name in a cloned repository, or from something as ordinary as a
+/// workspace living under a directory like `Program Files (x86)`. `)` is legal inside `<…>`, and `<`
+/// / `>` themselves *are* percent-encoded by `url`, so the wrapper cannot itself be forged open by
+/// the URI's own content. `path_ref.path` (the raw, untrusted document text) is similarly fenced
+/// into a code span wide enough that it cannot be closed early — see [`code_span`].
+fn render_asset_hover(
+    path_ref: &PathRef,
+    resolved: Option<&Path>,
+    line_index: &LineIndex,
+    encoding: PositionEncoding,
+) -> Hover {
+    let mut value = format!("**Asset** {}", code_span(&path_ref.path));
+    if let Some(target_uri) = resolved.and_then(uri_from_file_path) {
+        // Sprite preview: an inline image if the client's Markdown renderer supports it (see the
+        // doc comment above — unverified here, client-dependent).
+        value.push_str(&format!("\n\n![](<{}>)", target_uri.as_str()));
+    }
+    Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value,
+        }),
+        range: Some(line_index.range(path_ref.span.start, path_ref.span.end, encoding)),
+    }
+}
+
+/// Wrap untrusted `text` in a Markdown inline code span using a backtick fence one character longer
+/// than the longest run of backticks `text` itself contains — the CommonMark-mandated way to fence
+/// arbitrary text so a literal backtick inside it can never close the span early. `text` here is
+/// `path_ref.path`, raw document content: a crafted value like `` x` <b>evil</b> `y `` would
+/// otherwise close a fixed single-backtick span after `x` and let the rest render as live Markdown/
+/// HTML in the hover. A leading/trailing space is always added around the content, which CommonMark
+/// requires when the content itself starts or ends with a backtick (or is empty) and is otherwise
+/// harmless (CommonMark trims exactly one such space back off on render).
+///
+/// Newlines are collapsed to spaces first. A block-scalar value (`image-source: |`) can carry a
+/// blank line into `path_ref.path`, and a code span cannot span a blank line — the fence would be
+/// left open and everything after the blank line would render as a live paragraph. Backtick fencing
+/// alone does not close that hole; flattening to a single line does.
+fn code_span(text: &str) -> String {
+    let text: String = text
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    let longest_backtick_run = text
+        .as_bytes()
+        .split(|&b| b != b'`')
+        .map(<[u8]>::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat(longest_backtick_run + 1);
+    format!("{fence} {text} {fence}")
+}
+
 /// Append an "Inherits from `Base`" line (marking a native base as `(built-in)`) when `inherits` is
 /// present; a no-op otherwise.
 fn append_inherits(value: &mut String, inherits: Option<&Inheritance>) {
@@ -1969,6 +2283,7 @@ impl Backend {
             let documents = Arc::clone(&self.documents);
             let reindex_guard = Arc::clone(&self.reindex_guard);
             let shutdown = Arc::clone(&self.shutdown);
+            let otpkg_cache = Arc::clone(&self.otpkg_cache);
             let sender = self.sender.clone();
             let encoding = self.encoding();
             // The scan thread holds a `Sender` clone solely to refresh open documents once the
@@ -2061,10 +2376,26 @@ impl Backend {
                 if !open.is_empty() {
                     let styles = style_index.read().expect("style_index lock poisoned");
                     let lua = lua_index.read().expect("lua_index lock poisoned");
+                    // Same asset resolution as `Backend::publish`: the workspace roots computed once
+                    // for the whole refresh batch, each document's own directory computed per-URI.
+                    let workspace_roots: Vec<PathBuf> =
+                        roots.iter().filter_map(uri_to_file_path).collect();
                     for (uri, text, version) in open {
+                        let doc_dir =
+                            uri_to_file_path(&uri).and_then(|p| p.parent().map(Path::to_path_buf));
                         compute_and_send_diagnostics(
-                            &sender, &service, &styles, &lua, &documents, encoding, uri, &text,
+                            &sender,
+                            &service,
+                            &styles,
+                            &lua,
+                            &documents,
+                            encoding,
+                            uri,
+                            &text,
                             version,
+                            doc_dir.as_deref(),
+                            &workspace_roots,
+                            &otpkg_cache,
                         );
                     }
                 }
@@ -2219,24 +2550,17 @@ impl Backend {
         // Only `file://` documents have a directory to resolve relative paths against.
         let doc_path = uri_to_file_path(&uri)?;
         let doc_dir = doc_path.parent()?.to_path_buf();
-        // The workspace roots as filesystem paths (the heuristic "data root" for `/`-rooted paths).
-        let workspace_roots: Vec<PathBuf> = self
-            .roots
-            .lock()
-            .expect("roots mutex poisoned")
-            .iter()
-            .filter_map(uri_to_file_path)
-            .collect();
+        let data_roots = self.asset_data_roots(&doc_dir);
 
         let encoding = self.encoding();
         let index = LineIndex::new(&text);
         let mut links = Vec::new();
-        for PathRef { span, path } in self.service.document_links(&text) {
+        for PathRef { span, path, .. } in self.service.document_links(&text) {
             // Pure resolution → candidate filesystem paths; the `.is_file()` I/O is the only fs work,
             // kept thin here (a handful of links per document). `is_file()` (not `exists()`) so a path
             // resolving to a directory is not linked — a directory target isn't openable and would be
             // the very dead link this feature avoids.
-            let Some(target_path) = resolve_asset_candidates(&path, &doc_dir, &workspace_roots)
+            let Some(target_path) = resolve_asset_candidates(&path, &doc_dir, &data_roots)
                 .into_iter()
                 .find(|candidate| candidate.is_file())
             else {
@@ -2564,8 +2888,27 @@ impl Backend {
         drop(index);
         // Not a style token — fall back to a property-key hover (value type from the catalog/schema
         // metadata; no workspace index needed).
-        let pdesc = self.service.property_hover_at(&text, offset)?;
-        Some(render_property_hover(&pdesc, &line_index, encoding))
+        if let Some(pdesc) = self.service.property_hover_at(&text, offset) {
+            return Some(render_property_hover(&pdesc, &line_index, encoding));
+        }
+        // Not a property key either — is the cursor on an asset path *value* (a sprite-preview
+        // hover)? Same resolution as `document_link`/the missing-asset diagnostic; unlike the
+        // diagnostic this is not a claim of absence, so it degrades silently (no image, no note) when
+        // the path cannot be resolved rather than requiring a workspace root up front.
+        let path_ref = self.service.asset_ref_at(&text, offset)?;
+        let doc_dir = uri_to_file_path(&uri).and_then(|p| p.parent().map(Path::to_path_buf));
+        let resolved = doc_dir.and_then(|doc_dir| {
+            let data_roots = self.asset_data_roots(&doc_dir);
+            resolve_asset_candidates(&path_ref.path, &doc_dir, &data_roots)
+                .into_iter()
+                .find(|candidate| candidate.is_file())
+        });
+        Some(render_asset_hover(
+            &path_ref,
+            resolved.as_deref(),
+            &line_index,
+            encoding,
+        ))
     }
 
     fn completion(&self, params: CompletionParams) -> Option<CompletionResponse> {
@@ -5306,70 +5649,179 @@ end
     }
 
     // --- document links -----------------------------------------------------
+    //
+    // `resolve_asset_candidates`, `is_asset_sentinel_value` and `is_runtime_variable_path` moved to
+    // `otui_core::links` (CodeRabbit Finding 4 on PR #51 — pure OTML/OTClient path semantics with no
+    // I/O belong in the engine crate, not the transport crate). Their unit tests moved with them;
+    // see `otui_core::links::tests`.
 
     #[test]
-    fn resolve_asset_candidates_maps_rooted_path_against_workspace_roots() {
-        // A `/`-rooted OTClient "absolute" path is joined onto each workspace root with the leading
-        // `/` stripped — never against the doc dir.
-        let doc_dir = Path::new("/project/modules/game_things");
-        let roots = vec![PathBuf::from("/data-a"), PathBuf::from("/data-b")];
-        let candidates = resolve_asset_candidates("/images/ui/window.png", doc_dir, &roots);
+    fn detect_client_roots_uses_only_the_docs_own_client_root_not_unrelated_workspace_roots() {
+        // Finding 1: a workspace can legitimately contain more than one OTClient install (e.g. two
+        // client checkouts side by side as separate workspace folders). A document inside root A must
+        // resolve against root A alone — an asset that happens to exist under an unrelated root B
+        // must never be folded in, or it could suppress a legitimate `missing-asset` finding for A,
+        // or redirect a link/hover to the wrong tree entirely.
+        let base = std::env::temp_dir().join(format!(
+            "otui-two-client-roots-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let root_a = base.join("client-a");
+        let root_b = base.join("client-b");
+        for root in [&root_a, &root_b] {
+            std::fs::create_dir_all(root.join("data")).expect("mkdir data");
+            std::fs::create_dir_all(root.join("modules")).expect("mkdir modules");
+            std::fs::write(root.join("init.lua"), b"-- stand-in\n").expect("init.lua");
+        }
+        let doc_dir = root_a.join("modules").join("game_x");
+        std::fs::create_dir_all(&doc_dir).expect("mkdir doc dir");
+
+        let workspace_roots = vec![root_a.clone(), root_b.clone()];
+        let detected = detect_client_roots(Some(&doc_dir), &workspace_roots);
         assert_eq!(
-            candidates,
-            vec![
-                PathBuf::from("/data-a/images/ui/window.png"),
-                PathBuf::from("/data-b/images/ui/window.png"),
-            ]
+            detected,
+            vec![root_a.clone()],
+            "a document under root A must resolve against root A alone, not both: {detected:?}"
         );
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
-    fn resolve_asset_candidates_maps_relative_path_against_doc_dir() {
-        // A relative path resolves against the current file's directory, ignoring workspace roots.
-        let doc_dir = Path::new("/project/modules/game_things");
-        let roots = vec![PathBuf::from("/data-root")];
-        let candidates = resolve_asset_candidates("sprites/ok.png", doc_dir, &roots);
-        assert_eq!(
-            candidates,
-            vec![PathBuf::from("/project/modules/game_things/sprites/ok.png")]
-        );
+    fn detect_client_roots_falls_back_to_scanning_workspace_roots_with_no_doc_client_root() {
+        // The preserved fallback: when the document itself has no client root above it (e.g. a
+        // request with no real document context), every workspace root is still scanned and
+        // deduplicated, exactly as before Finding 1.
+        let base = std::env::temp_dir().join(format!(
+            "otui-client-root-fallback-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let root = base.join("client");
+        std::fs::create_dir_all(root.join("data")).expect("mkdir data");
+        std::fs::create_dir_all(root.join("modules")).expect("mkdir modules");
+        std::fs::write(root.join("init.lua"), b"-- stand-in\n").expect("init.lua");
+        let unrelated_doc_dir = base.join("nowhere");
+        std::fs::create_dir_all(&unrelated_doc_dir).expect("mkdir unrelated");
+
+        let workspace_roots = vec![root.clone()];
+        let detected = detect_client_roots(Some(&unrelated_doc_dir), &workspace_roots);
+        assert_eq!(detected, vec![root]);
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
-    fn resolve_asset_candidates_rooted_with_no_workspace_yields_nothing() {
-        // Offline, a `/`-rooted path has no data root to resolve against when no workspace is open.
-        let candidates = resolve_asset_candidates("/images/x.png", Path::new("/project/sub"), &[]);
-        assert!(candidates.is_empty());
+    fn otpkg_present_under_cached_memoizes_the_walk_per_root() {
+        // Finding 3: the same root queried twice must not re-walk the filesystem — proven here by
+        // deleting the archive between calls; a cached `true` must survive the deletion (the whole
+        // point of memoizing), while a fresh `otpkg_present_under` call would see `false`.
+        let base = std::env::temp_dir().join(format!(
+            "otui-otpkg-cache-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let mods = base.join("mods");
+        std::fs::create_dir_all(&mods).expect("mkdir");
+        let archive = mods.join("bundle.otpkg");
+        std::fs::write(&archive, b"not a real zip").expect("write");
+
+        let cache: RwLock<HashMap<PathBuf, bool>> = RwLock::new(HashMap::new());
+        assert!(otpkg_present_under_cached(&cache, &base));
+
+        std::fs::remove_file(&archive).expect("remove archive");
+        assert!(
+            otpkg_present_under_cached(&cache, &base),
+            "a cached hit must not be invalidated by a later on-disk change"
+        );
+        // The uncached function, called fresh, now correctly reports no archive — proving the cache
+        // (not some other effect) is what kept the first assertion `true`.
+        assert!(!otpkg_present_under(&base));
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
-    fn resolve_asset_candidates_appends_png_to_an_extensionless_path() {
-        // OTUI authors omit the extension; the engine appends `.png`. The `.png` variant is probed
-        // first, then the literal as a fallback.
-        let roots = vec![PathBuf::from("/data")];
-        let candidates =
-            resolve_asset_candidates("/images/ui/button", Path::new("/project"), &roots);
-        assert_eq!(
-            candidates,
-            vec![
-                PathBuf::from("/data/images/ui/button.png"),
-                PathBuf::from("/data/images/ui/button"),
-            ]
-        );
+    fn find_client_root_walks_up_from_a_nested_directory_to_the_install_root() {
+        // Finding 2: the install root is `init.lua` + `data/` + `modules/` together — verified
+        // against the real `init.lua` (`g_resources.addSearchPath(getWorkDir() .. 'data' |
+        // 'modules', true)`, both unconditional and fatal if missing).
+        let base = std::env::temp_dir().join(format!(
+            "otui-client-root-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let nested = base.join("modules").join("game_x");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+        std::fs::write(base.join("init.lua"), b"-- stand-in\n").expect("init.lua");
+        std::fs::create_dir_all(base.join("data")).expect("mkdir data");
+        std::fs::create_dir_all(base.join("modules")).expect("mkdir modules");
+
+        assert_eq!(find_client_root(&nested), Some(base.clone()));
+        assert_eq!(find_client_root(&base), Some(base.clone()));
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
-    fn resolve_asset_candidates_keeps_an_explicit_extension_as_is() {
-        // A path that already carries an extension is probed verbatim — no `.png.png`.
-        let candidates = resolve_asset_candidates(
-            "sprites/ok.png",
-            Path::new("/project/mod"),
-            &[PathBuf::from("/data")],
-        );
-        assert_eq!(
-            candidates,
-            vec![PathBuf::from("/project/mod/sprites/ok.png")]
-        );
+    fn find_client_root_is_none_for_a_standalone_module_with_no_markers_above_it() {
+        // The scenario Finding 2 exists for: a module or mod repository opened on its own has no
+        // `init.lua`/`data`/`modules` anywhere above it.
+        let base = std::env::temp_dir().join(format!(
+            "otui-no-client-root-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&base).expect("mkdir");
+        assert_eq!(find_client_root(&base), None);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn find_client_root_requires_init_lua_not_just_the_two_directories() {
+        // `data/` + `modules/` without `init.lua` is not enough — a coincidental pair of
+        // similarly-named directories must not be mistaken for the install root.
+        let base = std::env::temp_dir().join(format!(
+            "otui-client-root-no-init-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(base.join("data")).expect("mkdir data");
+        std::fs::create_dir_all(base.join("modules")).expect("mkdir modules");
+        assert_eq!(find_client_root(&base), None);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn otpkg_present_under_finds_an_archive_nested_under_a_subdirectory() {
+        let base = std::env::temp_dir().join(format!(
+            "otui-otpkg-present-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let mods = base.join("mods");
+        std::fs::create_dir_all(&mods).expect("mkdir");
+        std::fs::write(mods.join("bundle.otpkg"), b"not a real zip").expect("write");
+
+        assert!(otpkg_present_under(&base));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn otpkg_present_under_is_false_with_no_archive_anywhere() {
+        let base = std::env::temp_dir().join(format!(
+            "otui-otpkg-absent-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(base.join("images")).expect("mkdir");
+        std::fs::write(base.join("images").join("a.png"), b"png").expect("write");
+
+        assert!(!otpkg_present_under(&base));
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
