@@ -10,7 +10,7 @@ use std::error::Error;
 
 use lsp_server::{Connection, Notification};
 use lsp_types::InitializeParams;
-use otui_lsp_server::{serve, Backend};
+use otui_lsp_server::{Backend, serve};
 
 fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
     // The transport: a pair of crossbeam channels wired to stdin/stdout by dedicated I/O threads.

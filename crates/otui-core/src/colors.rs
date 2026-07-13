@@ -58,10 +58,10 @@ pub fn document_colors(source: &str) -> Vec<(ByteSpan, Rgba)> {
 fn collect(node: Node<'_>, source: &str, out: &mut Vec<(ByteSpan, Rgba)>) {
     if node.kind() == "color" {
         push_color(node, source, out);
-    } else if node.kind() == "property" {
-        if let Some(value) = color_typed_value(node, source) {
-            collect_named_in_value(value, source, out);
-        }
+    } else if node.kind() == "property"
+        && let Some(value) = color_typed_value(node, source)
+    {
+        collect_named_in_value(value, source, out);
     }
 
     let mut cursor = node.walk();

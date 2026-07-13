@@ -238,21 +238,21 @@ fn collect_instantiated_ids(
             .map(|n| slice(source, n).to_owned()),
         _ => None,
     };
-    if let Some(type_name) = instantiated {
-        if seen_types.insert(type_name.clone()) {
-            let ancestry = resolve_ancestry(&type_name, styles, lua);
-            for ancestor in &ancestry.chain {
-                for (doc, def) in styles.lookup(ancestor) {
-                    for body_id in &def.body_ids {
-                        out.push(VisibleId {
-                            id: body_id.id.clone(),
-                            span: body_id.span,
-                            origin: IdOrigin::InheritedStyle {
-                                style: ancestor.clone(),
-                                doc: doc.clone(),
-                            },
-                        });
-                    }
+    if let Some(type_name) = instantiated
+        && seen_types.insert(type_name.clone())
+    {
+        let ancestry = resolve_ancestry(&type_name, styles, lua);
+        for ancestor in &ancestry.chain {
+            for (doc, def) in styles.lookup(ancestor) {
+                for body_id in &def.body_ids {
+                    out.push(VisibleId {
+                        id: body_id.id.clone(),
+                        span: body_id.span,
+                        origin: IdOrigin::InheritedStyle {
+                            style: ancestor.clone(),
+                            doc: doc.clone(),
+                        },
+                    });
                 }
             }
         }
@@ -444,8 +444,7 @@ mod tests {
         // over-indented under a plain `key:` property (e.g. `visible: false`) parents to a
         // `property` node, unique for the same reason as `$state:` — its line has a `:` — so the
         // engine never creates it and the id must not be offered as a navigation target.
-        let local_doc =
-            "CharacterTitles < UIWidget\n  visible: false\n    VerticalScrollBar\n      \
+        let local_doc = "CharacterTitles < UIWidget\n  visible: false\n    VerticalScrollBar\n      \
              id: ListScrollbar\n";
         assert!(visible_ids(local_doc, &StyleIndex::new(), &no_lua()).is_empty());
 
@@ -551,8 +550,8 @@ mod tests {
     }
 
     #[test]
-    fn a_lua_defined_parent_with_its_own_otui_style_body_contributes_ids_only_with_a_real_lua_index(
-    ) {
+    fn a_lua_defined_parent_with_its_own_otui_style_body_contributes_ids_only_with_a_real_lua_index()
+     {
         // MyTable < UITable: UITable has no .otui def, so the .otui chain dead-ends at it as a
         // native class (resolve_ancestry's `is_native_base` heuristic). UITable's *Lua* parent is
         // UIScrollArea -- an otherwise Lua-only class that, unusually, also has its own .otui style

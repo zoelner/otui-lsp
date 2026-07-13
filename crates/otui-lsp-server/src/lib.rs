@@ -65,19 +65,19 @@ use lsp_types::{
     CodeLens, CodeLensOptions, CodeLensParams, Command, InlayHint, InlayHintKind, InlayHintLabel,
     InlayHintParams,
 };
+use otui_core::OtuiService;
 use otui_core::fixes::Fix;
 use otui_core::hover::{Inheritance, StyleHover, StyleHoverKind};
-use otui_core::ids::{visible_ids, IdOrigin};
+use otui_core::ids::{IdOrigin, visible_ids};
 use otui_core::inlay::ancestor_hints;
 use otui_core::lenses::style_lenses;
 use otui_core::links::{
-    is_asset_sentinel_value, is_runtime_variable_path, resolve_asset_candidates, PathRef,
+    PathRef, is_asset_sentinel_value, is_runtime_variable_path, resolve_asset_candidates,
 };
-use otui_core::lua_refs::{scan_id_refs, LuaRefIndex};
+use otui_core::lua_refs::{LuaRefIndex, scan_id_refs};
 use otui_core::lua_widgets::LuaWidgetIndex;
 use otui_core::property_hover::{PropertyHover, PropertyValueKind};
-use otui_core::style_index::{is_native_base, DocId, StyleDef, StyleIndex};
-use otui_core::OtuiService;
+use otui_core::style_index::{DocId, StyleDef, StyleIndex, is_native_base};
 
 use crate::position::{LineIndex, PositionEncoding};
 
@@ -694,10 +694,9 @@ impl Backend {
             .read()
             .expect("documents lock poisoned")
             .get(uri)
+            && doc.language == Language::Lua
         {
-            if doc.language == Language::Lua {
-                return Some(doc.text.clone());
-            }
+            return Some(doc.text.clone());
         }
         self.lua_texts
             .read()
@@ -964,10 +963,10 @@ pub fn detect_client_roots(doc_dir: Option<&Path>, workspace_roots: &[PathBuf]) 
     }
     let mut out: Vec<PathBuf> = Vec::new();
     for start in workspace_roots {
-        if let Some(root) = find_client_root(start) {
-            if !out.contains(&root) {
-                out.push(root);
-            }
+        if let Some(root) = find_client_root(start)
+            && !out.contains(&root)
+        {
+            out.push(root);
         }
     }
     out
@@ -1193,12 +1192,12 @@ fn collect_files_under(dir: &Path, ext: &str, out: &mut HashMap<Uri, String>) {
         }
         if meta.is_dir() {
             collect_files_under(&path, ext, out);
-        } else if meta.is_file() && path.extension().is_some_and(|e| e == ext) {
-            if let Some(uri) = uri_from_file_path(&path) {
-                if let Some(text) = read_indexed_file(&uri) {
-                    out.insert(uri, text);
-                }
-            }
+        } else if meta.is_file()
+            && path.extension().is_some_and(|e| e == ext)
+            && let Some(uri) = uri_from_file_path(&path)
+            && let Some(text) = read_indexed_file(&uri)
+        {
+            out.insert(uri, text);
         }
     }
 }
@@ -1208,10 +1207,10 @@ fn collect_files_under(dir: &Path, ext: &str, out: &mut HashMap<Uri, String>) {
 /// folder, and the server falls back to open-docs-only indexing.
 #[allow(deprecated)] // `InitializeParams.root_uri` is the mandatory legacy fallback; still read.
 fn workspace_roots(params: &InitializeParams) -> Vec<Uri> {
-    if let Some(folders) = &params.workspace_folders {
-        if !folders.is_empty() {
-            return folders.iter().map(|f| f.uri.clone()).collect();
-        }
+    if let Some(folders) = &params.workspace_folders
+        && !folders.is_empty()
+    {
+        return folders.iter().map(|f| f.uri.clone()).collect();
     }
     params.root_uri.clone().into_iter().collect()
 }
@@ -1573,15 +1572,13 @@ fn collect_references(
                 return out;
             };
             let occ = service.id_occurrences(&doc.text, id);
-            if include_declaration {
-                if let Some(span) = occ.declaration {
-                    out.push(convert::location_of(
-                        current_uri.clone(),
-                        &doc.text,
-                        span,
-                        encoding,
-                    ));
-                }
+            if include_declaration && let Some(span) = occ.declaration {
+                out.push(convert::location_of(
+                    current_uri.clone(),
+                    &doc.text,
+                    span,
+                    encoding,
+                ));
             }
             for span in occ.anchor_refs {
                 out.push(convert::location_of(
@@ -2121,7 +2118,7 @@ fn client_supports_inlay_hint_refresh(params: &InitializeParams) -> bool {
 /// mismatch can fail — reported as `InvalidParams`) and wraps the handler's return value in
 /// `Response::new_ok`. `$handler` is a closure `|params| -> impl Serialize`.
 macro_rules! reply {
-    ($req:expr, $method:literal, $ty:ty, $handler:expr) => {{
+    ($req:expr_2021, $method:literal, $ty:ty, $handler:expr_2021) => {{
         let req = $req;
         let fallback_id = req.id.clone();
         match req.extract::<$ty>($method) {
@@ -4037,10 +4034,10 @@ mod tests {
     fn drain_has_refresh_request(rx: &crossbeam_channel::Receiver<Message>, method: &str) -> bool {
         let mut found = false;
         while let Ok(msg) = rx.try_recv() {
-            if let Message::Request(req) = msg {
-                if req.method == method {
-                    found = true;
-                }
+            if let Message::Request(req) = msg
+                && req.method == method
+            {
+                found = true;
             }
         }
         found
@@ -4475,13 +4472,13 @@ mod tests {
         // fixture would trip.
         let mut published = None;
         while let Ok(msg) = rx.try_recv() {
-            if let Message::Notification(note) = msg {
-                if note.method == "textDocument/publishDiagnostics" {
-                    let params: PublishDiagnosticsParams =
-                        serde_json::from_value(note.params).expect("diagnostics params");
-                    if params.uri == uri {
-                        published = Some(params.diagnostics);
-                    }
+            if let Message::Notification(note) = msg
+                && note.method == "textDocument/publishDiagnostics"
+            {
+                let params: PublishDiagnosticsParams =
+                    serde_json::from_value(note.params).expect("diagnostics params");
+                if params.uri == uri {
+                    published = Some(params.diagnostics);
                 }
             }
         }
@@ -4517,96 +4514,120 @@ mod tests {
             end: position,
         };
 
-        assert!(backend
-            .semantic_tokens_full(SemanticTokensParams {
-                text_document: text_document.clone(),
-                work_done_progress_params: WorkDoneProgressParams::default(),
-                partial_result_params: PartialResultParams::default(),
-            })
-            .is_none());
-        assert!(backend
-            .document_symbol(DocumentSymbolParams {
-                text_document: text_document.clone(),
-                work_done_progress_params: WorkDoneProgressParams::default(),
-                partial_result_params: PartialResultParams::default(),
-            })
-            .is_none());
-        assert!(backend
-            .document_color(DocumentColorParams {
-                text_document: text_document.clone(),
-                work_done_progress_params: WorkDoneProgressParams::default(),
-                partial_result_params: PartialResultParams::default(),
-            })
-            .is_empty());
+        assert!(
+            backend
+                .semantic_tokens_full(SemanticTokensParams {
+                    text_document: text_document.clone(),
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                })
+                .is_none()
+        );
+        assert!(
+            backend
+                .document_symbol(DocumentSymbolParams {
+                    text_document: text_document.clone(),
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                })
+                .is_none()
+        );
+        assert!(
+            backend
+                .document_color(DocumentColorParams {
+                    text_document: text_document.clone(),
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                })
+                .is_empty()
+        );
         assert!(backend.document_link(link_params(&uri)).is_none());
-        assert!(backend
-            .color_presentation(ColorPresentationParams {
-                text_document: text_document.clone(),
-                color: Color {
-                    red: 1.0,
-                    green: 1.0,
-                    blue: 1.0,
-                    alpha: 1.0,
-                },
-                range,
-                work_done_progress_params: WorkDoneProgressParams::default(),
-                partial_result_params: PartialResultParams::default(),
-            })
-            .is_empty());
-        assert!(backend
-            .folding_range(FoldingRangeParams {
-                text_document: text_document.clone(),
-                work_done_progress_params: WorkDoneProgressParams::default(),
-                partial_result_params: PartialResultParams::default(),
-            })
-            .is_none());
-        assert!(backend
-            .goto_definition(GotoDefinitionParams {
-                text_document_position_params: text_document_position.clone(),
-                work_done_progress_params: WorkDoneProgressParams::default(),
-                partial_result_params: PartialResultParams::default(),
-            })
-            .is_none());
-        assert!(backend
-            .goto_type_definition(GotoTypeDefinitionParams {
-                text_document_position_params: text_document_position.clone(),
-                work_done_progress_params: WorkDoneProgressParams::default(),
-                partial_result_params: PartialResultParams::default(),
-            })
-            .is_none());
-        assert!(backend
-            .goto_implementation(GotoImplementationParams {
-                text_document_position_params: text_document_position.clone(),
-                work_done_progress_params: WorkDoneProgressParams::default(),
-                partial_result_params: PartialResultParams::default(),
-            })
-            .is_none());
-        assert!(backend
-            .prepare_type_hierarchy(TypeHierarchyPrepareParams {
-                text_document_position_params: text_document_position.clone(),
-                work_done_progress_params: WorkDoneProgressParams::default(),
-            })
-            .is_none());
-        assert!(backend
-            .references(ReferenceParams {
-                text_document_position: text_document_position.clone(),
-                work_done_progress_params: WorkDoneProgressParams::default(),
-                partial_result_params: PartialResultParams::default(),
-                context: ReferenceContext {
-                    include_declaration: true,
-                },
-            })
-            .is_none());
-        assert!(backend
-            .document_highlight(DocumentHighlightParams {
-                text_document_position_params: text_document_position.clone(),
-                work_done_progress_params: WorkDoneProgressParams::default(),
-                partial_result_params: PartialResultParams::default(),
-            })
-            .is_none());
-        assert!(backend
-            .prepare_rename(text_document_position.clone())
-            .is_none());
+        assert!(
+            backend
+                .color_presentation(ColorPresentationParams {
+                    text_document: text_document.clone(),
+                    color: Color {
+                        red: 1.0,
+                        green: 1.0,
+                        blue: 1.0,
+                        alpha: 1.0,
+                    },
+                    range,
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                })
+                .is_empty()
+        );
+        assert!(
+            backend
+                .folding_range(FoldingRangeParams {
+                    text_document: text_document.clone(),
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                })
+                .is_none()
+        );
+        assert!(
+            backend
+                .goto_definition(GotoDefinitionParams {
+                    text_document_position_params: text_document_position.clone(),
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                })
+                .is_none()
+        );
+        assert!(
+            backend
+                .goto_type_definition(GotoTypeDefinitionParams {
+                    text_document_position_params: text_document_position.clone(),
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                })
+                .is_none()
+        );
+        assert!(
+            backend
+                .goto_implementation(GotoImplementationParams {
+                    text_document_position_params: text_document_position.clone(),
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                })
+                .is_none()
+        );
+        assert!(
+            backend
+                .prepare_type_hierarchy(TypeHierarchyPrepareParams {
+                    text_document_position_params: text_document_position.clone(),
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                })
+                .is_none()
+        );
+        assert!(
+            backend
+                .references(ReferenceParams {
+                    text_document_position: text_document_position.clone(),
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                    context: ReferenceContext {
+                        include_declaration: true,
+                    },
+                })
+                .is_none()
+        );
+        assert!(
+            backend
+                .document_highlight(DocumentHighlightParams {
+                    text_document_position_params: text_document_position.clone(),
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                })
+                .is_none()
+        );
+        assert!(
+            backend
+                .prepare_rename(text_document_position.clone())
+                .is_none()
+        );
         assert_eq!(
             backend.rename(RenameParams {
                 text_document_position: text_document_position.clone(),
@@ -4615,37 +4636,49 @@ mod tests {
             }),
             Ok(None)
         );
-        assert!(backend
-            .hover(HoverParams {
-                text_document_position_params: text_document_position.clone(),
-                work_done_progress_params: WorkDoneProgressParams::default(),
-            })
-            .is_none());
-        assert!(backend
-            .completion(completion_params(&uri, position))
-            .is_none());
-        assert!(backend
-            .code_action(CodeActionParams {
-                text_document: text_document.clone(),
-                range,
-                context: CodeActionContext::default(),
-                work_done_progress_params: WorkDoneProgressParams::default(),
-                partial_result_params: PartialResultParams::default(),
-            })
-            .is_none());
-        assert!(backend
-            .formatting(DocumentFormattingParams {
-                text_document: text_document.clone(),
-                options: FormattingOptions::default(),
-                work_done_progress_params: WorkDoneProgressParams::default(),
-            })
-            .is_none());
-        assert!(backend
-            .range_formatting(range_formatting_params(&uri, range))
-            .is_none());
-        assert!(backend
-            .on_type_formatting(on_type_formatting_params(&uri, position, "\n"))
-            .is_none());
+        assert!(
+            backend
+                .hover(HoverParams {
+                    text_document_position_params: text_document_position.clone(),
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                })
+                .is_none()
+        );
+        assert!(
+            backend
+                .completion(completion_params(&uri, position))
+                .is_none()
+        );
+        assert!(
+            backend
+                .code_action(CodeActionParams {
+                    text_document: text_document.clone(),
+                    range,
+                    context: CodeActionContext::default(),
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                })
+                .is_none()
+        );
+        assert!(
+            backend
+                .formatting(DocumentFormattingParams {
+                    text_document: text_document.clone(),
+                    options: FormattingOptions::default(),
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                })
+                .is_none()
+        );
+        assert!(
+            backend
+                .range_formatting(range_formatting_params(&uri, range))
+                .is_none()
+        );
+        assert!(
+            backend
+                .on_type_formatting(on_type_formatting_params(&uri, position, "\n"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -4903,9 +4936,11 @@ mod tests {
         let defs = svc.style_defs(junk);
         index.set_document(DocId::from(uri.to_string()), defs);
         // No top-level `Name < Base` header → no entries for this document.
-        assert!(index
-            .document(&DocId::from(uri.to_string()))
-            .is_none_or(<[StyleDef]>::is_empty));
+        assert!(
+            index
+                .document(&DocId::from(uri.to_string()))
+                .is_none_or(<[StyleDef]>::is_empty)
+        );
         // And a lookup of anything finds nothing from it.
         assert!(index.lookup("garbage").is_empty());
     }
@@ -4986,22 +5021,22 @@ end
     fn drain_diagnostic_codes(rx: &crossbeam_channel::Receiver<Message>, uri: &Uri) -> Vec<String> {
         let mut codes = None;
         while let Ok(msg) = rx.try_recv() {
-            if let Message::Notification(note) = msg {
-                if note.method == "textDocument/publishDiagnostics" {
-                    let params: PublishDiagnosticsParams =
-                        serde_json::from_value(note.params).expect("diagnostics params");
-                    if &params.uri == uri {
-                        codes = Some(
-                            params
-                                .diagnostics
-                                .iter()
-                                .filter_map(|d| match &d.code {
-                                    Some(lsp_types::NumberOrString::String(s)) => Some(s.clone()),
-                                    _ => None,
-                                })
-                                .collect(),
-                        );
-                    }
+            if let Message::Notification(note) = msg
+                && note.method == "textDocument/publishDiagnostics"
+            {
+                let params: PublishDiagnosticsParams =
+                    serde_json::from_value(note.params).expect("diagnostics params");
+                if &params.uri == uri {
+                    codes = Some(
+                        params
+                            .diagnostics
+                            .iter()
+                            .filter_map(|d| match &d.code {
+                                Some(lsp_types::NumberOrString::String(s)) => Some(s.clone()),
+                                _ => None,
+                            })
+                            .collect(),
+                    );
                 }
             }
         }
@@ -5117,16 +5152,16 @@ end
         // Wait (bounded) for a publishDiagnostics addressed to the open document.
         let mut refreshed = false;
         while let Ok(msg) = rx.recv_timeout(Duration::from_secs(5)) {
-            if let Message::Notification(note) = msg {
-                if note.method == "textDocument/publishDiagnostics" {
-                    let params: PublishDiagnosticsParams =
-                        serde_json::from_value(note.params).expect("diagnostics params");
-                    if params.uri == doc_uri {
-                        refreshed = !params.diagnostics.iter().any(|d| {
+            if let Message::Notification(note) = msg
+                && note.method == "textDocument/publishDiagnostics"
+            {
+                let params: PublishDiagnosticsParams =
+                    serde_json::from_value(note.params).expect("diagnostics params");
+                if params.uri == doc_uri {
+                    refreshed = !params.diagnostics.iter().any(|d| {
                             matches!(&d.code, Some(lsp_types::NumberOrString::String(s)) if s == "unknown-property")
                         });
-                        break;
-                    }
+                    break;
                 }
             }
         }
@@ -6276,9 +6311,11 @@ end
         let (index, _) = workspace(&[("file:///a.otui", "MainWindow < UIWindow\n  id: main\n")]);
         let src = "MainWindow < UIWindow\n  id: main\n";
         let offset = src.find("main").expect("present");
-        assert!(OtuiService::new()
-            .style_hover_at(src, offset, &index)
-            .is_none());
+        assert!(
+            OtuiService::new()
+                .style_hover_at(src, offset, &index)
+                .is_none()
+        );
     }
 
     /// Render the property-key hover at `needle` in `text` (the fallback path of the hover handler).
@@ -6830,9 +6867,11 @@ end
             start: Position::new(0, 0),
             end: Position::new(0, 8),
         };
-        assert!(backend
-            .range_formatting(range_formatting_params(&uri, range))
-            .is_none());
+        assert!(
+            backend
+                .range_formatting(range_formatting_params(&uri, range))
+                .is_none()
+        );
     }
 
     #[test]
@@ -6845,9 +6884,11 @@ end
             start: Position::new(0, 0),
             end: Position::new(0, 0),
         };
-        assert!(backend
-            .range_formatting(range_formatting_params(&uri, range))
-            .is_none());
+        assert!(
+            backend
+                .range_formatting(range_formatting_params(&uri, range))
+                .is_none()
+        );
     }
 
     fn on_type_formatting_params(
@@ -6915,9 +6956,11 @@ end
         let text = "Panel\n  id: main\n  ";
         let backend = backend_with_doc(&uri, text, Vec::new());
 
-        assert!(backend
-            .on_type_formatting(on_type_formatting_params(&uri, Position::new(2, 2), "\n"))
-            .is_none());
+        assert!(
+            backend
+                .on_type_formatting(on_type_formatting_params(&uri, Position::new(2, 2), "\n"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -6929,9 +6972,11 @@ end
         let text = "Panel\n\n";
         let backend = backend_with_doc(&uri, text, Vec::new());
 
-        assert!(backend
-            .on_type_formatting(on_type_formatting_params(&uri, Position::new(1, 0), "}"))
-            .is_none());
+        assert!(
+            backend
+                .on_type_formatting(on_type_formatting_params(&uri, Position::new(1, 0), "}"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -6943,9 +6988,11 @@ end
         let text = "Panel\n  @onClick: |\n    self:hide()\n";
         let backend = backend_with_doc(&uri, text, Vec::new());
 
-        assert!(backend
-            .on_type_formatting(on_type_formatting_params(&uri, Position::new(2, 4), "\n"))
-            .is_none());
+        assert!(
+            backend
+                .on_type_formatting(on_type_formatting_params(&uri, Position::new(2, 4), "\n"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -6954,8 +7001,10 @@ end
         let (tx, _rx) = crossbeam_channel::unbounded();
         let backend = Backend::new(tx, &InitializeParams::default());
         let uri = Uri::from_str("file:///nope.otui").expect("uri");
-        assert!(backend
-            .on_type_formatting(on_type_formatting_params(&uri, Position::new(0, 0), "\n"))
-            .is_none());
+        assert!(
+            backend
+                .on_type_formatting(on_type_formatting_params(&uri, Position::new(0, 0), "\n"))
+                .is_none()
+        );
     }
 }

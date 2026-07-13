@@ -1220,7 +1220,7 @@ mod tests {
             assert!(is_layout_type(v), "{v} should be a layout type");
         }
         assert!(is_layout_type("  verticalBox  ")); // trimmed
-                                                    // Exact, case-sensitive: the engine compares the type verbatim.
+        // Exact, case-sensitive: the engine compares the type verbatim.
         assert!(!is_layout_type("verticalbox"));
         assert!(!is_layout_type("VerticalBox"));
     }

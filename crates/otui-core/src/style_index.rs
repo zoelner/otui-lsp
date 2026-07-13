@@ -212,13 +212,13 @@ fn collect_body_ids(node: Node<'_>, source: &str, out: &mut Vec<StyleBodyId>) {
         if is_reparented_onto_a_unique_sibling(child, source) {
             continue;
         }
-        if child.kind() == "id_property" {
-            if let Some(value) = child.child_by_field_name("value") {
-                last_own_id = Some(StyleBodyId {
-                    id: slice(source, value).to_owned(),
-                    span: SyntaxTree::span_of(value),
-                });
-            }
+        if child.kind() == "id_property"
+            && let Some(value) = child.child_by_field_name("value")
+        {
+            last_own_id = Some(StyleBodyId {
+                id: slice(source, value).to_owned(),
+                span: SyntaxTree::span_of(value),
+            });
         }
     }
     out.extend(last_own_id);
@@ -483,8 +483,7 @@ mod tests {
     fn a_duplicate_id_does_not_suppress_an_unrelated_sibling_widgets_id() {
         // Last-wins is scoped to the widget the duplicate `id:` lines are written directly on --
         // it must not reach across to a different, unrelated widget's own single `id:`.
-        let src =
-            "MiniWindow < UIMiniWindow\n  Header\n    id: first\n    id: second\n  Footer\n    \
+        let src = "MiniWindow < UIMiniWindow\n  Header\n    id: first\n    id: second\n  Footer\n    \
                     id: footerId\n";
         let defs = defs_of(src);
         let ids: Vec<&str> = defs[0].body_ids.iter().map(|b| b.id.as_str()).collect();

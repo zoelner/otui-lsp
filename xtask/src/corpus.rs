@@ -7,12 +7,12 @@
 //! here rather than coming out of that pass.
 //!
 //! Usage: `cargo xtask corpus --src <engine-source-root>`
-use otui_core::diagnostics::{analyze_with_widgets, WidgetContext};
+use otui_core::diagnostics::{WidgetContext, analyze_with_widgets};
 use otui_core::links::{
     document_links, is_asset_sentinel_value, is_runtime_variable_path, resolve_asset_candidates,
 };
-use otui_core::lua_widgets::{scan_widgets, LuaWidgetIndex};
-use otui_core::style_index::{extract_style_defs, StyleIndex};
+use otui_core::lua_widgets::{LuaWidgetIndex, scan_widgets};
+use otui_core::style_index::{StyleIndex, extract_style_defs};
 use otui_core::syntax::SyntaxTree;
 // `detect_client_roots`/`otpkg_present_under` do real filesystem I/O (walking ancestor directories,
 // recursively scanning for `.otpkg`), so — per the workspace's hard rule that `otui-core` stays
@@ -30,10 +30,10 @@ pub fn run(root: &Path) {
     let mut styles = StyleIndex::new();
     let mut luas = LuaWidgetIndex::new();
     for f in &otui {
-        if let Ok(s) = std::fs::read_to_string(f) {
-            if let Some(t) = SyntaxTree::parse(&s) {
-                styles.set_document(f.display().to_string(), extract_style_defs(&t));
-            }
+        if let Ok(s) = std::fs::read_to_string(f)
+            && let Some(t) = SyntaxTree::parse(&s)
+        {
+            styles.set_document(f.display().to_string(), extract_style_defs(&t));
         }
     }
     for f in &lua {

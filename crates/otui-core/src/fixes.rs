@@ -216,7 +216,7 @@ pub fn edit_distance(a: &str, b: &str) -> usize {
             let mut best = (d[i - 1][j] + 1) // deletion
                 .min(d[i][j - 1] + 1) // insertion
                 .min(d[i - 1][j - 1] + cost); // substitution
-                                              // Adjacent transposition (`ab` <-> `ba`).
+            // Adjacent transposition (`ab` <-> `ba`).
             if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
                 best = best.min(d[i - 2][j - 2] + 1);
             }

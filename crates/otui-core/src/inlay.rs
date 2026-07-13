@@ -88,7 +88,7 @@ pub fn ancestor_hints(
 mod tests {
     use super::*;
     use crate::lua_widgets::scan_widgets;
-    use crate::style_index::{extract_style_defs, DocId};
+    use crate::style_index::{DocId, extract_style_defs};
 
     fn styles(docs: &[(&str, &str)]) -> StyleIndex {
         let mut index = StyleIndex::new();

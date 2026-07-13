@@ -19,7 +19,7 @@
 
 use crate::lua_widgets::LuaWidgetIndex;
 use crate::schema;
-use crate::style_index::{is_native_base, StyleDef, StyleIndex};
+use crate::style_index::{StyleDef, StyleIndex, is_native_base};
 use std::collections::HashSet;
 
 /// The resolved ancestry of a widget type: every type name from the starting type up to the root of
@@ -453,10 +453,14 @@ mod tests {
         let styles = styles(&[("a.otui", "Button < UIButton\nTextEdit < UITextEdit\n")]);
         let lua = LuaWidgetIndex::new();
 
-        assert!(resolve_ancestry("TextEdit", &styles, &lua)
-            .declares_custom_property(&lua, "change-cursor-image"));
-        assert!(!resolve_ancestry("Button", &styles, &lua)
-            .declares_custom_property(&lua, "change-cursor-image"));
+        assert!(
+            resolve_ancestry("TextEdit", &styles, &lua)
+                .declares_custom_property(&lua, "change-cursor-image")
+        );
+        assert!(
+            !resolve_ancestry("Button", &styles, &lua)
+                .declares_custom_property(&lua, "change-cursor-image")
+        );
     }
 
     #[test]

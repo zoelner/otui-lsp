@@ -483,10 +483,10 @@ fn collect_style_node_reads(line: &str, var: &str, props: &mut BTreeSet<String>)
             if !field.is_empty() {
                 props.insert(field);
             }
-        } else if let Some(after_bracket) = rest.strip_prefix('[') {
-            if let Some(key) = leading_string_literal(after_bracket.trim_start()) {
-                props.insert(key);
-            }
+        } else if let Some(after_bracket) = rest.strip_prefix('[')
+            && let Some(key) = leading_string_literal(after_bracket.trim_start())
+        {
+            props.insert(key);
         }
     }
 }
@@ -528,16 +528,16 @@ fn comparison_literal(line: &str, key_var: &str) -> Option<String> {
     let right = line[eq_at + 2..].trim_start();
 
     // `<key_var> == '<lit>'`
-    if ends_with_word(left, key_var) {
-        if let Some(lit) = leading_string_literal(right) {
-            return Some(lit);
-        }
+    if ends_with_word(left, key_var)
+        && let Some(lit) = leading_string_literal(right)
+    {
+        return Some(lit);
     }
     // `'<lit>' == <key_var>` — the literal is the trailing token of the left side.
-    if starts_with_word(right, key_var) {
-        if let Some(lit) = trailing_string_literal(left) {
-            return Some(lit);
-        }
+    if starts_with_word(right, key_var)
+        && let Some(lit) = trailing_string_literal(left)
+    {
+        return Some(lit);
     }
     None
 }
