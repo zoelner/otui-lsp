@@ -1046,6 +1046,17 @@ fn code_lens_reports_the_derived_count_on_the_style_name() {
         "title must report the exact derived count: {:?}",
         command.title
     );
+    // Deliberately inert, not a broken client-specific action: see `Backend::code_lens`'s doc
+    // comment for why. Pinned here so an accidental switch to a command id no generic LSP client
+    // can actually run (see that comment) fails a test instead of shipping silently.
+    assert_eq!(
+        command.command, "",
+        "the lens command is deliberately empty (informative-only, inert on every client)"
+    );
+    assert!(
+        command.arguments.is_none(),
+        "no command id means no arguments either"
+    );
 
     shutdown_and_exit(&client, server_thread, 3);
 }
@@ -1128,7 +1139,10 @@ fn inlay_hint_shows_the_native_ancestor_and_filters_to_the_requested_range() {
         );
     }
 
-    // Second: a viewport scoped to just Foo's line (line 1) must filter Bar's hint out.
+    // Second: a viewport scoped to just Foo's line (line 1) must filter Bar's hint out. The end
+    // is line 2 column 0 (the start of Bar's line), well clear of `foo_pos` — not clamped to it —
+    // so this exercises the "Bar is outside the viewport" filter, not the end-exclusive boundary
+    // (that is covered separately below).
     client
         .sender
         .send(Message::Request(Request::new(
@@ -1136,7 +1150,7 @@ fn inlay_hint_shows_the_native_ancestor_and_filters_to_the_requested_range() {
             "textDocument/inlayHint".to_owned(),
             InlayHintParams {
                 text_document: TextDocumentIdentifier { uri: uri.clone() },
-                range: lsp_types::Range::new(Position::new(1, 0), Position::new(1, 20)),
+                range: lsp_types::Range::new(Position::new(1, 0), Position::new(2, 0)),
                 work_done_progress_params: WorkDoneProgressParams::default(),
             },
         )))
@@ -1159,5 +1173,30 @@ fn inlay_hint_shows_the_native_ancestor_and_filters_to_the_requested_range() {
          {scoped_hints:#?}"
     );
 
-    shutdown_and_exit(&client, server_thread, 4);
+    // Third: LSP ranges are end-exclusive, so a viewport whose end sits exactly at Bar's hint
+    // anchor must NOT include it — that anchor is one past the requested range, not inside it.
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(4),
+            "textDocument/inlayHint".to_owned(),
+            InlayHintParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                range: lsp_types::Range::new(Position::new(2, 0), bar_pos),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            },
+        )))
+        .expect("send inlayHint (range ending exactly at Bar's hint)");
+    let resp = recv_response(&client, &RequestId::from(4));
+    assert!(resp.error.is_none(), "inlayHint errored: {resp:?}");
+    let boundary_hints: Vec<lsp_types::InlayHint> =
+        serde_json::from_value(resp.result.expect("inlayHint result present"))
+            .expect("deserialize Vec<InlayHint>");
+    assert!(
+        boundary_hints.is_empty(),
+        "a hint anchored exactly at the range's (exclusive) end must be excluded: \
+         {boundary_hints:#?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 5);
 }

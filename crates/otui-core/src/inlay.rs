@@ -34,6 +34,12 @@ pub struct AncestorHint {
 /// that native name differs from the literal `Base` token written on the line — a base that
 /// already spells out the resolved native (`Button < UIButton`) would otherwise get a redundant
 /// `→UIButton` echo. Returns an empty vec when `source` fails to parse.
+///
+/// Top-level only, deliberately — mirroring [`extract_style_defs`](crate::style_index)'s own scope
+/// (see its "Only top-level declarations are styles" fidelity note): a `style_header` nested inside
+/// a widget's body is a widget *instance*, not a style declaration, and gets no ancestor hint here
+/// either. Documented as a known gap, not a bug: widening this to walk nested `style_header` nodes
+/// too is a plausible future extension.
 #[must_use]
 pub fn ancestor_hints(
     source: &str,
@@ -56,9 +62,13 @@ pub fn ancestor_hints(
         let span = SyntaxTree::span_of(base_node);
         let base_text = &source[span.start..span.end];
 
-        // Resolving from the written base directly yields the same `.native` as resolving from the
-        // style's own declared name would: the walk from the declared name simply prepends one more
-        // step (itself) onto the same continuation, which starting from `base_text` already covers.
+        // Deliberately resolves from the line's own *written* base, not from the declared name.
+        // Starting at the declared name would first have `pick_def` choose a winner among any
+        // duplicate-named defs sharing it — and if this declaration is not the one `pick_def`
+        // would pick, that lookup could hand back a *different* duplicate's base, silently
+        // resolving a native ancestor this line never actually reaches. Starting at `base_text`
+        // sidesteps the ambiguity entirely: it is the base this exact line wrote, with nothing to
+        // pick between.
         let ancestry = resolve_ancestry(base_text, styles, lua);
         let Some(native) = ancestry.native else {
             continue; // dead end (undefined base, or a cycle) — nothing to report
