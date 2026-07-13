@@ -59,8 +59,16 @@ use lsp_types::{
     TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri, WorkDoneProgressOptions,
     WorkspaceEdit, WorkspaceSymbolParams,
 };
+// Code lens / inlay hint types (node `lens-hints`), appended separately to keep the merge with
+// concurrent nodes touching the block above localized to this new `use`.
+use lsp_types::{
+    CodeLens, CodeLensOptions, CodeLensParams, Command, InlayHint, InlayHintKind, InlayHintLabel,
+    InlayHintParams,
+};
 use otui_core::fixes::Fix;
 use otui_core::hover::{Inheritance, StyleHover, StyleHoverKind};
+use otui_core::inlay::ancestor_hints;
+use otui_core::lenses::style_lenses;
 use otui_core::links::{
     is_asset_sentinel_value, is_runtime_variable_path, resolve_asset_candidates, PathRef,
 };
@@ -2016,6 +2024,16 @@ impl Backend {
                     self.document_link(p)
                 })
             }
+            // Code lens / inlay hint (node `lens-hints`), grouped together here to keep the merge
+            // with concurrent nodes touching this `match` localized to these two arms.
+            "textDocument/codeLens" => {
+                reply!(req, "textDocument/codeLens", CodeLensParams, |p| self
+                    .code_lens(p))
+            }
+            "textDocument/inlayHint" => {
+                reply!(req, "textDocument/inlayHint", InlayHintParams, |p| self
+                    .inlay_hint(p))
+            }
             "textDocument/prepareRename" => reply!(
                 req,
                 "textDocument/prepareRename",
@@ -2206,6 +2224,16 @@ impl Backend {
                     resolve_provider: Some(false),
                     work_done_progress_options: WorkDoneProgressOptions::default(),
                 }),
+                // Code lens: "N widgets inherit this style" on a top-level style's declared name
+                // (only when N >= 1). Computed eagerly per request, so `resolve_provider` is
+                // `false` — there is no `codeLens/resolve`.
+                code_lens_provider: Some(CodeLensOptions {
+                    resolve_provider: Some(false),
+                }),
+                // Inlay hints: the resolved native `UI*` ancestor after a based widget/style's
+                // `Base` token (`Foo < SomeStyle →UIButton`). A plain boolean provider — hints are
+                // computed on demand per requested viewport range.
+                inlay_hint_provider: Some(OneOf::Left(true)),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -2578,6 +2606,87 @@ impl Backend {
             });
         }
         Some(links)
+    }
+
+    /// `textDocument/codeLens`: "N widget(s) inherit this style" on a top-level style's declared
+    /// name, shown only when at least one style derives from it directly (spec §5.2's
+    /// `Name < Base` namespace is global, so a style's derivations can live in other documents).
+    ///
+    /// Eager, not lazy: `resolve_provider` is advertised `false`, so every `CodeLens` carries its
+    /// final `Command` up front. The lens is purely informative — there is no portable, editor-
+    /// agnostic command to jump to every derivation from here (that would mean inventing a
+    /// client-side command no client actually registers), so the `Command`'s `command` id is left
+    /// empty; clients render the title as inert text rather than a broken action.
+    fn code_lens(&self, params: CodeLensParams) -> Option<Vec<CodeLens>> {
+        let uri = params.text_document.uri;
+        // Serve from the stored document text; an unknown document has no lenses, and (the
+        // OTUI-only language guard) neither does a `.lua` one.
+        let text = self.otui_document_text(&uri)?;
+
+        let encoding = self.encoding();
+        let index = LineIndex::new(&text);
+        let styles = self.style_index.read().expect("style_index lock poisoned");
+        let lenses = style_lenses(&text, &styles)
+            .into_iter()
+            .map(|lens| {
+                let n = lens.derived_count;
+                let title = if n == 1 {
+                    "1 widget inherits this style".to_owned()
+                } else {
+                    format!("{n} widgets inherit this style")
+                };
+                CodeLens {
+                    range: index.range(lens.name_span.start, lens.name_span.end, encoding),
+                    command: Some(Command {
+                        title,
+                        command: String::new(),
+                        arguments: None,
+                    }),
+                    data: None,
+                }
+            })
+            .collect();
+        Some(lenses)
+    }
+
+    /// `textDocument/inlayHint`: the resolved native `UI*` ancestor after a based widget/style's
+    /// `Base` token (`Foo < SomeStyle →UIButton`), so the reader sees what `Foo` ultimately *is*
+    /// without hand-walking the `Name < Base` chain. Filtered to the requested `params.range`
+    /// (the client's visible viewport), so a large document is never asked to hint off-screen.
+    fn inlay_hint(&self, params: InlayHintParams) -> Option<Vec<InlayHint>> {
+        let uri = params.text_document.uri;
+        // Serve from the stored document text; an unknown document has no hints, and (the
+        // OTUI-only language guard) neither does a `.lua` one.
+        let text = self.otui_document_text(&uri)?;
+
+        let encoding = self.encoding();
+        let index = LineIndex::new(&text);
+        // Convert the viewport once to a byte range, so filtering each hint is a plain offset
+        // comparison rather than a per-hint Position conversion.
+        let range_start = index.offset_at(params.range.start, encoding);
+        let range_end = index.offset_at(params.range.end, encoding);
+
+        let hints = {
+            let styles = self.style_index.read().expect("style_index lock poisoned");
+            let lua = self.lua_index.read().expect("lua_index lock poisoned");
+            ancestor_hints(&text, &styles, &lua)
+        };
+
+        let out = hints
+            .into_iter()
+            .filter(|hint| range_start <= hint.anchor && hint.anchor <= range_end)
+            .map(|hint| InlayHint {
+                position: index.position(hint.anchor, encoding),
+                label: InlayHintLabel::from(format!("→ {}", hint.native)),
+                kind: Some(InlayHintKind::TYPE),
+                text_edits: None,
+                tooltip: None,
+                padding_left: Some(true),
+                padding_right: None,
+                data: None,
+            })
+            .collect();
+        Some(out)
     }
 
     fn color_presentation(&self, params: ColorPresentationParams) -> Vec<ColorPresentation> {
