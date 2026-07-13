@@ -174,6 +174,26 @@ fn analyze_inner(
     out
 }
 
+/// The two **schema-agnostic** passes of [`analyze_inner`], shared by every OTML document
+/// regardless of what schema its top-level keys belong to: the line-based indentation pass
+/// (tab/odd-indentation/invalid-depth) and the tree-sitter `ERROR`/`MISSING` harvest. Both mirror
+/// the OTML *parser* itself (`OTMLParser::getLineDepth`/`parseLine`), not the widget style
+/// resolver, so they apply just as much to a `.otmod` module manifest
+/// ([`crate::manifest::analyze_manifest`]) as to a widget `.otui` — unlike the rest of
+/// [`analyze_inner`]'s passes (unknown-property, anchors, `$state`, style resolution, …), which all
+/// assume a widget tree and would misfire on manifest keys like `scripts:`/`sandboxed:`.
+///
+/// `pub(crate)`: this is an implementation-sharing seam between two sibling modules, not part of
+/// the public API — callers outside the crate reach the OTUI-flavored passes via [`analyze`], or
+/// the manifest-flavored ones via [`crate::manifest::analyze_manifest`].
+pub(crate) fn structural_diagnostics(source: &str, tree: Option<&SyntaxTree>) -> Vec<Diagnostic> {
+    let mut out = indentation_pass(source);
+    if let Some(tree) = tree {
+        collect_structural_errors(tree.root(), &mut out);
+    }
+    out
+}
+
 /// Emit a tab / odd-indentation diagnostic for `line`'s leading whitespace if malformed, returning
 /// whether one was pushed. The engine checks for a tab first (`line[spaces] == '\t'`) and, only if
 /// absent, for odd indentation, so at most one finding per line. Shared by the structural and comment

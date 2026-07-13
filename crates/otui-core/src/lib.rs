@@ -11,7 +11,8 @@
 //! [`navigation`], [`references`], [`hierarchy`], [`format`], [`indent`], [`folding`], [`semantic`],
 //! [`colors`], [`links`], [`fixes`], [`lenses`], [`inlay`], plus the workspace-index building blocks
 //! ([`style_index`], [`lua_widgets`], [`lua_refs`], [`lua_ui_loads`], [`otmod`], [`widget_resolve`],
-//! [`ids`]) and the engine data ([`schema`], [`catalog`]).
+//! [`ids`]), the module-manifest-flavored diagnostics pass ([`manifest`]), and the engine data
+//! ([`schema`], [`catalog`]).
 //! The [`LanguageService`] trait
 //! and the inherent [`OtuiService`] methods below are the entry points the server drives.
 
@@ -32,6 +33,7 @@ pub mod links;
 pub mod lua_refs;
 pub mod lua_ui_loads;
 pub mod lua_widgets;
+pub mod manifest;
 pub mod navigation;
 mod otml_reparent;
 pub mod otmod;
@@ -320,6 +322,15 @@ impl OtuiService {
     #[must_use]
     pub fn quick_fixes(&self, source: &str, range: ByteSpan) -> Vec<Fix> {
         fixes::quick_fixes(source, range)
+    }
+
+    /// Like [`quick_fixes`](Self::quick_fixes), but for a `.otmod`/`.otfont` manifest: restricted
+    /// to the schema-agnostic structural fixes (tabs→spaces, odd-indentation rounding) instead of
+    /// the widget-aware "did you mean" suggestions, which can misfire on a manifest's own keys —
+    /// see [`fixes::structural_quick_fixes`]'s doc comment for why.
+    #[must_use]
+    pub fn quick_fixes_structural(&self, source: &str, range: ByteSpan) -> Vec<Fix> {
+        fixes::structural_quick_fixes(source, range)
     }
 
     /// Format the whole document (spec §8): return the canonical, whitespace-normalized text, or

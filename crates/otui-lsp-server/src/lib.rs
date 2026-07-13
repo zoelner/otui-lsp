@@ -79,6 +79,7 @@ use otui_core::links::{
 use otui_core::lua_refs::{LuaRefIndex, scan_id_refs};
 use otui_core::lua_ui_loads::scan_ui_loads;
 use otui_core::lua_widgets::LuaWidgetIndex;
+use otui_core::manifest::{analyze_font_manifest, analyze_manifest};
 use otui_core::otmod::otmod_scripts;
 use otui_core::property_hover::{PropertyHover, PropertyValueKind};
 use otui_core::style_index::{DocId, StyleDef, StyleIndex, is_native_base};
@@ -99,7 +100,8 @@ struct Document {
     language: Language,
 }
 
-/// A document's language, used to gate OTUI-only behavior away from a `.lua` buffer.
+/// A document's language, used to gate OTUI-only behavior away from a `.lua` buffer, and
+/// widget-semantic behavior away from a module-manifest buffer.
 ///
 /// The server is about to be registered, by the separate VS Code extension, for `.lua` documents
 /// too — so a Lua `getChildById('closeButton')` can jump to the paired `.otui`'s `id:`. Every
@@ -108,50 +110,106 @@ struct Document {
 /// a strict no-op on a Lua document — those surfaces belong to the user's `lua-language-server`,
 /// and a second server answering them would produce duplicated or garbage entries beside the good
 /// ones.
+///
+/// [`Manifest`](Language::Manifest) exists for the same reason, one level down: a `.otmod`/
+/// `.otfont` file parses through the *same* OTML grammar a widget `.otui` does (so every purely
+/// syntactic feature — semantic tokens, folding, formatting — still applies unchanged, see
+/// [`Backend::otml_document_text`]), but its top-level keys belong to a completely different,
+/// much smaller schema (spec: `module.cpp`'s `Module::discover`, see [`otui_core::manifest`]).
+/// Running the widget-aware diagnostics (or hover/completion/references over the *style* graph)
+/// on a manifest would judge `name:`/`scripts:`/`sandboxed:` against the widget property catalog,
+/// which was never meant to answer for them — see [`Backend::is_otui_document`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Language {
     /// An OTUI/OTML style/layout document: every existing behavior applies unchanged.
     Otui,
     /// A Lua script: every OTUI-only surface is a no-op here.
     Lua,
+    /// A `.otmod` module manifest or `.otfont` font manifest: OTML syntactically (so the
+    /// syntax-only surfaces still serve it, see [`Backend::otml_document_text`]), but not a widget
+    /// tree — every widget-semantic surface (diagnostics above all, but also hover/completion/
+    /// references/rename over the style graph, code lens, inlay hints, document links/colors) is a
+    /// no-op here, exactly like [`Language::Lua`] is for those same surfaces.
+    ///
+    /// Carries [`ManifestKind`] — which of the two manifest schemas
+    /// ([`otui_core::manifest::analyze_manifest`] vs.
+    /// [`otui_core::manifest::analyze_font_manifest`]) applies — so that choice is made **once**,
+    /// right here where [`classify`](Language::classify)/[`from_uri`](Language::from_uri) already
+    /// resolve every signal (`languageId` *and* URI extension, `file:` or not) into a `Language`.
+    /// Before this, [`compute_and_send_manifest_diagnostics`] re-derived font-vs-module on its own
+    /// via a second, `file:`-URI-only helper (`is_otfont_uri`) that could disagree with this enum's
+    /// own classification — e.g. a `.otfont` opened under a non-`file:` URI, or recognized only by
+    /// `languageId`, would still pass this helper's `false` and silently fall back to the module
+    /// schema, wrongly reporting `missing-module-root` on a valid font manifest. Keeping the kind
+    /// inside the variant makes that drift impossible: whoever computed the `Language` also computed
+    /// the schema, from the very same signals.
+    Manifest(ManifestKind),
+}
+
+/// Which manifest schema a [`Language::Manifest`] document is judged against — see that variant's
+/// doc comment for why this lives inside it rather than being re-derived from the URI a second time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManifestKind {
+    /// A `.otmod` module manifest: [`otui_core::manifest::analyze_manifest`].
+    Module,
+    /// A `.otfont` font manifest: [`otui_core::manifest::analyze_font_manifest`].
+    Font,
 }
 
 impl Language {
     /// Classify an opened document from **both** signals: it is Lua if the `didOpen` `languageId`
-    /// says so **or** the URI looks like Lua.
+    /// says so **or** the URI looks like Lua; failing that, it is a manifest if the `languageId`
+    /// says so **or** the URI looks like a `.otmod`/`.otfont`.
     ///
     /// Belt and braces, deliberately. The client that will start sending `.lua` here is a *separate
     /// repository*; if the guard trusted `languageId` alone, one editor sending `"plaintext"` (or
     /// its own id) for a `.lua` file would silently switch the entire guard off — the analyzer would
     /// run on Lua and `style_defs` would feed the workspace `StyleIndex` with garbage. A guard whose
     /// correctness depends on a string chosen in another repo is not a guard. Either signal saying
-    /// "Lua" is enough.
+    /// "Lua" is enough — and likewise for "this is a manifest".
     ///
     /// The converse stays permissive: this server has never required a particular `languageId` for an
     /// OTUI buffer (a client may send `"otui"`, `"otml"`, or its own convention), so anything that is
-    /// neither signal defaults to [`Language::Otui`], preserving today's behavior for every existing
-    /// client.
+    /// none of those signals defaults to [`Language::Otui`], preserving today's behavior for every
+    /// existing client.
     fn classify(uri: &Uri, language_id: &str) -> Self {
         if language_id.eq_ignore_ascii_case("lua") || Self::from_uri(uri) == Language::Lua {
-            Language::Lua
-        } else {
-            Language::Otui
+            return Language::Lua;
         }
+        // The manifest kind, like the Lua check above, honors EITHER signal — a `languageId` of
+        // "otfont"/"otmod" is decisive on its own, whatever the URI looks like (an `untitled:`
+        // buffer, or a URI whose extension the client's own convention does not surface). This is
+        // also the single place the kind is picked: `from_uri`'s URI-only answer is only consulted
+        // when `language_id` said nothing, so a caller can never end up with a `Language::Manifest`
+        // whose kind was decided by a second, disagreeing check downstream (see the variant's doc
+        // comment).
+        if language_id.eq_ignore_ascii_case("otfont") {
+            return Language::Manifest(ManifestKind::Font);
+        }
+        if language_id.eq_ignore_ascii_case("otmod") {
+            return Language::Manifest(ManifestKind::Module);
+        }
+        if let Language::Manifest(kind) = Self::from_uri(uri) {
+            return Language::Manifest(kind);
+        }
+        Language::Otui
     }
 
     /// Classify from the URI's file extension alone. Used when a request names a document this
     /// server has no recorded `languageId` for (never opened, or a handler that answers purely from
     /// `params` without looking up the [`Document`] — see [`Backend::is_otui_document`]).
     ///
-    /// Case-insensitive (a `.LUA` file is still Lua), and the URI's query and fragment are stripped
-    /// first: without that, `file:///m/mod.lua#frag` or a `git:` diff-view URI ends in `lua#frag` /
-    /// `lua?{...}` and would be classified **OTUI** — the analyzer would then run over Lua. Every
-    /// misclassification this function can make must fail *closed*, never open.
+    /// Case-insensitive (a `.LUA` file is still Lua, a `.OTMOD` still a manifest), and the URI's
+    /// query and fragment are stripped first: without that, `file:///m/mod.lua#frag` or a `git:`
+    /// diff-view URI ends in `lua#frag` / `lua?{...}` and would be classified **OTUI** — the
+    /// analyzer would then run over Lua. Every misclassification this function can make must fail
+    /// *closed*, never open.
     ///
-    /// This is the single source of truth for "is this URI Lua?". Any other place that needs the
-    /// answer must call it rather than testing the string itself — the two rules drifted apart once
-    /// already (the watched-files router matched `.lua` case-sensitively while this said `.LUA` was
-    /// Lua), and a mixed-case file then took the OTUI branch straight into the workspace index.
+    /// This is the single source of truth for "is this URI Lua? / a manifest?". Any other place
+    /// that needs the answer must call it rather than testing the string itself — the two rules
+    /// drifted apart once already (the watched-files router matched `.lua` case-sensitively while
+    /// this said `.LUA` was Lua), and a mixed-case file then took the OTUI branch straight into the
+    /// workspace index.
     fn from_uri(uri: &Uri) -> Self {
         // Classify off the SAME view of the URI that the code which actually opens the file uses.
         // `read_indexed_file` resolves through `uri_to_file_path`, which percent-**decodes**; a
@@ -159,25 +217,32 @@ impl Language {
         // `file:///m/mod%2Elua` carries no literal dot, so the raw test answered OTUI — while the
         // reader decoded it, opened the real `mod.lua`, and fed it to `style_defs` and the workspace
         // `StyleIndex`. A classifier and a reader must not disagree about which file a URI names.
-        if uri_to_file_path(uri).is_some_and(|path| {
-            path.extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("lua"))
-        }) {
-            return Language::Lua;
+        if let Some(path) = uri_to_file_path(uri) {
+            return match path.extension() {
+                Some(ext) if ext.eq_ignore_ascii_case("lua") => Language::Lua,
+                Some(ext) if ext.eq_ignore_ascii_case("otmod") => {
+                    Language::Manifest(ManifestKind::Module)
+                }
+                Some(ext) if ext.eq_ignore_ascii_case("otfont") => {
+                    Language::Manifest(ManifestKind::Font)
+                }
+                _ => Language::Otui,
+            };
         }
         // Fallback for URIs that name no filesystem path (`untitled:` and other non-`file:` schemes):
         // the raw string, with query and fragment stripped — without that a `git:` diff-view URI ends
         // in `lua?{...}` and reads as OTUI.
         let s = uri.as_str();
         let path = s.split(['#', '?']).next().unwrap_or(s);
-        let is_lua = path
-            .rsplit('.')
-            .next()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("lua"));
-        if is_lua {
-            Language::Lua
-        } else {
-            Language::Otui
+        match path.rsplit('.').next() {
+            Some(ext) if ext.eq_ignore_ascii_case("lua") => Language::Lua,
+            Some(ext) if ext.eq_ignore_ascii_case("otmod") => {
+                Language::Manifest(ManifestKind::Module)
+            }
+            Some(ext) if ext.eq_ignore_ascii_case("otfont") => {
+                Language::Manifest(ManifestKind::Font)
+            }
+            _ => Language::Otui,
         }
     }
 }
@@ -459,48 +524,76 @@ impl Backend {
     }
 
     /// Run the engine over `text` and push the resulting diagnostics for `uri`, unless a newer
-    /// edit has since superseded `version`.
+    /// edit has since superseded `version`. Routes on [`Language`]:
+    ///
+    /// * [`Language::Lua`] — never analyzed here (the OTUI parser would choke on perfectly valid
+    ///   Lua and shower the buffer with false `syntax-error`/`tab-indentation` diagnostics, and
+    ///   unknown-property hints belong to the user's `lua-language-server`, not us). An **empty**
+    ///   diagnostics array is still published — a client needs it to clear anything stale (e.g.
+    ///   from before the buffer's `languageId` was known to us) — it is only the analysis that is
+    ///   skipped.
+    /// * [`Language::Manifest`] — analyzed with the manifest-flavored
+    ///   [`otui_core::manifest::analyze_manifest`]/[`otui_core::manifest::analyze_font_manifest`],
+    ///   never the widget-aware pass: a `.otmod`/`.otfont` is not a widget tree, so
+    ///   `name:`/`scripts:`/`sandboxed:` must never be judged against the widget property catalog
+    ///   (the regression this routing exists to fix). Which of the two schemas applies is read
+    ///   straight off the variant's carried [`ManifestKind`] — the same classification
+    ///   [`document_language`](Self::document_language) just produced — never re-derived from `uri`
+    ///   a second time (see [`Language::Manifest`]'s doc comment).
+    /// * [`Language::Otui`] — the existing widget-aware pass, unchanged.
     ///
     /// The single-threaded loop processes `did_open`/`did_change` to completion one at a time, so
-    /// the version check here is belt-and-braces: it still discards diagnostics computed for an
-    /// older `version` than the one currently stored for `uri`.
-    ///
-    /// (The OTUI-only language guard.) A `.lua` document is never analyzed here: the OTUI parser
-    /// would choke on perfectly valid Lua and shower the buffer with false
-    /// `syntax-error`/`tab-indentation` diagnostics, and unknown-property hints belong to the
-    /// user's `lua-language-server`, not us. An **empty** diagnostics array is still published —
-    /// a client needs it to clear anything stale (e.g. from before the buffer's `languageId` was
-    /// known to us) — it is only the analysis that is skipped.
+    /// the version check in each branch's compute+send helper is belt-and-braces: it still
+    /// discards diagnostics computed for an older `version` than the one currently stored for
+    /// `uri`.
     fn publish(&self, uri: Uri, text: &str, version: i32) {
-        if !self.is_otui_document(&uri) {
-            self.send_diagnostics(uri, Vec::new(), Some(version));
-            return;
+        match self.document_language(&uri) {
+            Language::Lua => {
+                self.send_diagnostics(uri, Vec::new(), Some(version));
+            }
+            Language::Manifest(kind) => {
+                let encoding = self.encoding();
+                compute_and_send_manifest_diagnostics(
+                    &self.sender,
+                    &self.documents,
+                    encoding,
+                    uri,
+                    kind,
+                    text,
+                    version,
+                );
+            }
+            Language::Otui => {
+                // Widget-aware diagnostics: the unknown-property check consults the workspace
+                // style + Lua indexes so a Lua-added property is not wrongly hinted. With the
+                // indexes still empty (scan not yet complete) this is identical to the
+                // catalog-only pass. The actual compute+send is shared with the background scan's
+                // completion refresh (see `compute_and_send_diagnostics`).
+                let encoding = self.encoding();
+                let styles = self.style_index.read().expect("style_index lock poisoned");
+                let lua = self.lua_index.read().expect("lua_index lock poisoned");
+                // Same asset resolution as `document_link` (§ missing-asset diagnostic): the
+                // current document's directory (for relative paths) and the workspace roots (for
+                // `/`-rooted ones).
+                let doc_dir =
+                    uri_to_file_path(&uri).and_then(|p| p.parent().map(Path::to_path_buf));
+                let workspace_roots = self.workspace_root_paths();
+                compute_and_send_diagnostics(
+                    &self.sender,
+                    &self.service,
+                    &styles,
+                    &lua,
+                    &self.documents,
+                    encoding,
+                    uri,
+                    text,
+                    version,
+                    doc_dir.as_deref(),
+                    &workspace_roots,
+                    &self.otpkg_cache,
+                );
+            }
         }
-        // Widget-aware diagnostics: the unknown-property check consults the workspace style + Lua
-        // indexes so a Lua-added property is not wrongly hinted. With the indexes still empty (scan
-        // not yet complete) this is identical to the catalog-only pass. The actual compute+send is
-        // shared with the background scan's completion refresh (see `compute_and_send_diagnostics`).
-        let encoding = self.encoding();
-        let styles = self.style_index.read().expect("style_index lock poisoned");
-        let lua = self.lua_index.read().expect("lua_index lock poisoned");
-        // Same asset resolution as `document_link` (§ missing-asset diagnostic): the current
-        // document's directory (for relative paths) and the workspace roots (for `/`-rooted ones).
-        let doc_dir = uri_to_file_path(&uri).and_then(|p| p.parent().map(Path::to_path_buf));
-        let workspace_roots = self.workspace_root_paths();
-        compute_and_send_diagnostics(
-            &self.sender,
-            &self.service,
-            &styles,
-            &lua,
-            &self.documents,
-            encoding,
-            uri,
-            text,
-            version,
-            doc_dir.as_deref(),
-            &workspace_roots,
-            &self.otpkg_cache,
-        );
     }
 
     /// Recompute and republish diagnostics for every currently open document.
@@ -573,6 +666,12 @@ impl Backend {
         match language {
             Language::Otui => self.reindex_styles(uri, text),
             Language::Lua => self.reindex_lua_refs_open(uri, text),
+            // A manifest is neither a widget style document nor a Lua module: it has no styles to
+            // seed the `StyleIndex` with and no `getChildById`/`.ui.<id>` references to scan for
+            // `lua_ref_index`. Its `scripts:`/`dependencies:` bookkeeping lives in the separate
+            // module-association index (`ModuleUiIndex`, built from disk via `is_otmod_uri`), not
+            // here.
+            Language::Manifest(_) => {}
         }
     }
 
@@ -588,21 +687,39 @@ impl Backend {
             .unwrap_or_else(|| Language::from_uri(uri))
     }
 
-    /// Whether `uri` is an OTUI document — the single guard every OTUI-only handler checks before
-    /// touching a document. See [`Language`] for why this exists and what it defends against.
+    /// Whether `uri` is a widget `.otui` document — the single guard every widget-semantic handler
+    /// checks before touching a document (diagnostics, hover, completion, references/rename over the
+    /// style graph, code lens, inlay hints, document links/colors, …). Deliberately **excludes**
+    /// [`Language::Manifest`]: a `.otmod`/`.otfont` is not a widget tree, so none of those surfaces
+    /// has anything meaningful to answer for it — see [`Language`] for the full rationale. A purely
+    /// syntactic surface (semantic tokens, folding, formatting) must use
+    /// [`otml_document_text`](Self::otml_document_text) instead, which also serves a manifest.
     fn is_otui_document(&self, uri: &Uri) -> bool {
         self.document_language(uri) == Language::Otui
     }
 
-    /// The stored text for `uri`, but only for an OTUI document: `None` for an unknown document
-    /// AND for a `.lua` one (the OTUI-only language guard). This is the seam nearly every
-    /// OTUI-only handler fetches its document text through, so gating it here — rather than
-    /// leaving each handler to remember an extra check — makes the guard structural: a new
-    /// handler that fetches its text this way is safe by construction.
+    /// The stored text for `uri`, but only for a widget `.otui` document: `None` for an unknown
+    /// document, for a `.lua` one, AND for a manifest (the OTUI-only language guard — see
+    /// [`is_otui_document`](Self::is_otui_document)). This is the seam nearly every widget-semantic
+    /// handler fetches its document text through, so gating it here — rather than leaving each
+    /// handler to remember an extra check — makes the guard structural: a new handler that fetches
+    /// its text this way is safe by construction.
     fn otui_document_text(&self, uri: &Uri) -> Option<String> {
         let docs = self.documents.read().expect("documents lock poisoned");
         let doc = docs.get(uri)?;
         (doc.language == Language::Otui).then(|| doc.text.clone())
+    }
+
+    /// The stored text for `uri` for **either** OTML schema — a widget `.otui` or a module/font
+    /// manifest — but still `None` for a `.lua` document. Used only by the handful of purely
+    /// syntactic surfaces (semantic tokens, folding, whole/range/on-type formatting) that operate on
+    /// the shared OTML grammar alone and do not care which schema the top-level keys belong to; every
+    /// other (widget-semantic) handler must keep using
+    /// [`otui_document_text`](Self::otui_document_text), which excludes a manifest.
+    fn otml_document_text(&self, uri: &Uri) -> Option<String> {
+        let docs = self.documents.read().expect("documents lock poisoned");
+        let doc = docs.get(uri)?;
+        matches!(doc.language, Language::Otui | Language::Manifest(_)).then(|| doc.text.clone())
     }
 
     /// The unified text view every span→range aggregator resolves against: the OPEN buffers overlaid
@@ -913,6 +1030,53 @@ fn compute_and_send_diagnostics(
         otpkg_cache,
         encoding,
     ));
+    let latest = documents
+        .read()
+        .expect("documents lock poisoned")
+        .get(&uri)
+        .map(|doc| doc.version);
+    if !is_current_version(latest, version) {
+        return;
+    }
+    let params = PublishDiagnosticsParams {
+        uri,
+        diagnostics: lsp_diags,
+        version: Some(version),
+    };
+    let _ = sender.send(Message::Notification(Notification::new(
+        "textDocument/publishDiagnostics".to_owned(),
+        params,
+    )));
+}
+
+/// Like [`compute_and_send_diagnostics`], but for a module/font manifest ([`Language::Manifest`]):
+/// runs the manifest-flavored [`analyze_manifest`]/[`analyze_font_manifest`] (spec: `module.cpp`'s
+/// `Module::discover` / `bitmapfont.cpp`'s `BitmapFont::load`) instead of the widget-aware pass,
+/// picking the schema from `kind` — the [`ManifestKind`] the caller's `Language::Manifest` already
+/// carries, itself produced by [`Language::classify`]/[`Language::from_uri`] from `uri` (and, for an
+/// open buffer, `languageId`) — never re-derived from `uri` a second time here. A second, narrower
+/// URI-only check drifting from the classifier is exactly the bug class [`Language::Manifest`]'s doc
+/// comment warns about: it would fail closed for anything the classifier accepts that the narrower
+/// check does not (a non-`file:` URI, a `languageId`-only signal, …), silently judging a font
+/// manifest against the module schema and reporting a spurious `missing-module-root`. No workspace
+/// style/Lua indexes are threaded through — a manifest's own diagnostics never depend on them — and
+/// no missing-asset augmentation either: none of a manifest's keys (`scripts:`, `dependencies:`,
+/// `load-later:`, `texture:`, …) are asset paths in the `image-source`/`icon` sense
+/// [`missing_asset_diagnostics`] resolves.
+fn compute_and_send_manifest_diagnostics(
+    sender: &Sender<Message>,
+    documents: &RwLock<HashMap<Uri, Document>>,
+    encoding: PositionEncoding,
+    uri: Uri,
+    kind: ManifestKind,
+    text: &str,
+    version: i32,
+) {
+    let core_diags = match kind {
+        ManifestKind::Font => analyze_font_manifest(text),
+        ManifestKind::Module => analyze_manifest(text),
+    };
+    let lsp_diags = convert::all_to_lsp(text, &core_diags, encoding);
     let latest = documents
         .read()
         .expect("documents lock poisoned")
@@ -2533,9 +2697,52 @@ fn build_code_actions(
     context: &[LspDiagnostic],
     encoding: PositionEncoding,
 ) -> Vec<CodeActionOrCommand> {
+    actions_from_fixes(
+        service.quick_fixes(text, range),
+        uri,
+        text,
+        context,
+        encoding,
+    )
+}
+
+/// Like [`build_code_actions`], but for a `.otmod`/`.otfont` manifest: fixes come from
+/// [`OtuiService::quick_fixes_structural`] rather than [`OtuiService::quick_fixes`], so only the
+/// schema-agnostic structural corrections (tabs→spaces, odd-indentation rounding) are ever offered
+/// — never a widget-catalog "did you mean" suggestion, which judges a manifest's own keys
+/// (`scripts:`, `sandboxed:`, a font's `space-width:`, …) against the wrong schema entirely and can
+/// suggest a flatly incorrect fix (see [`quick_fixes_structural`](OtuiService::quick_fixes_structural)'s
+/// doc comment for a real corpus example). Used by [`Backend::code_action`] for
+/// [`Language::Manifest`].
+fn build_manifest_code_actions(
+    service: &OtuiService,
+    uri: &Uri,
+    text: &str,
+    range: ByteSpan,
+    context: &[LspDiagnostic],
+    encoding: PositionEncoding,
+) -> Vec<CodeActionOrCommand> {
+    actions_from_fixes(
+        service.quick_fixes_structural(text, range),
+        uri,
+        text,
+        context,
+        encoding,
+    )
+}
+
+/// Map already-computed engine [`Fix`]es onto `quickfix` [`CodeAction`]s for `uri`, linking each to
+/// whichever of `context`'s client diagnostics it corrects. Shared by [`build_code_actions`] and
+/// [`build_manifest_code_actions`], which differ only in *which* fixes they compute.
+fn actions_from_fixes(
+    fixes: Vec<Fix>,
+    uri: &Uri,
+    text: &str,
+    context: &[LspDiagnostic],
+    encoding: PositionEncoding,
+) -> Vec<CodeActionOrCommand> {
     let line_index = LineIndex::new(text);
-    service
-        .quick_fixes(text, range)
+    fixes
         .into_iter()
         .map(|fix| {
             let edits: Vec<TextEdit> = fix
@@ -3421,8 +3628,9 @@ impl Backend {
         let uri = params.text_document.uri;
         // Serve from the stored document text; nothing to highlight for an unknown document, and
         // (the OTUI-only language guard) nothing for a `.lua` one either — semantic tokens for Lua
-        // belong to the user's `lua-language-server`.
-        let text = self.otui_document_text(&uri)?;
+        // belong to the user's `lua-language-server`. A module/font manifest, though, is still OTML
+        // syntactically, so it is served here via `otml_document_text` (not `otui_document_text`).
+        let text = self.otml_document_text(&uri)?;
 
         let core_tokens = self.service.semantic_tokens(&text);
         let data = semantic::encode(&text, &core_tokens, self.encoding());
@@ -3650,8 +3858,9 @@ impl Backend {
     fn folding_range(&self, params: FoldingRangeParams) -> Option<Vec<FoldingRange>> {
         let uri = params.text_document.uri;
         // Serve from the stored document text; an unknown document has nothing to fold, and (the
-        // OTUI-only language guard) neither does a `.lua` one.
-        let text = self.otui_document_text(&uri)?;
+        // OTUI-only language guard) neither does a `.lua` one. A module/font manifest is still OTML
+        // syntactically, so it is served here via `otml_document_text` (not `otui_document_text`).
+        let text = self.otml_document_text(&uri)?;
 
         let folds = self.service.folding_ranges(&text);
         Some(convert::folds_to_lsp(&folds))
@@ -4136,9 +4345,15 @@ impl Backend {
         let uri = params.text_document.uri;
         let encoding = self.encoding();
 
-        // Serve from the stored document text; an unknown document has nothing to fix, and (the
-        // OTUI-only language guard) neither does a `.lua` one.
-        let text = self.otui_document_text(&uri)?;
+        // A module/font manifest is still OTML syntactically, so it is served here via
+        // `otml_document_text` (not `otui_document_text`) — the tabs→spaces / odd-indentation
+        // quick-fixes correct exactly the structural diagnostics
+        // `compute_and_send_manifest_diagnostics` already publishes for it (spec: the OTML
+        // *parser*'s own indentation rule, not the widget style resolver). An unknown document has
+        // nothing to fix, and (the OTUI-only language guard) neither does a `.lua` one —
+        // `otml_document_text` returns `None` for both.
+        let language = self.document_language(&uri);
+        let text = self.otml_document_text(&uri)?;
 
         // Map the requested LSP range to a byte span, then let the engine compute the fixes that
         // overlap it. An empty list is a valid answer (nothing fixable here); return it as such.
@@ -4147,14 +4362,28 @@ impl Backend {
             line_index.offset_at(params.range.start, encoding),
             line_index.offset_at(params.range.end, encoding),
         );
-        let actions = build_code_actions(
-            &self.service,
-            &uri,
-            &text,
-            range,
-            &params.context.diagnostics,
-            encoding,
-        );
+        // A manifest's own keys belong to a different, much smaller schema than the widget property
+        // catalog the ordinary path's "did you mean" suggestions draw from — routed through
+        // `build_manifest_code_actions` so only the schema-agnostic structural fixes are ever
+        // offered for it (see that function's doc comment).
+        let actions = match language {
+            Language::Manifest(_) => build_manifest_code_actions(
+                &self.service,
+                &uri,
+                &text,
+                range,
+                &params.context.diagnostics,
+                encoding,
+            ),
+            _ => build_code_actions(
+                &self.service,
+                &uri,
+                &text,
+                range,
+                &params.context.diagnostics,
+                encoding,
+            ),
+        };
         Some(actions)
     }
 
@@ -4164,8 +4393,9 @@ impl Backend {
 
         // Serve from the stored document text; an unknown document has nothing to format, and
         // (the OTUI-only language guard) neither does a `.lua` one — `lua-language-server` owns
-        // that surface.
-        let text = self.otui_document_text(&uri)?;
+        // that surface. A module/font manifest is still OTML syntactically, so it is served here
+        // via `otml_document_text` (not `otui_document_text`).
+        let text = self.otml_document_text(&uri)?;
 
         // Ask the engine to format. `None` means the document does not parse cleanly (parse error /
         // `ERROR`/`MISSING` node); per the safety gate we then return no edits. Otherwise reply with
@@ -4181,8 +4411,10 @@ impl Backend {
         let encoding = self.encoding();
 
         // Serve from the stored document text; an unknown document has nothing to format, and
-        // (the OTUI-only language guard) neither does a `.lua` one.
-        let text = self.otui_document_text(&uri)?;
+        // (the OTUI-only language guard) neither does a `.lua` one. A module/font manifest is
+        // still OTML syntactically, so it is served here via `otml_document_text` (not
+        // `otui_document_text`).
+        let text = self.otml_document_text(&uri)?;
 
         // LSP ranges are END-EXCLUSIVE, but `format_line_edits` takes an INCLUSIVE end line. A
         // selection that ends at `{ line: M, character: 0 }` (the shape editors produce when the
@@ -4251,8 +4483,9 @@ impl Backend {
 
         // Serve from the stored document text; an unknown (not open) document has nothing to
         // format, matching every other formatting handler — and (the OTUI-only language guard)
-        // neither does a `.lua` one.
-        let text = self.otui_document_text(&uri)?;
+        // neither does a `.lua` one. A module/font manifest is still OTML syntactically, so it is
+        // served here via `otml_document_text` (not `otui_document_text`).
+        let text = self.otml_document_text(&uri)?;
 
         let line = params.text_document_position.position.line;
 
@@ -4356,6 +4589,9 @@ impl Backend {
                 Some(text) => self.index_lua_refs_from_disk(&uri, text),
                 None => self.deindex_lua_refs(&uri),
             },
+            // Never fed into either index on open (see `set_open_document`), so there is nothing
+            // to re-sync on close either.
+            Language::Manifest(_) => {}
         }
     }
 }
