@@ -20,7 +20,7 @@ pub mod convert;
 pub mod position;
 pub mod semantic;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -74,7 +74,9 @@ use otui_core::links::{
     is_asset_sentinel_value, is_runtime_variable_path, resolve_asset_candidates, PathRef,
 };
 use otui_core::lua_refs::{scan_id_refs, LuaRefIndex};
+use otui_core::lua_ui_loads::scan_ui_loads;
 use otui_core::lua_widgets::LuaWidgetIndex;
+use otui_core::otmod::otmod_scripts;
 use otui_core::property_hover::{PropertyHover, PropertyValueKind};
 use otui_core::style_index::{is_native_base, DocId, StyleDef, StyleIndex};
 use otui_core::OtuiService;
@@ -258,6 +260,25 @@ pub struct Backend {
     /// bridge read a `.lua` file's text through. [`Arc`] so the background scan can populate it from
     /// a spawned task.
     lua_texts: Arc<RwLock<HashMap<Uri, String>>>,
+    /// The workspace-wide **module association** index: for every module directory (one containing
+    /// at least one `*.otmod`), the `.lua` ↔ `.otui` pairs discovered from that module's own
+    /// `.otmod` `scripts:` list ([`otui_core::otmod::otmod_scripts`]) crossed with each named
+    /// controller's `g_ui.loadUI`/`displayUI`/`importStyle` calls
+    /// ([`otui_core::lua_ui_loads::scan_ui_loads`]) — the mechanism OTClient's own module loader uses
+    /// to associate a controller with its UI, which the bridge's same-directory/same-stem fast path
+    /// ([`paired_uri`]) misses for roughly half of the engine's real controllers (a `styles/`
+    /// subdirectory, a differently-named UI file, …). Consulted by
+    /// [`Backend::associated_uris`], which every direction of the bridge
+    /// ([`Backend::lua_forward_references`]/[`Backend::lua_references`]) now goes through instead of
+    /// `paired_uri` alone — `paired_uri`'s result, when present, is always included first; this index
+    /// only *adds* coverage, never removes or reorders it.
+    ///
+    /// Populated at startup by scanning every module directory under the workspace roots (this is I/O
+    /// — real `.otmod`/`.lua`/`.otui` files must be read from disk — so it lives here, never in
+    /// `otui-core`), and kept fresh via file watching for `**/*.otmod`, `**/*.lua` and `**/*.otui`
+    /// (see [`Backend::update_module_index_for`]). [`Arc`] so the background scan can write into it
+    /// from a spawned task.
+    module_ui_index: Arc<RwLock<ModuleUiIndex>>,
     /// On-disk text of every **indexed closed** `.otui` file, keyed by its `file://` URL. This is
     /// the content store that lets the aggregators map a closed file's byte span → LSP range without
     /// the file being open. For any URI also present in [`documents`](Self::documents) the open
@@ -320,6 +341,7 @@ impl Backend {
             lua_index: Arc::new(RwLock::new(LuaWidgetIndex::new())),
             lua_ref_index: Arc::new(RwLock::new(LuaRefIndex::new())),
             lua_texts: Arc::new(RwLock::new(HashMap::new())),
+            module_ui_index: Arc::new(RwLock::new(ModuleUiIndex::new())),
             disk_texts: Arc::new(RwLock::new(HashMap::new())),
             roots: Mutex::new(workspace_roots(params)),
             reindex_guard: Arc::new(Mutex::new(())),
@@ -705,6 +727,87 @@ impl Backend {
             .get(uri)
             .cloned()
     }
+
+    /// Every `.otui`/`.lua` file paired with `uri` — the OTUI↔Lua bridge's full pairing rule,
+    /// combining [`paired_uri`]'s same-directory/same-stem fast path with
+    /// [`module_ui_index`](Self::module_ui_index)'s `.otmod`-derived association.
+    ///
+    /// The fast-path result, when it exists, is always first and always present — the association
+    /// index only *adds* candidates, it never removes or displaces the fast path (spec §2.3's rule
+    /// is correct wherever it applies; this just widens what "applies" covers). Deduplicated by URL,
+    /// so a controller that happens to satisfy both is not listed twice.
+    fn associated_uris(&self, uri: &Uri, target_ext: &str) -> Vec<Uri> {
+        let mut out = Vec::new();
+        if let Some(fast) = paired_uri(uri, target_ext) {
+            out.push(fast);
+        }
+        let index = self
+            .module_ui_index
+            .read()
+            .expect("module_ui_index lock poisoned");
+        let extra: &[Uri] = match target_ext {
+            "lua" => index.lua_files_for(uri),
+            "otui" => index.otui_files_for(uri),
+            _ => &[],
+        };
+        for u in extra {
+            if !out.contains(u) {
+                out.push(u.clone());
+            }
+        }
+        out
+    }
+
+    /// Recompute exactly one module's contribution to [`module_ui_index`](Self::module_ui_index) in
+    /// response to a watched-file change to `uri`, or do nothing when `uri` is not relevant
+    /// (anything other than a `.otmod`, `.lua`, or `.otui` file).
+    ///
+    /// Runs for **every** relevant watched change, independent of the open-buffer/style-index/
+    /// Lua-index handling in [`did_change_watched_files`](Self::did_change_watched_files) —
+    /// including a currently-open `.otui`/`.lua` file: this index is pure disk-existence bookkeeping
+    /// (a `loadUI` target either exists on disk or it does not), which does not depend on whether an
+    /// editor happens to have the file open the way [`style_index`](Self::style_index)/
+    /// [`disk_texts`](Self::disk_texts) do.
+    ///
+    /// * A changed `.otmod` always owns *its own* directory as the module directory — regardless of
+    ///   whether the file still exists after the change (a DELETE): [`scan_module_dir`] re-reads that
+    ///   directory, finds no `.otmod` there anymore, and returns an empty pair list, which
+    ///   [`ModuleUiIndex::set_module`] treats as "remove this module" — so a deleted `.otmod`
+    ///   correctly clears its module's associations rather than leaking stale ones forever.
+    /// * A changed `.lua`/`.otui` file walks upward for the nearest module directory that owns it
+    ///   ([`find_owning_module_dir`]) and rebuilds that module instead — covering both "a controller
+    ///   gained/lost a `loadUI` call" and "a `loadUI` target was created/deleted" with the same
+    ///   rebuild, since [`scan_module_dir`] re-derives the whole association from disk every time.
+    fn update_module_index_for(&self, uri: &Uri) {
+        let Some(path) = uri_to_file_path(uri) else {
+            return;
+        };
+        let is_otmod = is_otmod_uri(uri);
+        let is_lua = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("lua"));
+        let is_otui = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("otui"));
+        if !(is_otmod || is_lua || is_otui) {
+            return;
+        }
+        let module_dir = if is_otmod {
+            path.parent().map(Path::to_path_buf)
+        } else {
+            let roots = self.workspace_root_paths();
+            path.parent()
+                .and_then(|start| find_owning_module_dir(start, &roots))
+        };
+        let Some(module_dir) = module_dir else {
+            return;
+        };
+        let pairs = scan_module_dir(&module_dir);
+        self.module_ui_index
+            .write()
+            .expect("module_ui_index lock poisoned")
+            .set_module(module_dir, pairs);
+    }
 }
 
 /// Compute widget-aware diagnostics for one document and publish them, unless a newer version has
@@ -895,14 +998,303 @@ fn uri_from_file_path(path: &Path) -> Option<Uri> {
 /// have a same-directory/same-stem `.otui` to pair with here. The rest keep their UI elsewhere — a
 /// `styles/` subdirectory (e.g. `game_rewardwall/game_rewardwall.lua` ↔
 /// `game_rewardwall/styles/style.otui`) or an altogether different filename/module layout (e.g.
-/// `game_wheel/classes/*`) — and for those the bridge is silently a no-op in **both** directions:
-/// [`Backend::lua_forward_references`]/[`Backend::lua_references`] simply find no paired document,
-/// same as any other file with no sibling. That is a real gap, not a bug in this rule: associating
-/// such a controller via its `.otmod`/`g_ui.displayUI(...)`/`importStyle(...)` declaration instead is
-/// a legitimate, larger follow-up, deliberately left out of this bridge.
+/// `game_wheel/classes/*`) — and this function alone finds nothing for them: it does not, and cannot
+/// (it has no notion of a "module"), discover a controller/UI pair that does not share a directory and
+/// stem. [`Backend::associated_uris`] closes that gap by additionally consulting
+/// [`ModuleUiIndex`] — the association OTClient's own module loader actually uses (a module's
+/// `.otmod` names its controllers; each controller's `g_ui.loadUI`/`displayUI`/`importStyle` calls
+/// name its UI files) — so this function's result, whenever it exists, is only ever the fast path,
+/// never the whole story.
 fn paired_uri(uri: &Uri, target_ext: &str) -> Option<Uri> {
     let path = uri_to_file_path(uri)?;
     uri_from_file_path(&path.with_extension(target_ext))
+}
+
+/// The workspace-wide module-association index: for every module directory found under the
+/// workspace roots (one containing at least one `*.otmod`), the `.lua` ↔ `.otui` pairs that
+/// directory's own module declares — see [`Backend::module_ui_index`]'s doc comment for the
+/// mechanism and [`scan_module_dir`] for how one module's pairs are computed.
+///
+/// Keyed internally by module directory (`by_module`) rather than flattened straight into the two
+/// derived lookup maps, so a later change to exactly one module ([`Backend::update_module_index_for`])
+/// can replace that module's contribution ([`set_module`](Self::set_module)) without disturbing any
+/// other module's pairs, then cheaply rebuild the two derived maps from scratch — cheap because a
+/// real workspace has on the order of a hundred modules, not a hundred thousand.
+#[derive(Debug, Default)]
+struct ModuleUiIndex {
+    by_module: HashMap<PathBuf, Vec<(Uri, Uri)>>,
+    lua_to_otui: HashMap<Uri, Vec<Uri>>,
+    otui_to_lua: HashMap<Uri, Vec<Uri>>,
+}
+
+impl ModuleUiIndex {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace `module_dir`'s contribution with `pairs` (each `(controller_uri, ui_uri)`), then
+    /// rebuild the derived lookup maps. An empty `pairs` removes the module entirely — the shape
+    /// [`Backend::update_module_index_for`] relies on to clear a module whose `.otmod` was deleted,
+    /// or that no longer declares any resolvable pair.
+    fn set_module(&mut self, module_dir: PathBuf, pairs: Vec<(Uri, Uri)>) {
+        if pairs.is_empty() {
+            self.by_module.remove(&module_dir);
+        } else {
+            self.by_module.insert(module_dir, pairs);
+        }
+        self.rebuild_derived();
+    }
+
+    fn rebuild_derived(&mut self) {
+        self.lua_to_otui.clear();
+        self.otui_to_lua.clear();
+        for pairs in self.by_module.values() {
+            for (lua, otui) in pairs {
+                let lua_list = self.lua_to_otui.entry(lua.clone()).or_default();
+                if !lua_list.contains(otui) {
+                    lua_list.push(otui.clone());
+                }
+                let otui_list = self.otui_to_lua.entry(otui.clone()).or_default();
+                if !otui_list.contains(lua) {
+                    otui_list.push(lua.clone());
+                }
+            }
+        }
+    }
+
+    /// Every `.otui` file `lua_uri` is associated with (its module's `.otmod` names it as a
+    /// controller, and it calls `loadUI`/`displayUI`/`importStyle` on that `.otui`), or an empty
+    /// slice when `lua_uri` is not indexed here at all.
+    fn otui_files_for(&self, lua_uri: &Uri) -> &[Uri] {
+        self.lua_to_otui.get(lua_uri).map_or(&[], Vec::as_slice)
+    }
+
+    /// The reverse of [`otui_files_for`](Self::otui_files_for): every `.lua` controller associated
+    /// with `otui_uri`.
+    fn lua_files_for(&self, otui_uri: &Uri) -> &[Uri] {
+        self.otui_to_lua.get(otui_uri).map_or(&[], Vec::as_slice)
+    }
+
+    /// The number of module directories currently indexed (log/test visibility, mirroring
+    /// [`otui_core::lua_refs::LuaRefIndex::document_count`]).
+    fn module_count(&self) -> usize {
+        self.by_module.len()
+    }
+}
+
+/// Whether `uri` names a `.otmod` file (case-insensitive extension match, like
+/// [`Language::from_uri`]'s `.lua` check) — a module manifest, never a real `.otui`/`.lua` document
+/// in its own right. `did_change_watched_files` routes it away from both the style-index and
+/// Lua-index branches before either can misread it (see the call site).
+fn is_otmod_uri(uri: &Uri) -> bool {
+    uri_to_file_path(uri).is_some_and(|p| {
+        p.extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("otmod"))
+    })
+}
+
+/// Whether `dir` itself directly contains at least one `*.otmod` file (non-recursive — a module's
+/// manifest always sits directly in its own directory in the real engine corpus).
+fn dir_has_otmod(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .path()
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("otmod"))
+    })
+}
+
+/// Walk upward from `start` (inclusive) looking for the nearest ancestor directory that directly
+/// contains a `*.otmod` — "the module `start` lives inside", if any. The walk never goes above a
+/// known workspace root: a `.lua`/`.otui` file living outside any module (most of `data/`, for
+/// instance) must not pay the cost of walking all the way to the filesystem root only to find
+/// nothing, and must not accidentally associate with some unrelated module sitting further up an
+/// unbounded tree. Mirrors [`find_client_root`]'s upward-walk shape.
+fn find_owning_module_dir(start: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
+    let mut dir = Some(start);
+    while let Some(d) = dir {
+        if dir_has_otmod(d) {
+            return Some(d.to_path_buf());
+        }
+        if roots.iter().any(|r| r == d) {
+            return None;
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// Recursively collect every directory under `roots` that directly contains at least one `*.otmod`
+/// file — the full set of module directories the initial workspace scan needs to build
+/// [`ModuleUiIndex`] from scratch. Symlinks are not followed (same discipline as
+/// [`collect_files_under`], for the same reason: the walk must not escape the root or loop).
+fn find_module_dirs(roots: &[Uri]) -> Vec<PathBuf> {
+    let mut out = HashSet::new();
+    for root in roots {
+        if let Some(dir) = uri_to_file_path(root) {
+            collect_module_dirs(&dir, &mut out);
+        }
+    }
+    out.into_iter().collect()
+}
+
+fn collect_module_dirs(dir: &Path, out: &mut HashSet<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut has_otmod = false;
+    let mut subdirs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = path.symlink_metadata() else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            subdirs.push(path);
+        } else if meta.is_file() && path.extension().is_some_and(|e| e == "otmod") {
+            has_otmod = true;
+        }
+    }
+    if has_otmod {
+        out.insert(dir.to_path_buf());
+    }
+    for sub in subdirs {
+        collect_module_dirs(&sub, out);
+    }
+}
+
+/// Compute the full `.lua` ↔ `.otui` association for one module directory — everything
+/// [`Backend::module_ui_index`]'s doc comment describes, for exactly this module:
+///
+/// 1. Read every `*.otmod` directly inside `module_dir` (ordinarily exactly one) and extract its
+///    `scripts:` list ([`otmod_scripts`]). Each entry, resolved relative to `module_dir` with
+///    `.lua` implied, is a candidate controller — **except** an entry ending in `*` (module doc
+///    comment: OTClient's own directory-wildcard form), which is expanded here via
+///    [`collect_files_under`] instead of treated as a single file, since resolving it needs exactly
+///    the recursive-listing capability that helper already provides for the workspace-wide `.lua`
+///    scan.
+/// 2. Read each candidate controller that actually exists on disk (via [`read_indexed_file`], so an
+///    oversized/binary/unreadable one is silently skipped, matching every other reader in this
+///    file) and scan it for `g_ui.loadUI`/`displayUI`/`importStyle` calls
+///    ([`scan_ui_loads`]).
+/// 3. Resolve each call's argument relative to **that controller's own directory** — not
+///    `module_dir` — with `.otui` implied, and keep the pair only when that target **actually
+///    exists on disk** — the correctness rule this whole mechanism rests on (a load whose target
+///    does not exist would be a false pairing dressed up as a real one; see the module doc
+///    comment's "no false pairing" rule). The controller's own directory, mirroring the engine's
+///    `LuaInterface::loadScript`, which resolves a relative argument against
+///    `getCurrentSourcePath()` — the directory of whichever `.lua` source is *currently executing*
+///    the call. That coincides with `module_dir` for a top-level controller, but not for a nested
+///    one: `game_cyclopedia/tab/bestiary/bestiary.lua`'s `g_ui.loadUI("bestiary")` (real corpus
+///    example) resolves against `tab/bestiary/`, where its sibling `bestiary.otui` actually lives —
+///    resolving against `module_dir` instead would look for a `game_cyclopedia/bestiary.otui` that
+///    does not exist and silently drop the pairing.
+///
+/// Best-effort throughout, matching the wildcard/variable-argument tolerances
+/// [`otmod_scripts`]/[`scan_ui_loads`] already document: a missing `.otmod`, a controller that
+/// loads nothing, or a `loadUI` argument that is a variable simply contributes no pair — never a
+/// panic, never a guess. A `loadUI` argument starting with `/` (resolved by the engine against the
+/// mounted virtual filesystem root, not a plain relative join — 4 complete-literal calls in the
+/// whole engine corpus) is likewise left unresolved rather than guessed at.
+fn scan_module_dir(module_dir: &Path) -> Vec<(Uri, Uri)> {
+    let mut controllers: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(module_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("otmod"))
+            {
+                continue;
+            }
+            let Some(otmod_uri) = uri_from_file_path(&path) else {
+                continue;
+            };
+            let Some(text) = read_indexed_file(&otmod_uri) else {
+                continue;
+            };
+            for script in otmod_scripts(&text) {
+                if let Some(sub) = script.strip_suffix('*') {
+                    let listing_dir = module_dir.join(sub.trim_end_matches('/'));
+                    let mut found: HashMap<Uri, String> = HashMap::new();
+                    collect_files_under(&listing_dir, "lua", &mut found);
+                    controllers.extend(found.into_keys().filter_map(|u| uri_to_file_path(&u)));
+                } else {
+                    let mut p = module_dir.join(&script);
+                    if p.extension().is_none() {
+                        p.set_extension("lua");
+                    }
+                    controllers.push(p);
+                }
+            }
+        }
+    }
+    controllers.sort();
+    controllers.dedup();
+
+    let mut pairs: Vec<(Uri, Uri)> = Vec::new();
+    for controller_path in controllers {
+        let Some(lua_uri) = uri_from_file_path(&controller_path) else {
+            continue;
+        };
+        let Some(text) = read_indexed_file(&lua_uri) else {
+            continue;
+        };
+        // The controller's OWN directory, not `module_dir` — `LuaInterface::loadScript` resolves a
+        // relative argument against `getCurrentSourcePath()`, the directory of whichever `.lua`
+        // source is *currently executing* the call, which is only the module's root for a top-level
+        // controller. A nested one (`game_cyclopedia/tab/bestiary/bestiary.lua`, real corpus example)
+        // resolves `g_ui.loadUI("bestiary")` against `tab/bestiary/`, not `game_cyclopedia/` —
+        // resolving against `module_dir` here would look for a `game_cyclopedia/bestiary.otui` that
+        // does not exist, and silently miss the pairing entirely.
+        let controller_dir = controller_path.parent().unwrap_or(module_dir);
+        for load in scan_ui_loads(&text) {
+            if load.path.starts_with('/') {
+                // A leading `/` resolves against the mounted virtual filesystem root (the OTClient
+                // install's `data`/`modules` mount), not a plain relative join — the same rule
+                // `otui_core::links`/`resolve_asset_candidates` already handles for ordinary
+                // `image-source`/`icon` asset paths, but doing so here would need this function to
+                // also carry a confirmed client-install root per controller. Rare in the real corpus
+                // (4 complete-literal calls total) — best-effort: skip rather than guess.
+                continue;
+            }
+            let mut p = controller_dir.join(&load.path);
+            if p.extension().is_none() {
+                p.set_extension("otui");
+            }
+            if !p.is_file() {
+                continue; // best-effort: never pair against a target that does not exist on disk
+            }
+            let Some(otui_uri) = uri_from_file_path(&p) else {
+                continue;
+            };
+            pairs.push((lua_uri.clone(), otui_uri));
+        }
+    }
+    pairs.sort_by(|a, b| (a.0.as_str(), a.1.as_str()).cmp(&(b.0.as_str(), b.1.as_str())));
+    pairs.dedup();
+    pairs
+}
+
+/// Build [`ModuleUiIndex`] from scratch by scanning every module directory under `roots`. Blocking
+/// filesystem work, run only from the background scan thread — mirrors
+/// [`scan_workspace`]/[`scan_workspace_lua`] in that respect.
+fn build_module_index(roots: &[Uri]) -> ModuleUiIndex {
+    let mut index = ModuleUiIndex::new();
+    for dir in find_module_dirs(roots) {
+        let pairs = scan_module_dir(&dir);
+        if !pairs.is_empty() {
+            index.by_module.insert(dir, pairs);
+        }
+    }
+    index.rebuild_derived();
+    index
 }
 
 /// The two subdirectories that, together with `init.lua` itself, confirm a directory is the real
@@ -2482,13 +2874,15 @@ impl Backend {
             },
         );
 
-        // Watch every `.otui` (style corpus) and `.lua` (widget-definition corpus) in the workspace
-        // so both indexes track files edited/created/deleted on disk outside the editor (or in files
-        // the user never opens). Registered dynamically for the same reason as type hierarchy above:
-        // it is the portable way to request `workspace/didChangeWatchedFiles`, and (like above) it is
+        // Watch every `.otui` (style corpus), `.lua` (widget-definition corpus) and `.otmod` (module
+        // manifest, `module_ui_index`'s association source) in the workspace so all three indexes
+        // track files edited/created/deleted on disk outside the editor (or in files the user never
+        // opens). Registered dynamically for the same reason as type hierarchy above: it is the
+        // portable way to request `workspace/didChangeWatchedFiles`, and (like above) it is
         // fire-and-forget — the client's ack is a `Message::Response` the loop ignores. A client that
-        // honors dynamic watcher registration (VS Code, Neovim) then delivers `.lua` change events to
-        // keep the Lua widget index live; one that does not still gets the initial scan below.
+        // honors dynamic watcher registration (VS Code, Neovim) then delivers `.lua`/`.otmod` change
+        // events to keep the Lua widget/module-association indexes live; one that does not still gets
+        // the initial scan below.
         self.register_capability(
             "otui-watched-files",
             Registration {
@@ -2502,6 +2896,10 @@ impl Backend {
                         },
                         FileSystemWatcher {
                             glob_pattern: GlobPattern::String("**/*.lua".to_owned()),
+                            kind: None,
+                        },
+                        FileSystemWatcher {
+                            glob_pattern: GlobPattern::String("**/*.otmod".to_owned()),
                             kind: None,
                         },
                     ],
@@ -2527,6 +2925,7 @@ impl Backend {
             let lua_index = Arc::clone(&self.lua_index);
             let lua_ref_index = Arc::clone(&self.lua_ref_index);
             let lua_texts = Arc::clone(&self.lua_texts);
+            let module_ui_index = Arc::clone(&self.module_ui_index);
             let disk_texts = Arc::clone(&self.disk_texts);
             let documents = Arc::clone(&self.documents);
             let reindex_guard = Arc::clone(&self.reindex_guard);
@@ -2636,10 +3035,25 @@ impl Backend {
                         lua_refs_indexed += 1;
                     }
                 }
+                // Then build the module-association index (`.otmod` → controllers → loaded `.otui`
+                // files, module doc comment on `Backend::module_ui_index`). Independent of the two
+                // scans above — it re-reads every module's `.otmod`/controllers/UI files itself
+                // (`scan_module_dir`) rather than reusing `disk_texts`/`lua_texts`, so it is
+                // unaffected by whichever of the loops above the shutdown flag cut short.
+                if shutdown.load(Ordering::Relaxed) {
+                    return;
+                }
+                let built = build_module_index(&roots);
+                let module_indexed = built.module_count();
+                *module_ui_index
+                    .write()
+                    .expect("module_ui_index lock poisoned") = built;
+
                 // Progress on stderr, never the LSP channel.
                 eprintln!(
                     "otui-lsp: indexed {indexed} workspace .otui file(s), \
-                     {lua_indexed} .lua widget file(s), {lua_refs_indexed} .lua ref file(s)"
+                     {lua_indexed} .lua widget file(s), {lua_refs_indexed} .lua ref file(s), \
+                     {module_indexed} module(s) with a resolvable UI association"
                 );
                 // Completion refresh: the indexes are now complete, so re-diagnose every open
                 // document to clear any stale widget-aware hint computed against a partial index
@@ -2719,6 +3133,22 @@ impl Backend {
     fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         for change in params.changes {
             let uri = change.uri;
+
+            // Module association bookkeeping runs for EVERY relevant change (`.otmod`/`.lua`/
+            // `.otui`), independent of the open-buffer / style-index / Lua-index handling below —
+            // it is pure disk-existence bookkeeping (see `update_module_index_for`'s doc comment),
+            // so it must run before any branch below that `continue`s past it (the open-buffer
+            // check, in particular: a currently-open `.otui`/`.lua` file's on-disk existence still
+            // matters here even though its style/Lua-index re-indexing is skipped for it).
+            self.update_module_index_for(&uri);
+
+            if is_otmod_uri(&uri) {
+                // A `.otmod` module manifest is never a style/Lua document in its own right —
+                // `update_module_index_for` above already consumed it; routing it into either branch
+                // below would feed OTML module-manifest text into `style_defs`/`lua_widgets` as if it
+                // were a real `.otui`/`.lua` document.
+                continue;
+            }
             // A `.lua` widget module feeds the Lua index only (no open-buffer or disk-text tracking —
             // Lua is never an open OTUI document), so route it before the `.otui` logic.
             //
@@ -3220,49 +3650,55 @@ impl Backend {
         Some(locations)
     }
 
-    /// The forward half of the OTUI↔Lua bridge: every use of `id` in `otui_uri`'s **paired** `.lua`
-    /// controller ([`paired_uri`]), as LSP [`Location`]s in that file.
+    /// The forward half of the OTUI↔Lua bridge: every use of `id` in every `.lua` controller
+    /// associated with `otui_uri` ([`Backend::associated_uris`] — the same-stem fast path
+    /// ([`paired_uri`]) plus the `.otmod`-derived module association), as LSP [`Location`]s in each
+    /// file.
     ///
-    /// Scoped by [`LuaRefIndex::document`] — the paired document only — never the unscoped
+    /// Scoped by [`LuaRefIndex::document`] per associated file — never the unscoped
     /// [`LuaRefIndex::lookup`] (see [`lua_ref_index`](Self::lua_ref_index)'s doc comment: an id like
     /// `closeButton` repeats across dozens of unrelated modules in a real workspace). Every ref kind
     /// (`GetChildById`, `RecursiveGetChildById`, `DotUi`) is included on the same terms: each
     /// candidate is already filtered to `ref.id == id`, so a `DotUi` hit is, by construction, "a
     /// chain segment whose text equals this id" — the best-effort rule
     /// [`otui_core::lua_refs`] documents for that ambiguous form; nothing widens it further (e.g. no
-    /// attempt to also fall back to a chain PREFIX or a differently-cased match). Empty when the
-    /// paired file has no on-disk/open text, is not indexed, or contributes no matching ref.
+    /// attempt to also fall back to a chain PREFIX or a differently-cased match). Empty when
+    /// `otui_uri` has no associated file at all, or none of them have on-disk/open text, are
+    /// indexed, or contribute a matching ref.
     fn lua_forward_references(
         &self,
         otui_uri: &Uri,
         id: &str,
         encoding: PositionEncoding,
     ) -> Vec<Location> {
-        let Some(lua_uri) = paired_uri(otui_uri, "lua") else {
-            return Vec::new();
-        };
-        let Some(lua_text) = self.lua_text_for(&lua_uri) else {
-            return Vec::new();
-        };
-        let doc_id = DocId::from(lua_uri.to_string());
-        let index = self
-            .lua_ref_index
-            .read()
-            .expect("lua_ref_index lock poisoned");
-        let Some(doc_refs) = index.document(&doc_id) else {
-            return Vec::new();
-        };
-        doc_refs
-            .iter()
-            .filter(|r| r.id == id)
-            .map(|r| convert::location_of(lua_uri.clone(), &lua_text, r.span, encoding))
-            .collect()
+        let mut out = Vec::new();
+        for lua_uri in self.associated_uris(otui_uri, "lua") {
+            let Some(lua_text) = self.lua_text_for(&lua_uri) else {
+                continue;
+            };
+            let doc_id = DocId::from(lua_uri.to_string());
+            let index = self
+                .lua_ref_index
+                .read()
+                .expect("lua_ref_index lock poisoned");
+            let Some(doc_refs) = index.document(&doc_id) else {
+                continue;
+            };
+            out.extend(
+                doc_refs
+                    .iter()
+                    .filter(|r| r.id == id)
+                    .map(|r| convert::location_of(lua_uri.clone(), &lua_text, r.span, encoding)),
+            );
+        }
+        out
     }
 
     /// The reverse half of the OTUI↔Lua bridge: the cursor sits in `lua_uri` on a
     /// `getChildById`/`recursiveGetChildById`/`.ui.` token — resolve it back to the `id:`
-    /// declaration site(s) in the **paired** `.otui` (spec §2.3), including any inherited style body
-    /// that declares it ([`visible_ids`]).
+    /// declaration site(s) in every `.otui` file associated with `lua_uri`
+    /// ([`Backend::associated_uris`]; spec §2.3), including any inherited style body that declares
+    /// it ([`visible_ids`]).
     ///
     /// `None` when the cursor is not on any recognized reference form ([`lua_refs::ref_at`]) — "not
     /// applicable here", the same answer every other OTUI-only handler gives for an unrelated
@@ -3284,27 +3720,28 @@ impl Backend {
         let target_ref = otui_core::lua_refs::ref_at(&text, offset)?;
 
         let mut out = Vec::new();
-        if let Some(otui_uri) = paired_uri(lua_uri, "otui") {
-            let documents = self.merged_documents();
-            if let Some(otui_doc) = documents.get(&otui_uri) {
-                let styles = self.style_index.read().expect("style_index lock poisoned");
-                let lua_widgets = self.lua_index.read().expect("lua_index lock poisoned");
-                let visible = visible_ids(&otui_doc.text, &styles, &lua_widgets);
-                for v in visible.iter().filter(|v| v.id == target_ref.id) {
-                    let loc = match &v.origin {
-                        IdOrigin::Document => Some(convert::location_of(
-                            otui_uri.clone(),
-                            &otui_doc.text,
-                            v.span,
-                            encoding,
-                        )),
-                        IdOrigin::InheritedStyle { doc, .. } => {
-                            resolve_location(doc, v.span, &documents, encoding)
-                        }
-                    };
-                    if let Some(loc) = loc {
-                        out.push(loc);
+        let documents = self.merged_documents();
+        let styles = self.style_index.read().expect("style_index lock poisoned");
+        let lua_widgets = self.lua_index.read().expect("lua_index lock poisoned");
+        for otui_uri in self.associated_uris(lua_uri, "otui") {
+            let Some(otui_doc) = documents.get(&otui_uri) else {
+                continue;
+            };
+            let visible = visible_ids(&otui_doc.text, &styles, &lua_widgets);
+            for v in visible.iter().filter(|v| v.id == target_ref.id) {
+                let loc = match &v.origin {
+                    IdOrigin::Document => Some(convert::location_of(
+                        otui_uri.clone(),
+                        &otui_doc.text,
+                        v.span,
+                        encoding,
+                    )),
+                    IdOrigin::InheritedStyle { doc, .. } => {
+                        resolve_location(doc, v.span, &documents, encoding)
                     }
+                };
+                if let Some(loc) = loc {
+                    out.push(loc);
                 }
             }
         }
@@ -6957,5 +7394,354 @@ end
         assert!(backend
             .on_type_formatting(on_type_formatting_params(&uri, Position::new(0, 0), "\n"))
             .is_none());
+    }
+
+    // --- module-association index (`ModuleUiIndex`/`scan_module_dir`/`find_owning_module_dir`) ---
+    //
+    // Focused, disk-backed unit tests of the pure resolution logic, one directory tree per test — the
+    // full request/response coverage (driving `textDocument/references` through the real LSP loop in
+    // both directions) lives in `tests/loop_dispatch.rs`; these pin the underlying disk seam the way
+    // `scan_workspace_indexes_otui_and_skips_binary_and_non_otui` pins `scan_workspace`'s.
+
+    /// RAII guard mirroring `tests/loop_dispatch.rs`'s `TempDirGuard`: removes its directory on drop,
+    /// including on an unwinding panic from a failed assertion (unlike a trailing
+    /// `std::fs::remove_dir_all`, which a panic skips and leaks the temp directory).
+    struct ModuleTestDir(std::path::PathBuf);
+    impl Drop for ModuleTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn scan_module_dir_resolves_a_controller_and_ui_file_across_directories() {
+        // The exact shape the fast-path `paired_uri` alone cannot resolve: `ctrl.lua` and
+        // `styles/ui.otui` share neither a directory nor a stem.
+        let base = std::env::temp_dir().join(format!("otui-module-scan-{}", std::process::id()));
+        let _cleanup = ModuleTestDir(base.clone());
+        std::fs::create_dir_all(base.join("styles")).expect("mkdir styles");
+        std::fs::write(
+            base.join("mymodule.otmod"),
+            "Module\n  name: mymodule\n  scripts: [ ctrl ]\n",
+        )
+        .expect("write otmod");
+        std::fs::write(
+            base.join("ctrl.lua"),
+            "function onCreate(w)\n  g_ui.loadUI('styles/ui')\n  \
+             local btn = w:getChildById('x')\nend\n",
+        )
+        .expect("write ctrl.lua");
+        std::fs::write(
+            base.join("styles").join("ui.otui"),
+            "MainWindow < UIWidget\n  Button\n    id: x\n",
+        )
+        .expect("write ui.otui");
+
+        let pairs = scan_module_dir(&base);
+        assert_eq!(pairs.len(), 1, "{pairs:?}");
+        assert!(pairs[0].0.as_str().ends_with("ctrl.lua"), "{pairs:?}");
+        assert!(
+            pairs[0].1.as_str().ends_with("styles/ui.otui")
+                || pairs[0].1.as_str().ends_with("styles%2Fui.otui"),
+            "{pairs:?}"
+        );
+    }
+
+    #[test]
+    fn scan_module_dir_ignores_a_load_ui_target_that_does_not_exist_on_disk() {
+        // Best-effort / no-false-pairing rule: a `loadUI` argument naming a file that is not actually
+        // on disk must never become a pair.
+        let base =
+            std::env::temp_dir().join(format!("otui-module-scan-missing-{}", std::process::id()));
+        let _cleanup = ModuleTestDir(base.clone());
+        std::fs::create_dir_all(&base).expect("mkdir");
+        std::fs::write(base.join("m.otmod"), "Module\n  scripts: [ ctrl ]\n").expect("write otmod");
+        std::fs::write(base.join("ctrl.lua"), "g_ui.loadUI('does-not-exist')\n")
+            .expect("write ctrl.lua");
+
+        assert!(scan_module_dir(&base).is_empty());
+    }
+
+    #[test]
+    fn scan_module_dir_ignores_a_variable_load_ui_argument() {
+        let base =
+            std::env::temp_dir().join(format!("otui-module-scan-var-{}", std::process::id()));
+        let _cleanup = ModuleTestDir(base.clone());
+        std::fs::create_dir_all(&base).expect("mkdir");
+        std::fs::write(base.join("m.otmod"), "Module\n  scripts: [ ctrl ]\n").expect("write otmod");
+        std::fs::write(base.join("ctrl.lua"), "g_ui.loadUI(dynamicName)\n")
+            .expect("write ctrl.lua");
+        std::fs::write(base.join("dynamicName.otui"), "Panel < UIWidget\n").expect("write otui");
+
+        assert!(
+            scan_module_dir(&base).is_empty(),
+            "a variable argument must never be resolved, even if a file happens to share its name"
+        );
+    }
+
+    #[test]
+    fn scan_module_dir_resolves_a_wildcard_scripts_entry() {
+        // `scripts: [*]` (module doc comment / `otmod_scripts`'s doc comment): every `.lua` directly
+        // reachable under the module directory, recursively. The `loadUI`-style target resolves
+        // against the CONTROLLER's own directory (`nested/`), not the module root — see
+        // `scan_module_dir`'s doc comment (`getCurrentSourcePath` / the `bestiary.lua` corpus
+        // example) — so `deep.otui` must sit next to `deep.lua`, not at the module root.
+        let base =
+            std::env::temp_dir().join(format!("otui-module-scan-wild-{}", std::process::id()));
+        let _cleanup = ModuleTestDir(base.clone());
+        std::fs::create_dir_all(base.join("nested")).expect("mkdir nested");
+        std::fs::write(base.join("m.otmod"), "Module\n  scripts: [*]\n").expect("write otmod");
+        std::fs::write(
+            base.join("nested").join("deep.lua"),
+            "g_ui.importStyle('deep')\n",
+        )
+        .expect("write deep.lua");
+        std::fs::write(base.join("nested").join("deep.otui"), "Panel < UIWidget\n")
+            .expect("write otui");
+
+        let pairs = scan_module_dir(&base);
+        assert_eq!(pairs.len(), 1, "{pairs:?}");
+        assert!(pairs[0].0.as_str().ends_with("deep.lua"), "{pairs:?}");
+        assert!(
+            pairs[0].1.as_str().ends_with("nested/deep.otui"),
+            "{pairs:?}"
+        );
+    }
+
+    #[test]
+    fn scan_module_dir_resolves_a_nested_controllers_ui_relative_to_its_own_directory() {
+        // The exact real-corpus shape (`game_cyclopedia/tab/bestiary/bestiary.lua`): a controller
+        // named by `scripts:` lives in a SUBdirectory of the module, and its `loadUI` target sits
+        // next to it, not at the module root.
+        let base =
+            std::env::temp_dir().join(format!("otui-module-scan-nested-{}", std::process::id()));
+        let _cleanup = ModuleTestDir(base.clone());
+        std::fs::create_dir_all(base.join("tab").join("bestiary")).expect("mkdir");
+        std::fs::write(
+            base.join("m.otmod"),
+            "Module\n  scripts: [ tab/bestiary/bestiary ]\n",
+        )
+        .expect("write otmod");
+        std::fs::write(
+            base.join("tab").join("bestiary").join("bestiary.lua"),
+            "UI = g_ui.loadUI(\"bestiary\", contentContainer)\n",
+        )
+        .expect("write bestiary.lua");
+        std::fs::write(
+            base.join("tab").join("bestiary").join("bestiary.otui"),
+            "Panel < UIWidget\n",
+        )
+        .expect("write bestiary.otui");
+        // A decoy at the module root must NOT be what resolves — proves the fix actually matters
+        // (resolving against `module_dir` would have found this file instead and passed anyway).
+        std::fs::write(base.join("bestiary.otui"), "Panel < UIWidget\n  // decoy\n")
+            .expect("decoy");
+
+        let pairs = scan_module_dir(&base);
+        assert_eq!(pairs.len(), 1, "{pairs:?}");
+        assert!(
+            pairs[0].1.as_str().ends_with("tab/bestiary/bestiary.otui"),
+            "must resolve next to the controller, not at the module root: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn scan_module_dir_is_empty_when_there_is_no_otmod() {
+        let base =
+            std::env::temp_dir().join(format!("otui-module-scan-none-{}", std::process::id()));
+        let _cleanup = ModuleTestDir(base.clone());
+        std::fs::create_dir_all(&base).expect("mkdir");
+        std::fs::write(base.join("ctrl.lua"), "g_ui.loadUI('x')\n").expect("write ctrl.lua");
+        std::fs::write(base.join("x.otui"), "Panel < UIWidget\n").expect("write otui");
+
+        assert!(scan_module_dir(&base).is_empty());
+    }
+
+    #[test]
+    fn find_module_dirs_finds_a_nested_module_directory() {
+        let base = std::env::temp_dir().join(format!("otui-find-modules-{}", std::process::id()));
+        let _cleanup = ModuleTestDir(base.clone());
+        let module_dir = base.join("modules").join("nested_module");
+        std::fs::create_dir_all(&module_dir).expect("mkdir");
+        std::fs::write(module_dir.join("nested_module.otmod"), "Module\n").expect("write otmod");
+        std::fs::create_dir_all(base.join("modules").join("no_otmod_here")).expect("mkdir");
+
+        let root = uri_from_file_path(&base).expect("root uri");
+        let dirs = find_module_dirs(&[root]);
+        assert_eq!(dirs, vec![module_dir]);
+    }
+
+    #[test]
+    fn find_owning_module_dir_walks_up_to_the_nearest_otmod() {
+        let base = std::env::temp_dir().join(format!("otui-owning-module-{}", std::process::id()));
+        let _cleanup = ModuleTestDir(base.clone());
+        let module_dir = base.join("game_wheel");
+        let deep = module_dir.join("classes");
+        std::fs::create_dir_all(&deep).expect("mkdir");
+        std::fs::write(module_dir.join("wheel.otmod"), "Module\n").expect("write otmod");
+
+        let found = find_owning_module_dir(&deep, std::slice::from_ref(&base));
+        assert_eq!(found, Some(module_dir));
+    }
+
+    #[test]
+    fn find_owning_module_dir_stops_at_a_workspace_root_and_finds_nothing_beyond_it() {
+        // A file living outside any module (most of `data/`, for instance) must not walk past the
+        // workspace root looking for a module that owns it, and must not find an unrelated module
+        // sitting further up an unbounded tree.
+        let base =
+            std::env::temp_dir().join(format!("otui-owning-module-bound-{}", std::process::id()));
+        let _cleanup = ModuleTestDir(base.clone());
+        // An otmod ABOVE the workspace root must never be found.
+        std::fs::write(
+            std::env::temp_dir().join(format!("unrelated-{}.otmod", std::process::id())),
+            "Module\n",
+        )
+        .ok();
+        let data_dir = base.join("data").join("styles");
+        std::fs::create_dir_all(&data_dir).expect("mkdir");
+
+        let found = find_owning_module_dir(&data_dir, std::slice::from_ref(&base));
+        assert!(found.is_none(), "{found:?}");
+        // Cleanup the stray file created above (best-effort; a leaked temp file elsewhere costs
+        // nothing but tidiness).
+        let _ = std::fs::remove_file(
+            std::env::temp_dir().join(format!("unrelated-{}.otmod", std::process::id())),
+        );
+    }
+
+    #[test]
+    fn build_module_index_aggregates_every_module_and_supports_bidirectional_lookup() {
+        let base =
+            std::env::temp_dir().join(format!("otui-build-module-index-{}", std::process::id()));
+        let _cleanup = ModuleTestDir(base.clone());
+        let module_dir = base.join("mymodule");
+        std::fs::create_dir_all(module_dir.join("styles")).expect("mkdir");
+        std::fs::write(module_dir.join("m.otmod"), "Module\n  scripts: [ ctrl ]\n").expect("otmod");
+        std::fs::write(module_dir.join("ctrl.lua"), "g_ui.loadUI('styles/ui')\n")
+            .expect("ctrl.lua");
+        std::fs::write(
+            module_dir.join("styles").join("ui.otui"),
+            "Panel < UIWidget\n",
+        )
+        .expect("otui");
+
+        let root = uri_from_file_path(&base).expect("root uri");
+        let index = build_module_index(&[root]);
+        assert_eq!(index.module_count(), 1);
+
+        let lua_uri = uri_from_file_path(&module_dir.join("ctrl.lua")).expect("uri");
+        let otui_uri = uri_from_file_path(&module_dir.join("styles").join("ui.otui")).expect("uri");
+        assert_eq!(
+            index.otui_files_for(&lua_uri),
+            std::slice::from_ref(&otui_uri)
+        );
+        assert_eq!(index.lua_files_for(&otui_uri), [lua_uri]);
+    }
+
+    #[test]
+    fn module_ui_index_set_module_with_empty_pairs_removes_the_module() {
+        let mut index = ModuleUiIndex::new();
+        let dir = std::path::PathBuf::from("/scratch/mymodule");
+        let lua = Uri::from_str("file:///scratch/mymodule/ctrl.lua").expect("uri");
+        let otui = Uri::from_str("file:///scratch/mymodule/styles/ui.otui").expect("uri");
+        index.set_module(dir.clone(), vec![(lua.clone(), otui.clone())]);
+        assert_eq!(index.module_count(), 1);
+        assert_eq!(index.otui_files_for(&lua), std::slice::from_ref(&otui));
+
+        index.set_module(dir, Vec::new());
+        assert_eq!(index.module_count(), 0);
+        assert!(index.otui_files_for(&lua).is_empty());
+        assert!(index.lua_files_for(&otui).is_empty());
+    }
+
+    #[test]
+    fn watched_otmod_creation_populates_the_module_index_without_a_workspace_scan() {
+        use lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let base = std::env::temp_dir().join(format!("otui-watch-otmod-{}", std::process::id()));
+        let _cleanup = ModuleTestDir(base.clone());
+        std::fs::create_dir_all(base.join("styles")).expect("mkdir");
+        let ctrl_path = base.join("ctrl.lua");
+        std::fs::write(&ctrl_path, "g_ui.loadUI('styles/ui')\n").expect("write ctrl.lua");
+        std::fs::write(base.join("styles").join("ui.otui"), "Panel < UIWidget\n")
+            .expect("write ui.otui");
+        let otmod_path = base.join("m.otmod");
+        std::fs::write(&otmod_path, "Module\n  scripts: [ ctrl ]\n").expect("write otmod");
+
+        // No workspace root registered at all — proves this update is driven purely by the watched
+        // file event handler, never by the (in this case nonexistent) background scan.
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let backend = Backend::new(tx, &InitializeParams::default());
+
+        let ctrl_uri = uri_from_file_path(&ctrl_path).expect("uri");
+        let ui_uri = uri_from_file_path(&base.join("styles").join("ui.otui")).expect("uri");
+        let otmod_uri = uri_from_file_path(&otmod_path).expect("uri");
+        // `associated_uris` always includes `paired_uri`'s same-stem candidate whether or not it
+        // exists on disk (existence is checked downstream, by whoever tries to read its text) — so
+        // "nothing indexed yet" is checked by absence of the module-derived `ui_uri`, not emptiness.
+        assert!(
+            !backend.associated_uris(&ctrl_uri, "otui").contains(&ui_uri),
+            "the module association must not exist before the watched change fires"
+        );
+
+        backend.did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: vec![FileEvent {
+                uri: otmod_uri.clone(),
+                typ: FileChangeType::CREATED,
+            }],
+        });
+
+        assert!(backend.associated_uris(&ctrl_uri, "otui").contains(&ui_uri));
+        assert!(backend.associated_uris(&ui_uri, "lua").contains(&ctrl_uri));
+        // A `.otmod` manifest must never be routed into the OTUI style index — it is not a real
+        // `.otui` document (see `is_otmod_uri`'s doc comment).
+        assert!(backend
+            .style_index
+            .read()
+            .expect("style_index lock poisoned")
+            .document(&DocId::from(otmod_uri.to_string()))
+            .is_none());
+    }
+
+    #[test]
+    fn watched_otmod_deletion_clears_its_modules_associations() {
+        use lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let base =
+            std::env::temp_dir().join(format!("otui-watch-otmod-del-{}", std::process::id()));
+        let _cleanup = ModuleTestDir(base.clone());
+        std::fs::create_dir_all(&base).expect("mkdir");
+        std::fs::write(base.join("ctrl.lua"), "g_ui.loadUI('ui')\n").expect("write ctrl.lua");
+        std::fs::write(base.join("ui.otui"), "Panel < UIWidget\n").expect("write ui.otui");
+        let otmod_path = base.join("m.otmod");
+        std::fs::write(&otmod_path, "Module\n  scripts: [ ctrl ]\n").expect("write otmod");
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let backend = Backend::new(tx, &InitializeParams::default());
+        let otmod_uri = uri_from_file_path(&otmod_path).expect("uri");
+        let ctrl_uri = uri_from_file_path(&base.join("ctrl.lua")).expect("uri");
+        let ui_uri = uri_from_file_path(&base.join("ui.otui")).expect("uri");
+
+        backend.did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: vec![FileEvent {
+                uri: otmod_uri.clone(),
+                typ: FileChangeType::CREATED,
+            }],
+        });
+        assert!(backend.associated_uris(&ctrl_uri, "otui").contains(&ui_uri));
+
+        // Now the `.otmod` is deleted on disk, and the watcher tells us.
+        std::fs::remove_file(&otmod_path).expect("remove otmod");
+        backend.did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: vec![FileEvent {
+                uri: otmod_uri,
+                typ: FileChangeType::DELETED,
+            }],
+        });
+        assert!(
+            !backend.associated_uris(&ctrl_uri, "otui").contains(&ui_uri),
+            "a deleted .otmod must clear its module's associations"
+        );
     }
 }

@@ -195,6 +195,50 @@ fn call_string_literals<'a>(
     })
 }
 
+/// Parse a **single leading** string literal from the start of `rest` (after optional leading
+/// whitespace): the quote, its body (bounded to the current line, escape-free), and the closing
+/// quote. Returns `(literal_text, content_start, content_end, after_offset)` — the decoded literal,
+/// the byte offsets of its **content** (excluding the quotes) relative to `rest`, and the byte
+/// offset in `rest` immediately after the closing quote (so a caller can inspect what follows the
+/// literal — e.g. to decide whether it is a call's *sole* argument, or merely its *first*) — or
+/// `None` when `rest` does not begin (after whitespace) with a quote, the closing quote is never
+/// found on the current line, or the body carries a backslash escape.
+///
+/// Shared by every "a call's argument is a complete string literal" scan in this crate:
+/// [`sole_string_literal_arg`] below (`getChildById`/`recursiveGetChildById`/`setId`, spec §2.3) and
+/// [`crate::lua_ui_loads`]'s scan of `g_ui.loadUI`/`displayUI`/`importStyle`, whose *first* argument
+/// is the one that matters even though a second (`parent`) argument may legally follow it.
+///
+/// * **Bounded to the current line.** A Lua short string cannot span a raw newline, and
+///   `excluded_ranges` already relies on that — but an earlier version of this function scanned on
+///   to EOF, so the two disagreed and this module's advertised "an unterminated quote costs only its
+///   own line" was false here. Mid-edit (which is most of the time in an editor) `w:getChildById('`
+///   with the quote not yet closed would then borrow the next line's quote — and `if c == ')'`, an
+///   everyday idiom, supplies both a quote and the `)` a sole-argument check looks for — yielding an
+///   id with a newline inside it and a span painted across several lines.
+/// * **An escape is rejected outright, not decoded.** This function hands back the *raw source
+///   text*, whereas Lua's actual value is the decoded one (`'a\t'` is a tab, not a backslash and a
+///   `t`), so an id built from an escape would never match a real `id:` anyway. Zero occurrences in
+///   the engine's `getChildById`/`setId` calls.
+pub(crate) fn leading_string_literal(rest: &str) -> Option<(String, usize, usize, usize)> {
+    let ws = rest.len() - rest.trim_start().len();
+    let quote = rest[ws..].chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let content_start = ws + quote.len_utf8();
+    let line_end = rest[content_start..]
+        .find('\n')
+        .map_or(rest.len(), |rel| content_start + rel);
+    let close_rel = rest[content_start..line_end].find(quote)? + content_start;
+    let body = &rest[content_start..close_rel];
+    if body.contains('\\') {
+        return None;
+    }
+    let after_offset = close_rel + quote.len_utf8();
+    Some((body.to_owned(), content_start, close_rel, after_offset))
+}
+
 /// Parse a call's sole, complete string-literal argument from `rest` — the text immediately
 /// following the call's opening `(`. Returns `(literal_text, rel_start, rel_end)`, the decoded
 /// literal and the byte offsets of its **content** (excluding the quotes) relative to `rest`, only
@@ -204,37 +248,12 @@ fn call_string_literals<'a>(
 /// literal — yields `None`: the id is not known at scan time, so it cannot be indexed. This is the
 /// mechanism behind the corpus rule that a concatenation-built id (`'perkColumn_' .. i`) is never
 /// picked up — the text after the closing quote is `.. i)`, not (after trimming) `)`, so the match
-/// fails here. No escape handling (consistent with the rest of this crate's Lua-as-text scanning):
-/// a literal's content runs to the next occurrence of its own quote character.
+/// fails here.
 fn sole_string_literal_arg(rest: &str) -> Option<(String, usize, usize)> {
-    let ws = rest.len() - rest.trim_start().len();
-    let quote = rest[ws..].chars().next()?;
-    if quote != '\'' && quote != '"' {
-        return None;
-    }
-    let content_start = ws + quote.len_utf8();
-    // Bound the search for the closing quote to the same line. A Lua short string cannot span a raw
-    // newline, and `excluded_ranges` already relies on that — but this function used to scan on to
-    // EOF, so the two disagreed and the module's advertised "an unterminated quote costs only its own
-    // line" was false here. Mid-edit (which is most of the time in an editor) `w:getChildById('` with
-    // the quote not yet closed would then borrow the next line's quote — and `if c == ')'`, an
-    // everyday idiom, supplies both a quote and the `)` this function looks for — yielding an id with
-    // a newline inside it and a span painted across several lines.
-    let line_end = rest[content_start..]
-        .find('\n')
-        .map_or(rest.len(), |rel| content_start + rel);
-    let close_rel = rest[content_start..line_end].find(quote)? + content_start;
-    let body = &rest[content_start..close_rel];
-    // A literal carrying an escape is not navigable: this function hands back the *raw source text*,
-    // whereas Lua's actual value is the decoded one (`'a\t'` is a tab, not a backslash and a `t`), so
-    // the id would never match a real `id:` anyway. Reject it rather than index a value that does not
-    // exist. Zero occurrences in the engine.
-    if body.contains('\\') {
-        return None;
-    }
-    let after = rest[close_rel + quote.len_utf8()..].trim_start();
+    let (literal, content_start, close_rel, after_offset) = leading_string_literal(rest)?;
+    let after = rest[after_offset..].trim_start();
     if after.starts_with(')') {
-        Some((body.to_owned(), content_start, close_rel))
+        Some((literal, content_start, close_rel))
     } else {
         None
     }
@@ -295,7 +314,12 @@ fn collect_dot_ui_refs(source: &str, excluded: &[(usize, usize)], out: &mut Vec<
 /// `.ui.` chain: `--` line comments, `--[[ ... ]]` block comments, and single/double-quoted string
 /// literal bodies (so a reference-shaped snippet mentioned inside an unrelated string is not
 /// mistaken for a real one either). Sorted and non-overlapping, half-open `[start, end)`.
-fn excluded_ranges(source: &str) -> Vec<(usize, usize)> {
+///
+/// `pub(crate)`: [`crate::lua_ui_loads`] reuses this verbatim rather than re-deriving its own
+/// comment/string exclusion pass — the two modules scan the exact same Lua-as-text surface (only the
+/// call names differ), and a second, drifted implementation of "what is a comment or a string here"
+/// is exactly the kind of silent divergence this crate's doc comments elsewhere warn about.
+pub(crate) fn excluded_ranges(source: &str) -> Vec<(usize, usize)> {
     let bytes = source.as_bytes();
     let len = bytes.len();
     let mut ranges = Vec::new();
@@ -413,8 +437,9 @@ fn long_bracket_end(source: &str, at: usize) -> Option<usize> {
     )
 }
 
-/// Whether byte offset `pos` falls inside one of the sorted, non-overlapping `ranges`.
-fn in_excluded(ranges: &[(usize, usize)], pos: usize) -> bool {
+/// Whether byte offset `pos` falls inside one of the sorted, non-overlapping `ranges`. `pub(crate)`
+/// for the same reason as [`excluded_ranges`]: [`crate::lua_ui_loads`] shares it.
+pub(crate) fn in_excluded(ranges: &[(usize, usize)], pos: usize) -> bool {
     ranges
         .binary_search_by(|&(start, end)| {
             if pos < start {
@@ -429,14 +454,15 @@ fn in_excluded(ranges: &[(usize, usize)], pos: usize) -> bool {
 }
 
 /// Whether the byte immediately before `idx` (if any) is not an identifier character — i.e. `idx`
-/// starts a whole word.
-fn is_ident_boundary_before(source: &str, idx: usize) -> bool {
+/// starts a whole word. `pub(crate)` for the same reason as [`excluded_ranges`]: [`crate::lua_ui_loads`]
+/// shares it (a call name like `g_ui.loadUI` needs the same whole-word boundary check).
+pub(crate) fn is_ident_boundary_before(source: &str, idx: usize) -> bool {
     idx == 0 || !is_ident_byte(source.as_bytes()[idx - 1])
 }
 
 /// Whether the byte at `idx` (if any) is not an identifier character — i.e. the word ending at `idx`
-/// is whole.
-fn is_ident_boundary_after(source: &str, idx: usize) -> bool {
+/// is whole. `pub(crate)`: see [`is_ident_boundary_before`].
+pub(crate) fn is_ident_boundary_after(source: &str, idx: usize) -> bool {
     source
         .as_bytes()
         .get(idx)
