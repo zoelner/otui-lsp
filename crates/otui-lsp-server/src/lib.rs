@@ -1990,6 +1990,41 @@ fn resolve_location(
     ))
 }
 
+/// Every declaration site of `target_id` visible in `otui_uri` (its own `id:` properties plus any
+/// inherited style body that declares it — [`visible_ids`]'s usual over-approximation), each mapped
+/// to an LSP [`Location`]. `otui_uri` must already be in `documents` (the merged open+disk view);
+/// `None`/not-yet-indexed simply contributes no candidates. Factored out of
+/// [`Backend::resolve_lua_id_declarations`] so its module-union fallback
+/// ([`Backend::resolve_module_unique_id_declaration`]) can reuse the exact same per-file matching
+/// logic the primary exact-pairing loop uses — both need to answer the identical question ("does THIS
+/// `.otui` declare `target_id`, and where"), just over a different candidate file set.
+fn id_declarations_in(
+    otui_uri: &Uri,
+    otui_text: &str,
+    target_id: &str,
+    documents: &HashMap<Uri, Document>,
+    styles: &StyleIndex,
+    lua_widgets: &LuaWidgetIndex,
+    encoding: PositionEncoding,
+) -> Vec<Location> {
+    let visible = visible_ids(otui_text, styles, lua_widgets);
+    visible
+        .iter()
+        .filter(|v| v.id == target_id)
+        .filter_map(|v| match &v.origin {
+            IdOrigin::Document => Some(convert::location_of(
+                otui_uri.clone(),
+                otui_text,
+                v.span,
+                encoding,
+            )),
+            IdOrigin::InheritedStyle { doc, .. } => {
+                resolve_location(doc, v.span, documents, encoding)
+            }
+        })
+        .collect()
+}
+
 /// Resolve a `Name < Base` base name to its definition site(s) (spec §5.3).
 ///
 /// Fans the name out across the whole workspace index (the namespace is global), building an LSP
@@ -4329,27 +4364,37 @@ impl Backend {
         let documents = self.merged_documents();
         let styles = self.style_index.read().expect("style_index lock poisoned");
         let lua_widgets = self.lua_index.read().expect("lua_index lock poisoned");
-        for otui_uri in self.associated_uris(lua_uri, "otui") {
-            let Some(otui_doc) = documents.get(&otui_uri) else {
-                continue;
-            };
-            let visible = visible_ids(&otui_doc.text, &styles, &lua_widgets);
-            for v in visible.iter().filter(|v| v.id == target_ref.id) {
-                let loc = match &v.origin {
-                    IdOrigin::Document => Some(convert::location_of(
-                        otui_uri.clone(),
-                        &otui_doc.text,
-                        v.span,
-                        encoding,
-                    )),
-                    IdOrigin::InheritedStyle { doc, .. } => {
-                        resolve_location(doc, v.span, &documents, encoding)
-                    }
-                };
-                if let Some(loc) = loc {
-                    out.push(loc);
-                }
+        let associated = self.associated_uris(lua_uri, "otui");
+        for otui_uri in &associated {
+            if let Some(doc) = documents.get(otui_uri) {
+                out.extend(id_declarations_in(
+                    otui_uri,
+                    &doc.text,
+                    &target_ref.id,
+                    &documents,
+                    &styles,
+                    &lua_widgets,
+                    encoding,
+                ));
             }
+        }
+        // Exact pairing (above) is the PRIMARY, ranked source — the module-union fallback below only
+        // runs when it resolved literally nothing for this id (see
+        // `resolve_module_unique_id_declaration`'s doc comment for why "unique in the module" is a
+        // sound substitute for "explicitly paired" ONLY in that empty case, never as an override of an
+        // already-successful exact pairing).
+        if out.is_empty()
+            && let Some(loc) = self.resolve_module_unique_id_declaration(
+                lua_uri,
+                &target_ref.id,
+                &associated,
+                &documents,
+                &styles,
+                &lua_widgets,
+                encoding,
+            )
+        {
+            out.push(loc);
         }
         // Additional candidates: this SAME `.lua` document's own `setId("id")` declarations (see
         // this method's doc comment) — added alongside, never instead of, the `.otui` matches above.
@@ -4360,6 +4405,101 @@ impl Backend {
                 .map(|d| convert::location_of(lua_uri.clone(), &text, d.span, encoding)),
         );
         Some(out)
+    }
+
+    /// Navigation-only module-union fallback for [`resolve_lua_id_declarations`] (never consulted by
+    /// any diagnostic path — that method's only two callers are `lua_references`/`lua_definition`).
+    ///
+    /// Corpus finding (full write-up in this node's commit message): today's exact pairing
+    /// ([`associated_uris`]) only sees the `.otui` files THIS controller explicitly loads. When it
+    /// resolves nothing for `target_id`, the id is overwhelmingly a genuine cross-controller reference
+    /// (a module-global from `loadUI`, a shared `Controller`, a function-param widget) whose
+    /// declaration lives in a SIBLING `.otui` this controller never loads — never an "own-UI pointing
+    /// at nothing" typo (that guess category was corpus-verified empty, 0 occurrences). If `target_id`
+    /// is declared in exactly ONE `.otui` anywhere under `lua_uri`'s module directory, a live reference
+    /// to it can only mean that one tree, so resolving there is exact, not a guess. An id declared in
+    /// TWO OR MORE `.otui` files in the module is genuinely ambiguous — which tree the reference
+    /// belongs to cannot be known from the id alone — so this returns `None` rather than offering a
+    /// possibly-wrong candidate (silence over a guess, the same discipline
+    /// [`resolve_vfs_rooted_otui`] applies to an unresolvable `/`-rooted asset path).
+    ///
+    /// `exclude` is `lua_uri`'s own [`associated_uris`] set (the exact-pairing candidates the caller
+    /// already checked) — re-scanning them here would be redundant (the caller already knows they
+    /// contributed nothing for this id) and would betray "the module's OTHER `.otui` files", which is
+    /// exactly what this fallback is scoped to.
+    ///
+    /// The module directory is [`find_owning_module_dir`] applied to `lua_uri`'s own directory — the
+    /// SAME "nearest ancestor `.otmod`" identity
+    /// [`update_module_index_for`](Self::update_module_index_for) uses to decide which module a
+    /// changed `.lua`/`.otui` file belongs to. `None` when `lua_uri` is not a `file://` URI, or sits
+    /// outside any module (no ancestor `.otmod` before a workspace root) — there is no "module" to
+    /// union over, so the fallback silently declines rather than widening to the whole workspace (that
+    /// would reintroduce exactly the cross-module noise the existing pairing already avoids).
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_module_unique_id_declaration(
+        &self,
+        lua_uri: &Uri,
+        target_id: &str,
+        exclude: &[Uri],
+        documents: &HashMap<Uri, Document>,
+        styles: &StyleIndex,
+        lua_widgets: &LuaWidgetIndex,
+        encoding: PositionEncoding,
+    ) -> Option<Location> {
+        let module_dir = uri_to_file_path(lua_uri)
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .and_then(|start| find_owning_module_dir(&start, &self.workspace_root_paths()))?;
+
+        // Every `.otui` under the module directory, recursively — `collect_files_under` is the same
+        // walk `scan_workspace_ext` uses for the workspace-wide scan, reused here scoped to just this
+        // one module's subtree (nested module-local directories, e.g. `tab/bestiary/`, included — the
+        // same shape `scan_module_dir` already resolves a nested controller's own `loadUI` target
+        // against).
+        let mut otui_files: HashMap<Uri, String> = HashMap::new();
+        collect_files_under(&module_dir, "otui", &mut otui_files);
+
+        // Track at most one declaring file's candidate locations; a second distinct declaring file
+        // means the id is ambiguous in this module, and the whole fallback declines (`None`) —
+        // "exactly one .otui declares it" is a property of the WHOLE module, so every candidate file
+        // must be checked before a verdict, never short-circuited on the first match.
+        let mut unique: Option<(Uri, Vec<Location>)> = None;
+        for (otui_uri, disk_text) in &otui_files {
+            if exclude.contains(otui_uri) {
+                continue;
+            }
+            // Prefer the merged/indexed buffer (it reflects unsaved edits), but fall back to the text
+            // `collect_files_under` just read from disk — so a freshly created or not-yet-indexed
+            // `.otui` still participates in the declaration/ambiguity count (missing it could make a
+            // genuinely ambiguous id look unique and resolve to a wrong tree).
+            let text = documents
+                .get(otui_uri)
+                .map(|d| d.text.as_str())
+                .unwrap_or(disk_text.as_str());
+            let locs = id_declarations_in(
+                otui_uri,
+                text,
+                target_id,
+                documents,
+                styles,
+                lua_widgets,
+                encoding,
+            );
+            if locs.is_empty() {
+                continue;
+            }
+            if let Some((first_uri, _)) = &unique
+                && first_uri != otui_uri
+            {
+                return None; // ambiguous: at least two distinct .otui files declare target_id
+            }
+            unique = Some((otui_uri.clone(), locs));
+        }
+        // A unique declaring file may still hold more than one occurrence of the same id (e.g. two
+        // sibling widgets both id'd the same way, or a local id shadowing an inherited one) — this
+        // fallback slot is a single `Location`, so only the first is offered; `lua_definition`'s
+        // multi-candidate `Array` shape is reserved for exact-pairing's ranked results, not this
+        // best-effort fallback augmenting them one candidate at a time.
+        unique.and_then(|(_, locs)| locs.into_iter().next())
     }
 
     /// The reverse half of the OTUI↔Lua bridge for `textDocument/definition` (spec §5.3): the cursor
