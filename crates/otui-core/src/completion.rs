@@ -24,6 +24,12 @@
 //!   named-color list ([`catalog::NAMED_COLORS`]). The property's value kind comes from the audited
 //!   [`property_hover::classify_value`].
 //!
+//! plus the **`layout:` block** — a separate, closed key namespace ([`schema::is_layout_block_property`]
+//! / [`catalog::LAYOUT_PROPERTIES`]) valid only on the indented lines nested under a `layout:` header,
+//! disjoint from both the ordinary property catalog and the `layout: <type>` shorthand value: a key
+//! slot inside the block offers the block's own keys ([`Context::LayoutBlock`]), and a value slot
+//! offers that key's engine-verified value set, if it has one ([`Context::LayoutValue`]).
+//!
 //! **Deliberately out of scope** (returns an empty vec): **freeform** property values — a number, an
 //! asset path, the `border` shorthand, or an arbitrary string offer nothing (there is no closed set
 //! to complete). When no set applies, this returns nothing — never a guess.
@@ -55,6 +61,7 @@
 
 use crate::catalog;
 use crate::diagnostics;
+use crate::indent;
 use crate::lua_widgets::LuaWidgetIndex;
 use crate::property_hover;
 use crate::schema;
@@ -84,6 +91,14 @@ enum Context {
     /// offer that set (`display`/`layout` keywords, or named colors for a color property). The string
     /// is the property key. A freeform-valued property yields nothing.
     PropertyValue(String),
+    /// On an indented **key** slot nested inside a `layout:` block (see [`enclosing_layout_block`]):
+    /// offer the block's own closed key set ([`catalog::LAYOUT_PROPERTIES`]) — never the global
+    /// catalog or child-widget names, since a `layout:` block holds only layout properties.
+    LayoutBlock,
+    /// In the **value** position of a `layout:`-block key (`type`, `fit-children`, …): offer that
+    /// key's engine-verified value set (see [`layout_value_items`]), or nothing for a free
+    /// numeric/dimension key. The string is the layout-block key.
+    LayoutValue(String),
 }
 
 /// Compute the completion candidates for the cursor at byte `offset` in `source` (spec §6).
@@ -152,6 +167,11 @@ pub fn complete_at_with_widgets(
         {
             Vec::new()
         }
+        // A key slot nested under a `layout:` header is a separate, closed key namespace — reroute
+        // before falling into the ordinary catalog+widget-names union (see `enclosing_layout_block`).
+        Some(Context::IndentedSlot) if enclosing_layout_block(source, offset) => {
+            items_for(Context::LayoutBlock, source, offset)
+        }
         Some(Context::IndentedSlot) => {
             indented_slot_items(tree.as_ref(), source, offset, styles, lua)
         }
@@ -161,6 +181,16 @@ pub fn complete_at_with_widgets(
             if !diagnostics::line_indentation_is_valid(source, offset) =>
         {
             Vec::new()
+        }
+        // A value slot for a genuine layout-block key (gated on both the key belonging to that
+        // namespace AND the cursor actually sitting inside a `layout:` block) reroutes to the
+        // block's own value sets rather than the global `classify_value` — the two namespaces are
+        // disjoint by design (spec: layout keys are dispatched by the layout object, not the widget
+        // style parser).
+        Some(Context::PropertyValue(key))
+            if schema::is_layout_block_property(&key) && enclosing_layout_block(source, offset) =>
+        {
+            items_for(Context::LayoutValue(key), source, offset)
         }
         Some(context) => items_for(context, source, offset),
         None => Vec::new(),
@@ -177,6 +207,48 @@ fn rest_of_line_is_special_form(source: &str, offset: usize) -> bool {
         .map_or(source.len(), |nl| offset + nl);
     let rest = source[offset..line_end].trim_start();
     rest.starts_with(['$', '@', '&', '!', '-']) || rest.starts_with("anchors.")
+}
+
+/// Whether `offset` sits on a line **inside** a `layout:` block: the nearest preceding non-blank,
+/// non-comment line is indented strictly less than the current line, AND its key (the text before its
+/// first `:`, or the whole trimmed line if it has none) is exactly `layout`.
+///
+/// Both `layout:`-block forms count as that reference line: the bare block header (`layout:`, nothing
+/// after the colon) and the header carrying its own shorthand value (`layout: verticalBox`) — the
+/// engine applies a `layout:` node's children even when it already resolved a type from the leaf
+/// value (`src/framework/ui/uiwidgetbasestyle.cpp`: `layoutType` is read from either the leaf value or
+/// a nested `type:`, then `if (node->hasChildren()) m_layout->applyStyle(node)` runs unconditionally
+/// right after). A shallower reference line with any other key is not a layout block, so an ordinary
+/// nested property (`$hover:`'s children, a plain widget's properties, …) is unaffected.
+///
+/// Purely line/indentation-driven — the crate's shared [`indent`] primitives, never the CST — so it
+/// keeps working while a sibling line in the block is still mid-edit. Deliberately does not special-
+/// case a block-scalar body: no layout-block key's value is ever one, so that skip (which
+/// [`crate::indent::indent_for_line`] performs for the on-type-indent use case) is not needed here.
+fn enclosing_layout_block(source: &str, offset: usize) -> bool {
+    let lines = indent::split_lines(source);
+    let Some(idx) = lines
+        .iter()
+        .position(|l| offset >= l.start && offset <= l.start + l.text.len())
+    else {
+        return false;
+    };
+    let current_indent = indent::leading_spaces(lines[idx].text);
+    if current_indent == 0 {
+        return false;
+    }
+    for line in lines[..idx].iter().rev() {
+        let trimmed = line.text.trim();
+        if trimmed.is_empty() || indent::is_comment(trimmed) {
+            continue;
+        }
+        let sp = indent::leading_spaces(line.text);
+        if sp < current_indent {
+            let key = trimmed.split(':').next().unwrap_or(trimmed).trim();
+            return key == "layout";
+        }
+    }
+    false
 }
 
 /// Build the union offered in an indented statement slot — the grammatically-ambiguous position that
@@ -566,6 +638,62 @@ fn items_for(context: Context, source: &str, offset: usize) -> Vec<CompletionIte
             unreachable!("IndentedSlot is handled in complete_at_with_widgets")
         }
         Context::PropertyValue(key) => property_value_items(&key),
+        Context::LayoutBlock => layout_block_key_items(),
+        Context::LayoutValue(key) => layout_value_items(&key),
+    }
+}
+
+/// The **key** completions inside a `layout:` block: the closed set of keys the layout classes read
+/// ([`catalog::LAYOUT_PROPERTIES`]), each carrying the same `key: $0` snippet as an ordinary property
+/// key. Unlike [`indented_slot_items`] this is not a union with child-widget names — a `layout:` block
+/// holds only properties, never nested widgets (spec: it is dispatched by the layout object, which
+/// reads flat key/value tags, not a widget tree) — and not workspace-aware, since the block's key set
+/// is fixed by the engine rather than any Lua/style index.
+fn layout_block_key_items() -> Vec<CompletionItem> {
+    catalog::LAYOUT_PROPERTIES
+        .iter()
+        .map(|&key| CompletionItem {
+            label: key.to_owned(),
+            kind: CompletionKind::Keyword,
+            detail: Some("layout property".to_owned()),
+            sort_text: None,
+            insert_text: Some(property_key_snippet(key)),
+            insert_format: InsertFormat::Snippet,
+            documentation: None,
+        })
+        .collect()
+}
+
+/// The **value** completions for a key inside a `layout:` block ([`schema::is_layout_block_property`]),
+/// each verified individually against the engine's layout `applyStyle` dispatch
+/// (`src/framework/ui/`):
+///
+/// * `type` → the same 4 layout-type keywords as the leaf `layout: <type>` form
+///   ([`schema::LAYOUT_TYPES`]) — both forms are resolved by the identical dispatch,
+///   `uiwidgetbasestyle.cpp:786-803`.
+/// * `fit-children` → `true`/`false`: a genuine `node->value<bool>()` cast, read by both the box
+///   layout (`uiboxlayout.cpp:36-37`) and the grid layout (`uigridlayout.cpp:49-50`).
+/// * `align-right` → `true`/`false`: `uihorizontallayout.cpp:34-35`, `node->value<bool>()`.
+/// * `align-bottom` → `true`/`false`: `uiverticallayout.cpp:34-35`, `node->value<bool>()`.
+/// * `auto-spacing` → `true`/`false`: `uigridlayout.cpp:51-52`, `node->value<bool>()`.
+/// * `flow` → `true`/`false`: `uigridlayout.cpp:53-54`, `setFlow(node->value<bool>())` — despite the
+///   CSS-sounding name this is a plain on/off switch in the engine, not a keyword enum.
+///
+/// Every other layout key is a `node->value<int>()` (`spacing` `uiboxlayout.cpp:34-35`; `cell-width`,
+/// `cell-height`, `cell-spacing`, `num-columns`, `num-lines` — all `uigridlayout.cpp:39-48`) or a
+/// `node->value<Size>()` (`cell-size`, a free `"WxH"` pair, `uigridlayout.cpp:37-38`): free
+/// numeric/dimension input, so no value is offered — never fabricated.
+fn layout_value_items(key: &str) -> Vec<CompletionItem> {
+    match key {
+        "type" => set_items(
+            schema::LAYOUT_TYPES,
+            CompletionKind::EnumMember,
+            "layout type",
+        ),
+        "fit-children" | "align-right" | "align-bottom" | "auto-spacing" | "flow" => {
+            set_items(&["true", "false"], CompletionKind::Value, "value")
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -876,6 +1004,123 @@ mod tests {
         let src = "Widget\n  layout:\n";
         let off = at(src, "layout:") + "layout:".len();
         assert_eq!(labels(&complete_at(src, off)), schema::LAYOUT_TYPES);
+    }
+
+    // --- `layout:` block completion --------------------------------------------------------------
+
+    #[test]
+    fn key_slot_inside_a_layout_block_offers_the_layout_property_set() {
+        // Cursor building a bare key nested under a `layout:` header: the block's own closed key
+        // set (never the global catalog nor child-widget names — a layout block holds no widgets).
+        let src = "Panel\n  layout:\n    fit\n";
+        let items = complete_at(src, at(src, "fit") + "fit".len());
+        assert_eq!(labels(&items), catalog::LAYOUT_PROPERTIES);
+        assert!(items.iter().all(|i| i.kind == CompletionKind::Keyword));
+        assert!(
+            items
+                .iter()
+                .all(|i| i.detail.as_deref() == Some("layout property"))
+        );
+    }
+
+    #[test]
+    fn empty_key_slot_inside_a_layout_block_offers_the_layout_property_set() {
+        // The cursor sits at the start of an indented line that already has a word after it — an
+        // empty slot the classifier opens (mirrors `empty_slot_before_existing_content_offers_the_union`)
+        // — inside a `layout:` block this still offers the block's own key set.
+        let src = "Panel\n  layout:\n    fit\n";
+        let off = at(src, "fit"); // cursor right before the word
+        assert_eq!(labels(&complete_at(src, off)), catalog::LAYOUT_PROPERTIES);
+    }
+
+    #[test]
+    fn layout_block_key_snippet_continues_into_the_value_slot() {
+        let src = "Panel\n  layout:\n    fit\n";
+        let items = complete_at(src, at(src, "fit") + "fit".len());
+        let fit = items
+            .iter()
+            .find(|i| i.label == "fit-children")
+            .expect("fit-children offered");
+        assert_eq!(fit.insert_text.as_deref(), Some("fit-children: $0"));
+        assert_eq!(fit.insert_format, InsertFormat::Snippet);
+    }
+
+    #[test]
+    fn layout_block_type_value_offers_the_four_layout_types() {
+        let src = "Panel\n  layout:\n    type: ver\n";
+        let items = complete_at(src, at(src, "ver") + "ver".len());
+        assert_eq!(labels(&items), schema::LAYOUT_TYPES);
+        assert!(items.iter().all(|i| i.kind == CompletionKind::EnumMember));
+    }
+
+    #[test]
+    fn layout_block_boolean_keys_offer_true_and_false() {
+        for key in [
+            "fit-children",
+            "align-right",
+            "align-bottom",
+            "auto-spacing",
+            "flow",
+        ] {
+            let src = format!("Panel\n  layout:\n    {key}: t\n");
+            let items = complete_at(&src, at(&src, "t\n") + 1);
+            assert_eq!(labels(&items), ["true", "false"], "{key}");
+        }
+    }
+
+    #[test]
+    fn layout_block_numeric_key_offers_no_value() {
+        // `spacing`, the cell-* keys and num-columns/num-lines are free numeric/dimension input —
+        // never fabricated.
+        for key in [
+            "spacing",
+            "cell-size",
+            "cell-width",
+            "cell-height",
+            "cell-spacing",
+            "num-columns",
+            "num-lines",
+        ] {
+            let src = format!("Panel\n  layout:\n    {key}: 1\n");
+            let items = complete_at(&src, at(&src, "1\n") + 1);
+            assert!(items.is_empty(), "{key} must offer no value completion");
+        }
+    }
+
+    #[test]
+    fn layout_shorthand_value_is_unaffected_by_the_block_context() {
+        // Regression: `layout: verticalBox` on the header line itself is the leaf shorthand form,
+        // not a block key — it must keep offering the layout-type set exactly as before, never the
+        // layout-block key set.
+        let src = "Widget\n  layout: ver\n";
+        let items = complete_at(src, at(src, "ver") + "ver".len());
+        assert_eq!(labels(&items), schema::LAYOUT_TYPES);
+    }
+
+    #[test]
+    fn layout_block_child_at_a_sibling_property_indent_is_not_mistaken_for_the_block() {
+        // A property at the SAME indentation as `layout:` (a sibling, not a child) must not be
+        // routed into the layout-block key set.
+        let src = "Panel\n  layout:\n    type: grid\n  wid\n";
+        let items = complete_at(src, at(src, "wid") + "wid".len());
+        assert_eq!(labels(&items), catalog::PROPERTIES);
+    }
+
+    #[test]
+    fn nested_widget_after_a_layout_block_is_not_mistaken_for_the_block() {
+        let src = "Panel\n  layout:\n    type: grid\n  Child\n    wid\n";
+        let items = complete_at(src, at(src, "wid") + "wid".len());
+        assert_eq!(labels(&items), catalog::PROPERTIES);
+    }
+
+    #[test]
+    fn a_layout_header_with_both_a_shorthand_value_and_block_children_still_opens_the_block() {
+        // The engine applies a `layout:` node's children even when it already has a leaf value
+        // (`m_layout->applyStyle(node)` runs whenever the node has children, unconditionally) — so
+        // this less-common authoring form must still be recognized as the block header.
+        let src = "Panel\n  layout: verticalBox\n    spa\n";
+        let items = complete_at(src, at(src, "spa") + "spa".len());
+        assert_eq!(labels(&items), catalog::LAYOUT_PROPERTIES);
     }
 
     #[test]
