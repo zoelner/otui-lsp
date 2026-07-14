@@ -388,6 +388,31 @@ pub struct Backend {
     /// set, skips the remaining work and its completion refresh — so dropping the backend and joining
     /// the I/O threads never waits for a full scan. [`Arc`] so the scan thread holds a clone.
     shutdown: Arc<AtomicBool>,
+    /// `true` for the duration of the background workspace scan's index reads+installs (set just
+    /// before [`build_indexes`] runs, cleared once every per-document install below it has
+    /// completed — see `run_initialized`'s scan thread). Closes the initial-scan-vs-watched-file
+    /// race for [`style_index`](Self::style_index)/[`lua_index`](Self::lua_index)/
+    /// [`lua_ref_index`](Self::lua_ref_index): the scan reads file contents up front, then installs
+    /// per-document later, so a watched-file writer for the SAME uri that runs in between must not
+    /// be silently clobbered by the scan's now-stale snapshot when it finally installs. Consulted
+    /// (and [`scan_dirty`](Self::scan_dirty) written) only from inside a
+    /// [`reindex_guard`](Self::reindex_guard) critical section — see [`mark_scan_dirty`](Self::mark_scan_dirty).
+    /// A plain atomic flag, not part of `reindex_guard`'s data, because it is read on every
+    /// watched-file write (scan active or not) but changes only at scan start/end. It is *stored*
+    /// by the scan thread OUTSIDE the guard (the guard therefore establishes no happens-before for
+    /// it), so both the store and the `mark_scan_dirty` load use `SeqCst`: a writer racing the scan
+    /// reliably observes `true` by the memory model rather than by timing.
+    scan_active: Arc<AtomicBool>,
+    /// URIs a watched-file writer touched while [`scan_active`](Self::scan_active) was `true` — the
+    /// "dirty set" the scan's per-document installs consult (under the same
+    /// [`reindex_guard`](Self::reindex_guard) already held for that install) to skip re-installing
+    /// their now-stale snapshot for that URI, so the watched-file writer's fresher write is never
+    /// overwritten. Cleared at the start of each scan (see `run_initialized`), right before
+    /// [`build_indexes`] takes its snapshot, so every writer that runs during (or after) the
+    /// snapshot read is recorded. [`Arc`] so the scan thread holds a clone;
+    /// [`Mutex`]<[`HashSet`]> because entries are inserted/queried/cleared, never iterated in bulk
+    /// under contention.
+    scan_dirty: Arc<Mutex<HashSet<Uri>>>,
     /// Memoized `.otpkg`-under-root presence, keyed by detected client root (see
     /// [`otpkg_present_under_cached`]) — Finding 3: without this, `missing_asset_diagnostics` would
     /// re-walk the entire client tree on every diagnostics pass over a document with a missing asset.
@@ -430,6 +455,8 @@ impl Backend {
             roots: Mutex::new(workspace_roots(params)),
             reindex_guard: Arc::new(Mutex::new(())),
             shutdown: Arc::new(AtomicBool::new(false)),
+            scan_active: Arc::new(AtomicBool::new(false)),
+            scan_dirty: Arc::new(Mutex::new(HashSet::new())),
             otpkg_cache: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(test)]
             rebuild_module_index_calls: AtomicUsize::new(0),
@@ -754,10 +781,41 @@ impl Backend {
         merge_documents(&open, &disk)
     }
 
+    /// If the background workspace scan is currently running ([`scan_active`](Self::scan_active)),
+    /// record `uri` into [`scan_dirty`](Self::scan_dirty) so the scan's later per-document install —
+    /// which read its file contents from a snapshot taken before this write — skips re-installing
+    /// its now-stale entry for `uri` once it gets there, instead of clobbering the fresher write this
+    /// caller is about to make (or just made). A no-op once the scan has finished (`scan_active` is
+    /// `false`): there is then nothing left to protect against.
+    ///
+    /// MUST be called from inside the SAME [`reindex_guard`](Self::reindex_guard) critical section as
+    /// the index write it is protecting (every caller below does): the scan's per-document installs
+    /// read [`scan_dirty`](Self::scan_dirty) under that same guard, so a read-then-write pair on
+    /// either side can never interleave with the other.
+    fn mark_scan_dirty(&self, uri: &Uri) {
+        if self.scan_active.load(Ordering::SeqCst) {
+            self.scan_dirty
+                .lock()
+                .expect("scan_dirty poisoned")
+                .insert(uri.clone());
+        }
+    }
+
     /// Index `uri` from its on-disk text (the closed-file path used by the initial scan, the file
     /// watcher, and `did_close`): parse `text`, store its style defs in the index and cache the text
     /// in [`disk_texts`](Self::disk_texts) so its spans stay resolvable while the file is closed.
+    ///
+    /// Takes [`reindex_guard`](Self::reindex_guard) as the outermost lock around the write (and the
+    /// [`mark_scan_dirty`](Self::mark_scan_dirty) record) so a background scan installing its own
+    /// (possibly older) snapshot for the same `uri` can never race past this write: either the scan's
+    /// install runs first and is then shadowed by this fresher write, or this write runs first, marks
+    /// `uri` dirty, and the scan's later install for it is skipped — see
+    /// [`mark_scan_dirty`](Self::mark_scan_dirty) and the scan's per-document install in
+    /// `run_initialized`. Callers read disk / `self.roots` before calling this (never after), so
+    /// nothing else nests under the guard here.
     fn index_from_disk(&self, uri: &Uri, text: String) {
+        let _guard = self.reindex_guard.lock().expect("reindex_guard poisoned");
+        self.mark_scan_dirty(uri);
         let defs = self.service.style_defs(&text);
         self.style_index
             .write()
@@ -778,7 +836,13 @@ impl Backend {
     }
 
     /// Drop `uri` from both the style index and the disk-text cache (a deleted / vanished file).
+    ///
+    /// Guarded the same way as [`index_from_disk`](Self::index_from_disk) (see its doc comment): a
+    /// watched DELETE must also mark `uri` dirty so the scan does not resurrect it from a stale
+    /// pre-delete snapshot.
     fn deindex(&self, uri: &Uri) {
+        let _guard = self.reindex_guard.lock().expect("reindex_guard poisoned");
+        self.mark_scan_dirty(uri);
         self.style_index
             .write()
             .expect("style_index lock poisoned")
@@ -792,7 +856,12 @@ impl Backend {
     /// Re-index a `*.lua` file's widget definitions into the [`lua_index`](Self::lua_index) from its
     /// on-disk `text` (the initial scan and the file watcher). Extraction is pure; there is no
     /// disk-text cache or open-buffer check because Lua is never an open OTUI document.
+    ///
+    /// Guarded the same way as [`index_from_disk`](Self::index_from_disk) (see its doc comment) so
+    /// the scan's per-document `lua_index` install cannot clobber a watched-file write racing it.
     fn index_lua_from_disk(&self, uri: &Uri, text: &str) {
+        let _guard = self.reindex_guard.lock().expect("reindex_guard poisoned");
+        self.mark_scan_dirty(uri);
         let defs = self.service.lua_widgets(text);
         self.lua_index
             .write()
@@ -801,7 +870,11 @@ impl Backend {
     }
 
     /// Drop `uri`'s widget definitions from the [`lua_index`](Self::lua_index) (a deleted Lua file).
+    ///
+    /// Guarded the same way as [`deindex`](Self::deindex): a watched DELETE marks `uri` dirty too.
     fn deindex_lua(&self, uri: &Uri) {
+        let _guard = self.reindex_guard.lock().expect("reindex_guard poisoned");
+        self.mark_scan_dirty(uri);
         self.lua_index
             .write()
             .expect("lua_index lock poisoned")
@@ -813,7 +886,13 @@ impl Backend {
     /// spans stay resolvable into an LSP `Location`. Shared by the initial scan, the file watcher, and
     /// `did_close`'s disk re-sync (mirroring [`index_from_disk`](Self::index_from_disk) for the OTUI
     /// side of the bridge).
+    ///
+    /// Guarded the same way as [`index_from_disk`](Self::index_from_disk) (see its doc comment) so
+    /// the scan's per-document `lua_ref_index`/`lua_texts` install cannot clobber a watched-file
+    /// write racing it.
     fn index_lua_refs_from_disk(&self, uri: &Uri, text: String) {
+        let _guard = self.reindex_guard.lock().expect("reindex_guard poisoned");
+        self.mark_scan_dirty(uri);
         let refs = scan_id_refs(&text);
         self.lua_ref_index
             .write()
@@ -829,6 +908,10 @@ impl Backend {
     /// [`lua_ref_index`](Self::lua_ref_index) is touched here — the buffer's text itself is already
     /// authoritative in [`documents`](Self::documents), which [`lua_text_for`](Self::lua_text_for)
     /// consults first, so [`lua_texts`](Self::lua_texts) (the on-disk cache) is left alone.
+    ///
+    /// Not guarded here: this is only ever called from [`set_open_document`](Self::set_open_document),
+    /// which already holds [`reindex_guard`](Self::reindex_guard) across this call — taking it again
+    /// here would deadlock (the guard is not reentrant).
     fn reindex_lua_refs_open(&self, uri: &Uri, text: &str) {
         let refs = scan_id_refs(text);
         self.lua_ref_index
@@ -839,7 +922,11 @@ impl Backend {
 
     /// Drop `uri`'s cross-references from both [`lua_ref_index`](Self::lua_ref_index) and the
     /// [`lua_texts`](Self::lua_texts) disk-text cache (a deleted Lua file).
+    ///
+    /// Guarded the same way as [`deindex`](Self::deindex): a watched DELETE marks `uri` dirty too.
     fn deindex_lua_refs(&self, uri: &Uri) {
+        let _guard = self.reindex_guard.lock().expect("reindex_guard poisoned");
+        self.mark_scan_dirty(uri);
         self.lua_ref_index
             .write()
             .expect("lua_ref_index lock poisoned")
@@ -975,6 +1062,12 @@ impl Backend {
         };
         let workspace_roots = self.workspace_root_paths();
         let client_roots = detect_client_roots(Some(&module_dir), &workspace_roots);
+        // Take `reindex_guard` BEFORE the `scan_module_dir` disk read so this module's read-and-install
+        // is atomic against every other module-index writer (the initial scan and `rebuild_module_index`)
+        // — no concurrent write can slip in between our read and our install, so the newest disk state
+        // always wins. Safe against deadlock: `scan_module_dir` is a free filesystem fn (no `Backend`
+        // locks) and `self.roots` was already read+released above, so nothing nests under the guard.
+        let _guard = self.reindex_guard.lock().expect("reindex_guard poisoned");
         let pairs = scan_module_dir(&module_dir, &client_roots);
         self.module_ui_index
             .write()
@@ -1003,6 +1096,11 @@ impl Backend {
         if roots.is_empty() {
             return;
         }
+        // Take `reindex_guard` BEFORE the disk read so the rebuild is atomic (read + install under one
+        // guard), so a concurrent per-module update or the initial scan can't clobber a fresher write.
+        // `self.roots` is already read+released above and `build_module_index` takes no `Backend`
+        // locks, so nothing nests under the guard that could invert the lock order.
+        let _guard = self.reindex_guard.lock().expect("reindex_guard poisoned");
         let built = build_module_index(&roots);
         *self
             .module_ui_index
@@ -1203,6 +1301,23 @@ fn merge_documents(
         merged.insert(uri.clone(), doc.clone());
     }
     merged
+}
+
+/// Whether the background scan's per-document install (`run_initialized`'s scan thread) should skip
+/// `uri` rather than install its (now possibly stale) disk-read snapshot for it — either because
+/// `uri` is currently an open buffer (`open_docs`; `None` for the `lua_index` install, which has no
+/// open-buffer concept — a `.lua` file is never an open OTUI document, see
+/// [`Backend::index_lua_from_disk`]) or because a watched-file writer already installed a fresher
+/// entry for `uri` while the scan was running (`dirty` — see [`Backend::mark_scan_dirty`]).
+///
+/// Pure over borrowed state (mirrors [`merge_documents`] just above) so the skip decision is
+/// unit-testable without spinning up the real scan thread or racing it against a real watcher event.
+fn scan_install_should_skip(
+    uri: &Uri,
+    open_docs: Option<&HashMap<Uri, Document>>,
+    dirty: &HashSet<Uri>,
+) -> bool {
+    dirty.contains(uri) || open_docs.is_some_and(|docs| docs.contains_key(uri))
 }
 
 /// Read a `file://` `.otui` document from disk for indexing, or `None` when it cannot / should not be
@@ -1635,7 +1750,7 @@ fn resolve_vfs_rooted_otui(rest: &str, client_roots: &[PathBuf]) -> Option<PathB
 
 /// Build [`ModuleUiIndex`] from scratch by scanning every module directory under `roots`. Blocking
 /// filesystem work, run only from the background scan thread — mirrors
-/// [`scan_workspace`]/[`scan_workspace_lua`] in that respect.
+/// [`scan_workspace_ext_cancellable`] in that respect.
 ///
 /// Each module directory's `/`-rooted `loadUI` targets are resolved against the client root(s)
 /// detected FOR THAT DIRECTORY ([`detect_client_roots`], anchored on the module directory itself, the
@@ -1895,44 +2010,196 @@ fn read_indexed_file(uri: &Uri) -> Option<String> {
 }
 
 /// Recursively collect every `*.otui` file under `roots`, reading each into `(url, text)` — the
-/// `.otui` style corpus for the initial workspace scan.
+/// `.otui` style corpus for the initial workspace scan. A thin never-stop convenience wrapper over
+/// [`scan_workspace_ext_cancellable`] (the only production caller, [`build_indexes`], calls the
+/// cancellable form directly so it can abort mid-walk); kept `#[cfg(test)]` since that is its only
+/// remaining caller.
+#[cfg(test)]
 fn scan_workspace(roots: &[Uri]) -> Vec<(Uri, String)> {
-    scan_workspace_ext(roots, "otui")
+    scan_workspace_ext_cancellable(roots, "otui", &|| false)
 }
 
 /// Recursively collect every `*.lua` file under `roots`, reading each into `(url, text)` — the Lua
-/// module corpus scanned for widget definitions ([`OtuiService::lua_widgets`]).
+/// module corpus scanned for widget definitions ([`OtuiService::lua_widgets`]). See [`scan_workspace`]
+/// for why this is `#[cfg(test)]`-only.
+#[cfg(test)]
 fn scan_workspace_lua(roots: &[Uri]) -> Vec<(Uri, String)> {
-    scan_workspace_ext(roots, "lua")
+    scan_workspace_ext_cancellable(roots, "lua", &|| false)
 }
 
 /// Recursively collect every file with extension `ext` under `roots`, reading each into
-/// `(url, text)`.
-///
-/// Blocking filesystem work — run on the dedicated scan thread spawned in `run_initialized`, never
-/// on the single-threaded main loop. Symlinks are **not** followed (so the walk cannot escape the
-/// root or loop), unreadable directories are skipped, and each file is read through
-/// [`read_indexed_file`] (so oversized/binary files are dropped). Duplicate roots (or nested roots)
-/// are de-duplicated by URL at the end.
-fn scan_workspace_ext(roots: &[Uri], ext: &str) -> Vec<(Uri, String)> {
+/// `(url, text)` — same contract as [`scan_workspace`]/[`scan_workspace_lua`] (which delegate to this
+/// with a never-stop closure), except the directory walk itself is interruptible: `should_stop` is
+/// polled once per root and — via [`collect_files_under_cancellable`] — once per directory entry
+/// *during* the recursive walk, so a caller that wants to stop (e.g. [`build_indexes`] on server
+/// shutdown) does not have to wait for the entire corpus to be walked and read from disk before its
+/// first chance to abort. Stopping mid-walk returns whatever partial (possibly empty) results were
+/// collected so far. Symlinks are **not** followed (so the walk cannot escape a root or loop),
+/// unreadable directories are skipped, and each file is read through [`read_indexed_file`] (so
+/// oversized/binary files are dropped). Duplicate roots (or nested roots) are de-duplicated by URL at
+/// the end.
+fn scan_workspace_ext_cancellable(
+    roots: &[Uri],
+    ext: &str,
+    should_stop: &dyn Fn() -> bool,
+) -> Vec<(Uri, String)> {
     let mut out: HashMap<Uri, String> = HashMap::new();
     for root in roots {
+        if should_stop() {
+            break;
+        }
         let Some(dir) = uri_to_file_path(root) else {
             continue;
         };
-        collect_files_under(&dir, ext, &mut out);
+        collect_files_under_cancellable(&dir, ext, &mut out, should_stop);
     }
     out.into_iter().collect()
 }
 
+/// The full set of workspace indexes built from disk under `roots` — the single **pure
+/// disk→index construction** path shared by the server's initial background scan
+/// ([`Backend::run_initialized`]) and the `check` CLI subcommand ([`cli::run_check`]), so the two
+/// can never observe a different corpus for the same files on disk (the fidelity foundation this
+/// extraction exists for).
+///
+/// Built purely from what is on disk, with **no notion of "currently open in the editor"** — that
+/// precedence (an open buffer's unsaved text always wins over what is on disk for the same URI) is
+/// a server-only concern; `run_initialized` applies it as a merge pass over this result (see its
+/// body), while the CLI — which never has open buffers — installs the result as-is. Keeping that
+/// merge out of this function is what makes it reusable: the CLI has no `documents` map to check
+/// against, and must not need one.
+pub(crate) struct BuiltIndexes {
+    /// Every workspace `.otui` file's style defs, keyed by [`DocId`].
+    pub style_index: StyleIndex,
+    /// The raw text backing `style_index`, keyed the same way — mirrors
+    /// [`Backend::disk_texts`](crate::Backend).
+    pub disk_texts: HashMap<Uri, String>,
+    /// Every workspace `.lua` file's widget definitions (custom style props + `extends` parent).
+    pub lua_index: LuaWidgetIndex,
+    /// The URIs (in scan order) of the `.lua` files that contributed a non-empty widget definition
+    /// to `lua_index` — lets the consumer install `lua_index` per-document (preserving any entry a
+    /// concurrent watch event wrote during the scan) rather than replacing the whole map.
+    pub lua_widget_uris: Vec<Uri>,
+    /// Every workspace `.lua` file's `getChildById`/`.ui.<id>` cross-references.
+    pub lua_ref_index: LuaRefIndex,
+    /// The raw text backing `lua_ref_index`, keyed the same way — mirrors
+    /// [`Backend::lua_texts`](crate::Backend).
+    pub lua_texts: HashMap<Uri, String>,
+}
+
+/// Build [`BuiltIndexes`] by scanning every `.otui`/`.lua` file under `roots` and extracting each
+/// via the same per-file entry points the server uses on open/change
+/// ([`OtuiService::style_defs`]/[`OtuiService::lua_widgets`]/[`scan_id_refs`]). The module-association
+/// index is intentionally NOT built here: its only consumer is the long-lived server, which derives it
+/// fresh at install time (see the scan thread) so a concurrent watcher update is never clobbered; the
+/// one-shot CLI does not need it. Blocking filesystem work — the same discipline as
+/// [`scan_workspace`]/[`scan_workspace_lua`] (which [`scan_workspace_ext_cancellable`], the walk this
+/// composes, shares its extension-filtered walk with).
+///
+/// `should_stop` is threaded all the way into the directory walk itself (via
+/// [`scan_workspace_ext_cancellable`]/[`collect_files_under_cancellable`]), not just polled between/
+/// within the extraction loops: it is checked per root, per directory entry, and once per file in both
+/// the `.otui` and `.lua` extraction loops, plus once more between the two phases. That means a
+/// long-lived caller shutting down mid-scan aborts promptly — it does **not** have to wait for the
+/// *entire* `.otui` AND `.lua` corpora to be walked and read from disk before its first chance to stop,
+/// which matters on a large workspace where that walk is otherwise the dominant cost of shutdown.
+/// Stopping early returns whatever partial (possibly empty) indexes were built so far, which is fine:
+/// the caller is discarding the result anyway. The CLI (`cli::run_check`) passes a never-stop closure
+/// (`&|| false`) since a one-shot process has nothing to cancel for, so its full-corpus build is
+/// unaffected.
+pub(crate) fn build_indexes(roots: &[Uri], should_stop: &dyn Fn() -> bool) -> BuiltIndexes {
+    let service = OtuiService::new();
+
+    let mut style_index = StyleIndex::new();
+    let mut disk_texts = HashMap::new();
+    for (uri, text) in scan_workspace_ext_cancellable(roots, "otui", should_stop) {
+        if should_stop() {
+            return BuiltIndexes {
+                style_index,
+                disk_texts,
+                lua_index: LuaWidgetIndex::new(),
+                lua_widget_uris: Vec::new(),
+                lua_ref_index: LuaRefIndex::new(),
+                lua_texts: HashMap::new(),
+            };
+        }
+        let defs = service.style_defs(&text);
+        style_index.set_document(DocId::from(uri.to_string()), defs);
+        disk_texts.insert(uri, text);
+    }
+
+    let mut lua_index = LuaWidgetIndex::new();
+    let mut lua_widget_uris: Vec<Uri> = Vec::new();
+    let mut lua_ref_index = LuaRefIndex::new();
+    let mut lua_texts = HashMap::new();
+
+    // Checked BEFORE the `.lua` phase's own directory walk + disk read even starts — the single
+    // biggest win `should_stop` buys here, since that walk is otherwise a full second corpus read.
+    // The walk itself (`scan_workspace_ext_cancellable`) is also cancellable, so even without this
+    // upfront check the walk would abort promptly rather than reading the whole `.lua` corpus first.
+    if !should_stop() {
+        // `.lua` widget defs and id-refs are indexed independently — a file with refs but no widget
+        // defs (the common case: most controllers never define a custom widget type) must still land
+        // in `lua_ref_index`, so this is deliberately never a single `if defs.is_empty() { continue }`
+        // gate shared between them (mirrors the original inline loop's comment).
+        for (uri, text) in scan_workspace_ext_cancellable(roots, "lua", should_stop) {
+            if should_stop() {
+                break;
+            }
+            let defs = service.lua_widgets(&text);
+            if !defs.is_empty() {
+                lua_index.set_document(DocId::from(uri.to_string()), defs);
+                lua_widget_uris.push(uri.clone());
+            }
+            let refs = scan_id_refs(&text);
+            if !refs.is_empty() {
+                lua_ref_index.set_document(DocId::from(uri.to_string()), refs);
+                lua_texts.insert(uri, text);
+            }
+        }
+    }
+
+    BuiltIndexes {
+        style_index,
+        disk_texts,
+        lua_index,
+        lua_widget_uris,
+        lua_ref_index,
+        lua_texts,
+    }
+}
+
 /// Depth-first walk of `dir`, pushing every readable file whose extension is `ext` into `out` keyed
 /// by its `file://` URL. Does not follow symlinks (checked via the dir entry's own metadata) and
-/// silently skips entries it cannot stat/read.
+/// silently skips entries it cannot stat/read. Never cancellable — a thin never-stop wrapper over
+/// [`collect_files_under_cancellable`], for this fn's own existing callers (the server's module scan
+/// and the lua listing-dir lookup), whose signature/behavior this node leaves untouched.
 fn collect_files_under(dir: &Path, ext: &str, out: &mut HashMap<Uri, String>) {
+    collect_files_under_cancellable(dir, ext, out, &|| false);
+}
+
+/// [`collect_files_under`], but checks `should_stop` before reading `dir`'s entries and once per
+/// entry while iterating them, returning early (leaving `out` with whatever was collected so far) the
+/// moment it reports `true` — so a caller that wants to abort a large recursive walk (e.g.
+/// [`build_indexes`] via [`scan_workspace_ext_cancellable`]) does not have to wait for the walk to
+/// finish reading the entire subtree first. Recurses into subdirectories with the same `should_stop`,
+/// so cancellation is honored at every depth, not just at the top level.
+fn collect_files_under_cancellable(
+    dir: &Path,
+    ext: &str,
+    out: &mut HashMap<Uri, String>,
+    should_stop: &dyn Fn() -> bool,
+) {
+    if should_stop() {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
+        if should_stop() {
+            return;
+        }
         let path: PathBuf = entry.path();
         // `symlink_metadata` does not traverse the link, so a symlink is classified as a symlink and
         // skipped — the walk cannot follow one out of the root or into a cycle.
@@ -1943,7 +2210,7 @@ fn collect_files_under(dir: &Path, ext: &str, out: &mut HashMap<Uri, String>) {
             continue;
         }
         if meta.is_dir() {
-            collect_files_under(&path, ext, out);
+            collect_files_under_cancellable(&path, ext, out, should_stop);
         } else if meta.is_file()
             && path.extension().is_some_and(|e| e == ext)
             && let Some(uri) = uri_from_file_path(&path)
@@ -1952,6 +2219,64 @@ fn collect_files_under(dir: &Path, ext: &str, out: &mut HashMap<Uri, String>) {
             out.insert(uri, text);
         }
     }
+}
+
+/// Depth-first walk of `dir`, pushing the path of **every** file whose extension is `ext`
+/// (case-insensitively — `.OTUI`/`.otui` are the same target, mirroring how [`Language::from_uri`]
+/// and [`is_otmod_uri`] already recognize an uppercase extension) into `out` — unlike
+/// [`collect_files_under`] (which gates a file's presence on [`read_indexed_file`] successfully
+/// reading it, so an unreadable, oversized, or non-UTF-8/binary file is silently absent from its
+/// result), this is discovery-only and never touches the file's content, so it cannot drop a target
+/// for being unreadable.
+///
+/// Exists for the `otui-lsp` CLI (`cli.rs`'s `resolve_targets`/`collect_by_ext`): those need every
+/// on-disk `.otui`/`.otmod`/`.otfont` path under a directory argument, including a broken one, so the
+/// per-target `std::fs::read_to_string` that follows can report — not silently skip — the failure
+/// and make `check`/`fmt` exit non-zero instead of passing green over a file it never looked at.
+/// [`collect_files_under`] itself is intentionally left untouched: the server's own workspace scan
+/// legitimately wants "readable files only" (an unreadable file has nothing to index).
+///
+/// Symlinks are not followed (checked via the dir entry's own metadata, mirroring
+/// [`collect_files_under`]), so the walk cannot escape `dir` or loop.
+///
+/// Returns `Err` — instead of silently treating it as "no files here" — the moment `dir` itself, any
+/// entry read while iterating it, or any entry's `symlink_metadata` (used to classify it as a
+/// symlink/dir/file) cannot be read: an unreadable subdirectory OR an individual entry that cannot be
+/// stat'd (e.g. a permission-denied file, or one removed in the race between the directory listing and
+/// the stat) must fail `check`/`fmt` loudly (naming the path), never make them exit success having
+/// quietly skipped a whole unreadable subtree's — or a single unstattable file's — `.otui`/`.otmod`/
+/// `.otfont` targets. Propagated by the caller (`resolve_targets`/`collect_by_ext`), which is itself
+/// `Result`-returning end to end. Contrast a symlink that stats *successfully* as a symlink: that is a
+/// deliberate, silent skip (see below), not an error.
+pub(crate) fn collect_paths_under(
+    dir: &Path,
+    ext: &str,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("cannot read directory '{}': {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("cannot read directory '{}': {e}", dir.display()))?;
+        let path: PathBuf = entry.path();
+        // A genuine stat failure (permission denied, removed mid-walk, ...) is propagated — not
+        // silently swallowed — so `check`/`fmt` cannot pass green over a target it never looked at.
+        let meta = path
+            .symlink_metadata()
+            .map_err(|e| format!("cannot stat '{}': {e}", path.display()))?;
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            collect_paths_under(&path, ext, out)?;
+        } else if meta.is_file()
+            && path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+        {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
 
 /// The workspace roots carried by an `initialize` request: `workspace_folders` when present (each
@@ -3469,6 +3794,8 @@ impl Backend {
             let documents = Arc::clone(&self.documents);
             let reindex_guard = Arc::clone(&self.reindex_guard);
             let shutdown = Arc::clone(&self.shutdown);
+            let scan_active = Arc::clone(&self.scan_active);
+            let scan_dirty = Arc::clone(&self.scan_dirty);
             let otpkg_cache = Arc::clone(&self.otpkg_cache);
             let sender = self.sender.clone();
             let encoding = self.encoding();
@@ -3482,111 +3809,151 @@ impl Backend {
             // shutdown prompt despite the live `Sender` (which would otherwise make
             // `IoThreads::join()` wait for this thread), the indexing loops below check the
             // `shutdown` flag between files and bail; `signal_shutdown` sets it before the backend is
-            // dropped, so the thread drops its `Sender` clone and unblocks join. The per-directory
-            // walk+read inside `scan_workspace`/`scan_workspace_lua` runs before those checks and is
-            // not itself interruptible, but it is bounded (each file capped at MAX_INDEXED_FILE_BYTES,
-            // no network), so the residual shutdown wait is a bounded latency, never a hang. Progress
-            // is reported on stderr, never the LSP channel.
+            // dropped, so the thread drops its `Sender` clone and unblocks join. `build_indexes`
+            // itself now takes a `should_stop` closure reading this same flag (polled once per file
+            // in both the `.otui`/`.lua` extraction loops, and once between the two phases), so
+            // shutdown can abort mid-scan rather than only after the ENTIRE `.otui` and `.lua`
+            // corpora have been walked and extracted — see its doc comment for exactly which
+            // cancellation points that buys. Progress is reported on stderr, never the LSP channel.
             std::thread::spawn(move || {
-                let entries = scan_workspace(&roots);
-                // The scan is stateless, so a fresh service suffices for extraction.
-                let service = OtuiService::new();
-                let mut indexed = 0usize;
-                for (uri, text) in entries {
-                    if shutdown.load(Ordering::Relaxed) {
-                        return; // shutting down: stop promptly, drop the `Sender` clone
-                    }
-                    // Hold the reindex guard across the open-check AND the disk-index writes so a
-                    // concurrent `did_open`/`did_change` cannot slip between them and be clobbered by
-                    // stale disk text: an open buffer's index entry always wins (see `reindex_guard`).
-                    let _guard = reindex_guard.lock().expect("reindex_guard poisoned");
-                    // An open buffer is authoritative: if the file was opened while the scan ran, do
-                    // not overwrite its buffer-derived index entry with disk text.
-                    if documents
-                        .read()
-                        .expect("documents lock poisoned")
-                        .contains_key(&uri)
-                    {
-                        continue;
-                    }
-                    let defs = service.style_defs(&text);
-                    // Incremental: take the write locks per file and release them immediately, so the
-                    // scan never blocks request handlers for long.
-                    style_index
-                        .write()
-                        .expect("style_index lock poisoned")
-                        .set_document(DocId::from(uri.to_string()), defs);
-                    disk_texts
-                        .write()
-                        .expect("disk_texts lock poisoned")
-                        .insert(uri, text);
-                    indexed += 1;
-                }
-                // Then scan `.lua` for widget definitions (custom style props + `extends` parents)
-                // AND id cross-references (spec §2.3: `getChildById`/.../`.ui.` — the other half of
-                // the OTUI↔Lua bridge). No reindex guard, open-check, or disk-text cache for the
-                // widget-def half: Lua is never an open OTUI document, so `lua_index` is fed purely
-                // from disk. Files that declare no widget contribute an empty result there and are
-                // skipped to keep that index lean.
-                //
-                // The two halves are indexed INDEPENDENTLY — a `.lua` file with refs but no widget
-                // defs (the common case: most controllers never define a custom widget type) must
-                // still land in `lua_ref_index`, so this is deliberately never a single `if
-                // defs.is_empty() { continue }` gate shared between them.
-                let mut lua_indexed = 0usize;
-                let mut lua_refs_indexed = 0usize;
-                for (uri, text) in scan_workspace_lua(&roots) {
-                    if shutdown.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    let defs = service.lua_widgets(&text);
-                    if !defs.is_empty() {
-                        lua_index
-                            .write()
-                            .expect("lua_index lock poisoned")
-                            .set_document(DocId::from(uri.to_string()), defs);
-                        lua_indexed += 1;
-                    }
-                    // Unlike the widget-def half above, `lua_ref_index` IS open-buffer aware (see
-                    // `Backend::reindex_lua_refs_open`), so this write races against a concurrent
-                    // `didOpen`/`didChange` for the very same `.lua` file exactly like the `.otui`
-                    // loop above — and is guarded the same way: hold `reindex_guard` across the
-                    // open-check and the write, so an open buffer's fresher ref index can never be
-                    // clobbered by stale disk text found mid-scan.
-                    let refs = scan_id_refs(&text);
-                    if !refs.is_empty() {
-                        let _guard = reindex_guard.lock().expect("reindex_guard poisoned");
-                        if documents
-                            .read()
-                            .expect("documents lock poisoned")
-                            .contains_key(&uri)
-                        {
-                            continue;
-                        }
-                        lua_ref_index
-                            .write()
-                            .expect("lua_ref_index lock poisoned")
-                            .set_document(DocId::from(uri.to_string()), refs);
-                        lua_texts
-                            .write()
-                            .expect("lua_texts lock poisoned")
-                            .insert(uri, text);
-                        lua_refs_indexed += 1;
-                    }
-                }
-                // Then build the module-association index (`.otmod` → controllers → loaded `.otui`
-                // files, module doc comment on `Backend::module_ui_index`). Independent of the two
-                // scans above — it re-reads every module's `.otmod`/controllers/UI files itself
-                // (`scan_module_dir`) rather than reusing `disk_texts`/`lua_texts`, so it is
-                // unaffected by whichever of the loops above the shutdown flag cut short.
+                // The pure disk→index construction — shared verbatim with the `check` CLI
+                // subcommand (`cli::run_check`) via `build_indexes` (which passes a never-stop
+                // closure there, since a one-shot process has nothing to cancel for), so the two can
+                // never observe a different corpus for the same files on disk.
                 if shutdown.load(Ordering::Relaxed) {
+                    return; // shutting down: stop promptly, drop the `Sender` clone
+                }
+                // Mark the scan active, and clear any dirty set left over from a previous run, BEFORE
+                // `build_indexes` takes its snapshot read — so any watched-file write for a `uri` that
+                // lands anywhere from this point until the last per-document install below (even
+                // during the read itself) gets recorded, and this scan's later (now-stale) install for
+                // that `uri` is correctly skipped. See `scan_active`/`scan_dirty`/`mark_scan_dirty`.
+                scan_active.store(true, Ordering::SeqCst);
+                scan_dirty.lock().expect("scan_dirty poisoned").clear();
+                let should_stop = || shutdown.load(Ordering::Relaxed);
+                let mut built = build_indexes(&roots, &should_stop);
+                if shutdown.load(Ordering::Relaxed) {
+                    scan_active.store(false, Ordering::SeqCst);
                     return;
                 }
-                let built = build_module_index(&roots);
-                let module_indexed = built.module_count();
-                *module_ui_index
-                    .write()
-                    .expect("module_ui_index lock poisoned") = built;
+
+                // The scan is stateless, so a fresh service suffices for the completion refresh below.
+                let service = OtuiService::new();
+
+                // Open-buffer precedence merge for the two indexes a user can have an open buffer
+                // for (`.otui` style defs, `.lua` id refs): install every disk-derived document
+                // EXCEPT one currently open, whose buffer-derived index entry must never be
+                // clobbered by the (possibly stale) disk text this scan found for the same URI.
+                // Holding `reindex_guard` as the outermost lock across the open-check AND the writes
+                // below closes the race with a concurrent `did_open`/`did_change` exactly as the
+                // pre-extraction inline loop did (see `set_open_document`'s doc comment): either that
+                // call's own guarded write completes fully before this merge observes it (and is
+                // skipped here), or fully after (and this merge already lost the race, superseded by
+                // it) — never interleaved.
+                //
+                // ALSO skip a `uri` recorded in `scan_dirty`: a watched-file writer (`index_from_disk`/
+                // `deindex`) took `reindex_guard` for that `uri` sometime between `build_indexes`'s
+                // snapshot read (above) and this install, so its write is fresher than the disk text
+                // this scan read — installing this scan's copy over it would silently resurrect stale
+                // (or, for a delete, resurrect deleted) content. See `mark_scan_dirty`.
+                let indexed = {
+                    let _guard = reindex_guard.lock().expect("reindex_guard poisoned");
+                    let open_docs = documents.read().expect("documents lock poisoned");
+                    let dirty = scan_dirty.lock().expect("scan_dirty poisoned");
+                    let mut style_w = style_index.write().expect("style_index lock poisoned");
+                    let mut disk_w = disk_texts.write().expect("disk_texts lock poisoned");
+                    let mut count = 0usize;
+                    for (uri, text) in built.disk_texts {
+                        if scan_install_should_skip(&uri, Some(&open_docs), &dirty) {
+                            continue;
+                        }
+                        let doc_id = DocId::from(uri.to_string());
+                        if let Some(defs) = built.style_index.remove_document(&doc_id) {
+                            style_w.set_document(doc_id, defs);
+                        }
+                        disk_w.insert(uri, text);
+                        count += 1;
+                    }
+                    count
+                };
+
+                // Per-document install (NOT a wholesale map replace): mirrors the pre-extraction
+                // inline loop, so a concurrent `didChangeWatchedFiles` that indexed a *different*
+                // `.lua` file during this scan keeps its entry (a whole-map overwrite would drop it).
+                // No open-check here: Lua is never an open OTUI document, so `lua_index` is fed purely
+                // from disk (unlike the style/ref halves above/below). It DOES need `reindex_guard` +
+                // the same `scan_dirty` skip as the other two blocks, though — a watched `.lua`
+                // create/change/delete (`index_lua_from_disk`/`deindex_lua`) races this install exactly
+                // like the OTUI side does.
+                let lua_indexed = {
+                    let _guard = reindex_guard.lock().expect("reindex_guard poisoned");
+                    let dirty = scan_dirty.lock().expect("scan_dirty poisoned");
+                    let mut lua_w = lua_index.write().expect("lua_index lock poisoned");
+                    let mut count = 0usize;
+                    for uri in std::mem::take(&mut built.lua_widget_uris) {
+                        if scan_install_should_skip(&uri, None, &dirty) {
+                            continue;
+                        }
+                        let doc_id = DocId::from(uri.to_string());
+                        if let Some(defs) = built.lua_index.remove_document(&doc_id) {
+                            lua_w.set_document(doc_id, defs);
+                            count += 1;
+                        }
+                    }
+                    count
+                };
+
+                // Unlike the widget-def half above, `lua_ref_index` IS open-buffer aware (see
+                // `Backend::reindex_lua_refs_open`), so it gets the same open-buffer-precedence AND
+                // `scan_dirty` skip as `style_index`/`disk_texts` above.
+                let lua_refs_indexed = {
+                    let _guard = reindex_guard.lock().expect("reindex_guard poisoned");
+                    let open_docs = documents.read().expect("documents lock poisoned");
+                    let dirty = scan_dirty.lock().expect("scan_dirty poisoned");
+                    let mut ref_w = lua_ref_index.write().expect("lua_ref_index lock poisoned");
+                    let mut texts_w = lua_texts.write().expect("lua_texts lock poisoned");
+                    let mut count = 0usize;
+                    for (uri, text) in built.lua_texts {
+                        if scan_install_should_skip(&uri, Some(&open_docs), &dirty) {
+                            continue;
+                        }
+                        let doc_id = DocId::from(uri.to_string());
+                        if let Some(refs) = built.lua_ref_index.remove_document(&doc_id) {
+                            ref_w.set_document(doc_id, refs);
+                        }
+                        texts_w.insert(uri, text);
+                        count += 1;
+                    }
+                    count
+                };
+
+                // The module-association index (`.otmod` → controllers → loaded `.otui` files) has no
+                // open-buffer concern (a `.otmod` manifest is never an editable widget/Lua buffer this
+                // index merges against), so no per-document merge is needed. It is derived from disk
+                // HERE, at install time, under `reindex_guard` — the same guard `rebuild_module_index`
+                // / `update_module_index_for` now take — rather than from a scan-start snapshot, so a
+                // `.otmod`/`.otui` watcher update that landed while the scan ran cannot be clobbered:
+                // all module-index writers serialize and each reads fresh disk, so the newest state
+                // wins. (`build_indexes` deliberately does not build this half — see its doc comment.)
+                let module_indexed = {
+                    // Take `reindex_guard` BEFORE the disk read so the read+install is atomic: a watcher
+                    // update that lands mid-scan cannot slip between our `build_module_index` read and
+                    // our write, so the newest disk state always wins. `build_module_index` takes no
+                    // `Backend` locks and `roots` is a local Vec, so nothing nests under the guard.
+                    let _guard = reindex_guard.lock().expect("reindex_guard poisoned");
+                    let fresh = build_module_index(&roots);
+                    let count = fresh.module_count();
+                    *module_ui_index
+                        .write()
+                        .expect("module_ui_index lock poisoned") = fresh;
+                    count
+                };
+
+                // All per-document installs are done: clear the active flag so every watched-file
+                // writer from this point on (there is no more scan install left to race) just installs
+                // directly, without paying for a `scan_dirty` insert. `scan_dirty` itself is left as-is
+                // (harmless — the next scan clears it before its own snapshot read).
+                scan_active.store(false, Ordering::SeqCst);
 
                 // Progress on stderr, never the LSP channel.
                 eprintln!(
@@ -4452,10 +4819,10 @@ impl Backend {
             .and_then(|start| find_owning_module_dir(&start, &self.workspace_root_paths()))?;
 
         // Every `.otui` under the module directory, recursively — `collect_files_under` is the same
-        // walk `scan_workspace_ext` uses for the workspace-wide scan, reused here scoped to just this
-        // one module's subtree (nested module-local directories, e.g. `tab/bestiary/`, included — the
-        // same shape `scan_module_dir` already resolves a nested controller's own `loadUI` target
-        // against).
+        // walk `scan_workspace_ext_cancellable` uses for the workspace-wide scan, reused here scoped
+        // to just this one module's subtree (nested module-local directories, e.g. `tab/bestiary/`,
+        // included — the same shape `scan_module_dir` already resolves a nested controller's own
+        // `loadUI` target against).
         let mut otui_files: HashMap<Uri, String> = HashMap::new();
         collect_files_under(&module_dir, "otui", &mut otui_files);
 
@@ -5697,6 +6064,107 @@ mod tests {
     }
 
     #[test]
+    fn scan_install_skips_a_uri_recorded_dirty_by_a_racing_watched_file_writer() {
+        // Reproduces the initial-scan-vs-watched-file race directly against the pure skip predicate:
+        // a watched-file writer (`index_from_disk`/`deindex`/…) recorded `uri` into `scan_dirty`
+        // sometime between the scan's `build_indexes` snapshot read and this per-document install, so
+        // the scan's (now-stale) copy for it must be skipped — the writer's fresher write must win.
+        let uri = Uri::from_str("file:///dirtied.otui").expect("uri");
+        let mut dirty = HashSet::new();
+        dirty.insert(uri.clone());
+
+        assert!(scan_install_should_skip(&uri, None, &dirty));
+        assert!(scan_install_should_skip(
+            &uri,
+            Some(&HashMap::new()),
+            &dirty
+        ));
+    }
+
+    #[test]
+    fn scan_install_does_not_skip_a_clean_untouched_uri() {
+        // The common case (no watcher event raced this URI, and it is not an open buffer): the scan's
+        // own disk-read snapshot installs normally.
+        let uri = Uri::from_str("file:///untouched.otui").expect("uri");
+        let dirty = HashSet::new();
+
+        assert!(!scan_install_should_skip(&uri, None, &dirty));
+        assert!(!scan_install_should_skip(
+            &uri,
+            Some(&HashMap::new()),
+            &dirty
+        ));
+    }
+
+    #[test]
+    fn scan_install_skips_an_open_buffer_even_when_not_dirty() {
+        // The pre-existing open-buffer precedence (style/lua-ref halves only — `open_docs: None` is
+        // the `lua_index` half, which has no open-buffer concept) must still hold once `scan_dirty` is
+        // folded into the same predicate.
+        let uri = Uri::from_str("file:///open.otui").expect("uri");
+        let mut open_docs = HashMap::new();
+        open_docs.insert(
+            uri.clone(),
+            Document {
+                text: "Panel < UIWidget\n".to_owned(),
+                version: 3,
+                language: Language::Otui,
+            },
+        );
+        let dirty = HashSet::new();
+
+        assert!(scan_install_should_skip(&uri, Some(&open_docs), &dirty));
+    }
+
+    #[test]
+    fn a_watched_file_writer_records_the_uri_dirty_only_while_the_scan_is_active() {
+        // `mark_scan_dirty` (called from inside every watched-file writer — `index_from_disk`,
+        // `deindex`, `index_lua_from_disk`, `deindex_lua`, `index_lua_refs_from_disk`,
+        // `deindex_lua_refs`) must record the URI while a background scan is running, and be a no-op
+        // once it is not — there is nothing left to protect against outside the scan's window.
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let backend = Backend::new(tx, &InitializeParams::default());
+        let uri = Uri::from_str("file:///watched.otui").expect("uri");
+
+        // Before any scan runs: writing through the real watched-file entry point must not dirty it.
+        backend.index_from_disk(&uri, "Panel < UIWidget\n".to_owned());
+        assert!(
+            !backend
+                .scan_dirty
+                .lock()
+                .expect("scan_dirty poisoned")
+                .contains(&uri),
+            "must not record dirty while no scan is active"
+        );
+
+        // Simulate a scan in flight (as `run_initialized`'s scan thread does right before its
+        // `build_indexes` snapshot read) and re-run the same watched-file write.
+        backend.scan_active.store(true, Ordering::SeqCst);
+        backend.index_from_disk(&uri, "Panel < UIWidget\n".to_owned());
+        assert!(
+            backend
+                .scan_dirty
+                .lock()
+                .expect("scan_dirty poisoned")
+                .contains(&uri),
+            "must record dirty while a scan is active, so the scan's later install skips it"
+        );
+
+        // A watched DELETE must record dirty too (so the scan does not resurrect the deleted file
+        // from its stale pre-delete snapshot).
+        let deleted = Uri::from_str("file:///deleted.otui").expect("uri");
+        backend.deindex(&deleted);
+        assert!(
+            backend
+                .scan_dirty
+                .lock()
+                .expect("scan_dirty poisoned")
+                .contains(&deleted),
+            "a watched delete must record dirty while a scan is active"
+        );
+    }
+
+    #[test]
     fn references_resolve_across_a_mix_of_open_and_disk_only_files() {
         // `MyPanel` is declared in a CLOSED (disk-only) file and used as a base in an OPEN one. With
         // the merged view, references must span both — the whole point of a workspace-wide index.
@@ -6391,6 +6859,188 @@ end
         assert_eq!(defs[0].name, "UITable");
         assert_eq!(defs[0].lua_parent.as_deref(), Some("UIWidget"));
         assert!(defs[0].custom_props.contains("column-style"));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn build_indexes_returns_promptly_when_should_stop_is_immediate() {
+        // Regression (CodeRabbit): `build_indexes` used to check cancellation only AFTER both the
+        // `.otui` and `.lua` corpora had been fully scanned, so a shutdown mid-scan blocked until
+        // the whole scan's disk read finished. A `should_stop` returning `true` from the very first
+        // call must make `build_indexes` return promptly with empty indexes rather than scanning
+        // everything under `roots`.
+        //
+        // Note: this alone is a coarse smoke test, not proof the *walk* itself is cancellable —
+        // `build_indexes`'s own extraction loop re-checks `should_stop` on its very first iteration
+        // and discards any partial result either way, so an eager (non-cancellable) walk followed by
+        // that discard would *also* pass this assertion.
+        // `scan_workspace_ext_cancellable_aborts_the_walk_before_reading_the_whole_corpus` below is
+        // the test that actually distinguishes the two by inspecting the walk's own output.
+        let base =
+            std::env::temp_dir().join(format!("otui-build-indexes-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&base).expect("mkdir");
+        std::fs::write(base.join("widget.otui"), "Panel < UIWidget\n").expect("write otui");
+        std::fs::write(
+            base.join("widget.lua"),
+            "UITable = extends(UIWidget, 'UITable')\n",
+        )
+        .expect("write lua");
+
+        let root = uri_from_file_path(&base).expect("root url");
+        let built = build_indexes(&[root], &|| true);
+
+        assert!(
+            built.disk_texts.is_empty(),
+            "an immediate should_stop must abort before indexing any .otui file: {:?}",
+            built.disk_texts
+        );
+        assert!(
+            built.lua_widget_uris.is_empty(),
+            "an immediate should_stop must abort before indexing any .lua file: {:?}",
+            built.lua_widget_uris
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn scan_workspace_ext_cancellable_aborts_the_walk_before_reading_the_whole_corpus() {
+        // Regression (CodeRabbit): `build_indexes` used to call the eager, non-cancellable
+        // `scan_workspace`/`scan_workspace_lua`, which walk + read the *entire* corpus before the
+        // extraction loop gets its first chance to check `should_stop` — so on a large workspace,
+        // shutdown still blocked for a full-corpus disk read even though `should_stop` was polled
+        // per file in the (now-pointless) extraction loop. `scan_workspace_ext_cancellable` — which
+        // `build_indexes` now calls directly — must thread `should_stop` into the recursive walk
+        // itself (`collect_files_under_cancellable`), aborting discovery, not just extraction.
+        //
+        // A `build_indexes`-level black-box test cannot tell an eager walk from a cancellable one
+        // apart (see the note on `build_indexes_returns_promptly_when_should_stop_is_immediate`
+        // above), so this test calls the walk directly and inspects how many files it actually
+        // collected before `should_stop` tripped, against a corpus far larger than the trip
+        // threshold — spread across a nested subdirectory too, so the walk's recursive step is
+        // exercised, not just its top-level loop.
+        let base =
+            std::env::temp_dir().join(format!("otui-scan-cancellable-walk-{}", std::process::id()));
+        let nested = base.join("nested");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+        const TOTAL_FILES: usize = 300;
+        for i in 0..TOTAL_FILES {
+            let dir = if i % 2 == 0 { &base } else { &nested };
+            std::fs::write(dir.join(format!("w{i:04}.otui")), "Panel < UIWidget\n")
+                .expect("write otui");
+        }
+
+        let root = uri_from_file_path(&base).expect("root url");
+
+        // Trips to `true` on its 6th call onward — a call budget far smaller than `TOTAL_FILES`, so
+        // a walk that honors it can only ever have looked at a handful of entries.
+        const STOP_AFTER_CALLS: usize = 5;
+        let calls = AtomicUsize::new(0);
+        let should_stop = || calls.fetch_add(1, Ordering::Relaxed) + 1 > STOP_AFTER_CALLS;
+
+        let entries = scan_workspace_ext_cancellable(&[root], "otui", &should_stop);
+
+        assert!(
+            entries.len() < TOTAL_FILES / 10,
+            "a should_stop tripping after {STOP_AFTER_CALLS} calls must abort the walk long \
+             before it collects all {TOTAL_FILES} files, got {} entries: the walk read (close to) \
+             the whole corpus before honoring should_stop",
+            entries.len()
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn build_indexes_runs_to_completion_with_a_never_stop_closure() {
+        // The CLI's never-stop closure (`&|| false`) must still build full indexes — `run_check`'s
+        // behavior is unchanged by this node.
+        let base =
+            std::env::temp_dir().join(format!("otui-build-indexes-full-{}", std::process::id()));
+        std::fs::create_dir_all(&base).expect("mkdir");
+        std::fs::write(base.join("widget.otui"), "Panel < UIWidget\n").expect("write otui");
+        std::fs::write(
+            base.join("widget.lua"),
+            "UITable = extends(UIWidget, 'UITable')\n",
+        )
+        .expect("write lua");
+
+        let root = uri_from_file_path(&base).expect("root url");
+        let built = build_indexes(&[root], &|| false);
+
+        assert_eq!(built.disk_texts.len(), 1, "the .otui file must be indexed");
+        assert_eq!(
+            built.lua_widget_uris.len(),
+            1,
+            "the .lua widget file must be indexed"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn collect_paths_under_propagates_an_unstattable_entry_as_an_error() {
+        // Regression (CodeRabbit): a `symlink_metadata` failure on an individual entry (as opposed
+        // to a `read_dir` failure on the directory itself, already covered by the doc comment above)
+        // used to be silently swallowed (`let Ok(meta) = ... else { continue }`), contradicting this
+        // function's own error-propagation contract and risking a false-green `check`/`fmt`. It must
+        // now be a hard `Err`, not a silent skip.
+        //
+        // Stripping execute ("search") permission from the *parent* directory reproduces this
+        // deterministically: `read_dir` still lists the entry's bare name (only read permission is
+        // needed for that), but resolving/stat-ing its full path — which `symlink_metadata` must do —
+        // additionally needs execute permission on every directory component, so it now fails with
+        // `EACCES` instead of `read_dir` itself failing.
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!(
+            "otui-collect-paths-stat-fail-{}",
+            std::process::id()
+        ));
+        let locked = base.join("locked");
+        std::fs::create_dir_all(&locked).expect("mkdir");
+        std::fs::write(locked.join("target.otui"), "Panel < UIWidget\n").expect("write otui");
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o444))
+            .expect("chmod locked to read-only, no-execute");
+
+        let mut out = Vec::new();
+        let result = collect_paths_under(&locked, "otui", &mut out);
+
+        // Restore permissions unconditionally before any assertion, so `remove_dir_all` below (and
+        // the test harness's own temp-dir cleanup) can always remove `locked` regardless of outcome.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+            .expect("restore locked permissions");
+
+        // A container/CI environment running as root bypasses permission checks entirely, in which
+        // case `symlink_metadata` genuinely succeeds despite the `0o444` mode and `target.otui`
+        // legitimately lands in `out` — that reproduction is inconclusive rather than wrong, so skip
+        // the assertion in that specific case instead of failing a machine-specific false negative.
+        // Critically, this is judged by whether the file was actually *collected* (real success), not
+        // merely by `result.is_ok()`: a regression that silently `continue`s past the stat failure
+        // (instead of propagating it) also returns `Ok(())` with an empty `out` — that must still
+        // fail this test, not be waved through as "running as root".
+        if result.is_ok() && out.iter().any(|p| p.ends_with("target.otui")) {
+            eprintln!(
+                "collect_paths_under_propagates_an_unstattable_entry_as_an_error: stat succeeded \
+                 despite the restricted permissions (likely running as root) — skipping, this \
+                 environment cannot reproduce a stat failure via permissions"
+            );
+            std::fs::remove_dir_all(&base).ok();
+            return;
+        }
+
+        let err = result.expect_err("an unstattable entry must be a hard error, not a silent skip");
+        assert!(
+            err.contains("target.otui") && err.contains("cannot stat"),
+            "the error must name the unstattable path: {err}"
+        );
+        assert!(
+            out.is_empty(),
+            "no paths should be collected once an entry's stat fails: {out:?}"
+        );
 
         std::fs::remove_dir_all(&base).ok();
     }

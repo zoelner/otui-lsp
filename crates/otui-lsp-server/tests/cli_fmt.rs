@@ -94,6 +94,31 @@ fn fmt_check_on_a_canonical_file_exits_zero() {
 }
 
 #[test]
+fn fmt_check_on_a_non_utf8_otui_file_under_the_target_dir_is_not_silently_skipped() {
+    // Same regression as `cli_check.rs`'s equivalent test, for the `fmt --check` discovery path:
+    // a non-UTF-8/binary `.otui` under a target directory must still be discovered as a target
+    // (path-only `collect_paths_under`), so its `std::fs::read_to_string` failure is reported
+    // instead of the file being silently absent from the walk.
+    let dir = scratch_dir("binary-otui");
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    std::fs::write(dir.join("widget.otui"), CANONICAL).expect("write good fixture");
+    std::fs::write(dir.join("bad.otui"), [0xffu8, 0xfe, 0x00]).expect("write binary fixture");
+
+    let (code, stdout, stderr) = run_otui_lsp(&["fmt", "--check", dir.to_str().unwrap()], &dir);
+
+    assert_ne!(
+        code, 0,
+        "a non-UTF-8 .otui under the target dir must fail, not silently exit clean: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("bad.otui"),
+        "stderr should name the unreadable file: {stderr}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn fmt_write_rewrites_the_file_in_place() {
     let dir = scratch_dir("write");
     std::fs::create_dir_all(&dir).expect("create scratch dir");
