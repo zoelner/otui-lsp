@@ -334,16 +334,9 @@ pub fn documentation_body(name: &str) -> Option<String> {
 /// `diagnostics::check_property_value`'s dispatch *exactly* (the actual `INVALID_PROPERTY_VALUE`
 /// source of truth): `display`, `layout`, `border`, and every color-typed property
 /// ([`catalog::COLOR_PROPERTIES`] — `Color(node->value())` throws on an unparseable value, not just
-/// for `border-color`; see that module's `check_property_value` doc comment).
-///
-/// Note: `docs/otui-language-service-spec.md` §2.10/§4.2 (and the repo's `.coderabbit.yaml` path
-/// instructions, which quote it) still describe only "four" validating properties
-/// (`border`/`display`/`layout`/`anchors.*`) and say a malformed value for "any other property" gets
-/// no diagnostic. That predates the deliberate color-validation fidelity fix (`d577ee9`, "the engine
-/// hard-throws; the LSP now matches it") that extended `check_property_value` to the whole color
-/// catalog — the spec prose is stale on this specific point. This mirrors the current, more
-/// fidelity-correct `diagnostics.rs` behavior; the anchor-key case (`anchors.*`) is handled by the
-/// separate early-return branch in [`documentation_body`], so it never reaches this function.
+/// for `border-color`; see that module's `check_property_value` doc comment). The anchor-key case
+/// (`anchors.*`) is handled by the separate early-return branch in [`documentation_body`], so it
+/// never reaches this function — see [`anchor_edge_body`] for its own validation note.
 #[must_use]
 fn is_validating_property(name: &str) -> bool {
     matches!(name, "display" | "layout" | "border") || catalog::COLOR_PROPERTIES.contains(&name)
@@ -354,27 +347,32 @@ fn is_validating_property(name: &str) -> bool {
 /// shorthands ([`schema::SHORTHAND_ANCHORS`]) get their own wording (they anchor more than one edge
 /// at once); every other name reaching here is a genuine [`schema::ANCHOR_EDGES`] member.
 ///
-/// Resolution is stated precisely (spec §2.4): `UIAnchor::getHookedWidget` →
-/// `parentWidget->getChildById(targetId)` searches only the parent's **direct children** — a magic
-/// target (`parent`/`next`/`prev`) or a **direct sibling**'s `id:` value. An ancestor or a
-/// non-sibling id is not a parse error, but it silently fails to resolve at layout time, so this is
-/// called out explicitly rather than left as a vague "a target widget".
+/// States both facts spec §2.4 establishes about `anchors.*` — the other validating family besides
+/// [`is_validating_property`]'s catalog properties:
+/// * **validation** — an unrecognized edge/shorthand name is rejected: `check_anchor_property` in
+///   `diagnostics.rs` flags it `INVALID_ANCHOR_EDGE`, a hard `Severity::Error`;
+/// * **resolution** — `UIAnchor::getHookedWidget` → `parentWidget->getChildById(targetId)` searches
+///   only the parent's **direct children**, so the *value* resolves to a magic target
+///   (`parent`/`next`/`prev`) or a **direct sibling**'s `id:` value only. An ancestor or a
+///   non-sibling id is not a parse error, but it silently fails to resolve at layout time, so this is
+///   called out explicitly rather than left as a vague "a target widget".
 fn anchor_edge_body(edge: &str) -> String {
+    const VALIDATION_NOTE: &str = "OTClient rejects an invalid anchor edge.";
     const RESOLUTION_NOTE: &str = "The target is a direct sibling widget's `id:` value, or a magic \
         pseudo-target (`parent`, `next`, `prev`); an ancestor or non-sibling id silently fails to \
         resolve at layout time.";
     match edge {
         "fill" => format!(
             "Anchors shorthand: anchors all four edges to the target, filling it \
-             (`anchors.fill: <target>`). {RESOLUTION_NOTE}"
+             (`anchors.fill: <target>`). {VALIDATION_NOTE} {RESOLUTION_NOTE}"
         ),
         "centerIn" => format!(
             "Anchors shorthand: anchors this widget's center to the target's center \
-             (`anchors.centerIn: <target>`). {RESOLUTION_NOTE}"
+             (`anchors.centerIn: <target>`). {VALIDATION_NOTE} {RESOLUTION_NOTE}"
         ),
         _ => format!(
             "Anchors this widget's `{edge}` edge to a target (`anchors.{edge}: <target>`). \
-             {RESOLUTION_NOTE}"
+             {VALIDATION_NOTE} {RESOLUTION_NOTE}"
         ),
     }
 }
@@ -569,12 +567,16 @@ mod tests {
     }
 
     #[test]
-    fn documentation_body_anchor_edge_states_direct_sibling_and_magic_targets_only() {
-        // Spec §2.4: `getChildById` resolves only the parent's direct children, so the target is a
-        // direct sibling id or a magic pseudo-target — never an ancestor or non-sibling id.
+    fn documentation_body_anchor_edge_states_validation_and_direct_sibling_resolution() {
+        // Spec §2.4: an unrecognized edge is rejected (INVALID_ANCHOR_EDGE, a hard error), AND
+        // `getChildById` resolves only the parent's direct children, so the target is a direct
+        // sibling id or a magic pseudo-target — never an ancestor or non-sibling id. Both facts are
+        // distinct and both must be stated, mirroring how every other validating property gets an
+        // explicit "rejects an invalid value" sentence.
         let body = documentation_body("top").expect("anchor edge has a doc");
         assert!(body.contains("edge"), "{body}");
         assert!(body.contains("anchors.top"), "{body}");
+        assert!(body.contains("rejects an invalid"), "{body}");
         assert!(body.contains("direct sibling"), "{body}");
         assert!(
             body.contains("parent") && body.contains("next") && body.contains("prev"),
@@ -584,13 +586,15 @@ mod tests {
     }
 
     #[test]
-    fn documentation_body_anchor_shorthands_also_state_direct_sibling_and_magic_targets_only() {
+    fn documentation_body_anchor_shorthands_also_state_validation_and_direct_sibling_resolution() {
         let fill = documentation_body("fill").expect("fill has a doc");
         assert!(fill.to_lowercase().contains("all four edges"), "{fill}");
+        assert!(fill.contains("rejects an invalid"), "{fill}");
         assert!(fill.contains("direct sibling"), "{fill}");
 
         let center_in = documentation_body("centerIn").expect("centerIn has a doc");
         assert!(center_in.to_lowercase().contains("center"), "{center_in}");
+        assert!(center_in.contains("rejects an invalid"), "{center_in}");
         assert!(center_in.contains("direct sibling"), "{center_in}");
     }
 
