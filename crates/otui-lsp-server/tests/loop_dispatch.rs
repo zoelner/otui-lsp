@@ -422,6 +422,62 @@ fn memory_connection_hover_on_a_per_widget_property_describes_it() {
     shutdown_and_exit(&client, server_thread, 3);
 }
 
+/// Hovering a key nested under a `layout:` block (`num-columns`) — not a global catalog property,
+/// but a `layout:`-block key the shared `classify_layout_value` classifier describes — must return a
+/// non-empty hover naming the value kind (here, "Takes an integer."), end to end through the real
+/// LSP loop with no server-side rendering change (`render_property_hover` already calls the shared
+/// `documentation_body`, which now covers layout keys too).
+#[test]
+fn memory_connection_hover_on_a_layout_block_key_describes_its_value_kind() {
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+
+    client_handshake(&client);
+
+    let uri = Uri::from_str("file:///scratch/layout.otui").expect("uri");
+    let text = "Panel\n  layout:\n    type: grid\n    num-columns: 3\n".to_owned();
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: text.clone(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+
+    let mut position = position_of(&text, "num-columns");
+    position.character += 1;
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(2),
+            "textDocument/hover".to_owned(),
+            HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position,
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            },
+        )))
+        .expect("send hover");
+    let hover_resp = recv_response(&client, &RequestId::from(2));
+    assert!(hover_resp.error.is_none(), "hover errored: {hover_resp:?}");
+    let value = hover_markdown(&hover_resp);
+
+    assert!(value.contains("`num-columns`"), "{value}");
+    assert!(value.contains("Takes an integer."), "{value}");
+    assert!(value.contains("silently ignored"), "{value}");
+
+    shutdown_and_exit(&client, server_thread, 3);
+}
+
 /// `textDocument/completion` end-to-end, with the client advertising Markdown
 /// `documentationFormat`: a completion item for a curated global property (`width`) must come back
 /// with its `documentation` populated as Markdown — the curated one-line note surfaced from

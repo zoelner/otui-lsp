@@ -21,6 +21,49 @@ use crate::lua_widgets::LuaWidgetIndex;
 use crate::schema;
 use crate::style_index::{StyleDef, StyleIndex, is_native_base};
 use std::collections::HashSet;
+use tree_sitter::Node;
+
+/// The type name of the widget enclosing `start`: the `tag` of the nearest ancestor `container` (at
+/// or above `start`) or the `base` of the nearest ancestor `style_header`. `None` when `start` has no
+/// such ancestor. Shared by [`completion`](crate::completion) (widget-aware key completion) and
+/// [`property_hover`](crate::property_hover) (per-widget property hover) — the same "what widget owns
+/// this position" question, asked from two different starting points.
+///
+/// `line_skip`, when `Some(line_start)`, makes any node whose [`Node::start_byte`] is `>= line_start`
+/// invisible to the match — completion's mid-edit guard. Completion runs against a possibly-broken
+/// CST where the half-typed token on the cursor's own line frequently parses as a bare `container` tag
+/// (a lowercase word with no `:` yet is grammatically a widget tag), which is **not** the enclosing
+/// widget — it is the property being typed; passing the cursor's line start as `line_skip` skips it, so
+/// only a widget declared on an earlier line counts as a genuine encloser. Hover starts from an
+/// already-resolved `property_key` leaf in a document that parsed successfully, so it passes `None`
+/// (no node is ever skipped) and simply walks up.
+#[must_use]
+pub fn enclosing_widget_type(
+    start: Node,
+    source: &str,
+    line_skip: Option<usize>,
+) -> Option<String> {
+    let mut node = start;
+    loop {
+        let skip = line_skip.is_some_and(|line_start| node.start_byte() >= line_start);
+        if !skip {
+            match node.kind() {
+                "container" => {
+                    return node
+                        .child_by_field_name("tag")
+                        .map(|tag| source[tag.start_byte()..tag.end_byte()].to_owned());
+                }
+                "style_header" => {
+                    return node
+                        .child_by_field_name("base")
+                        .map(|base| source[base.start_byte()..base.end_byte()].to_owned());
+                }
+                _ => {}
+            }
+        }
+        node = node.parent()?;
+    }
+}
 
 /// The resolved ancestry of a widget type: every type name from the starting type up to the root of
 /// its inheritance, nearest-first.
