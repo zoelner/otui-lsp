@@ -225,7 +225,7 @@ fn rest_of_line_is_special_form(source: &str, offset: usize) -> bool {
 /// keeps working while a sibling line in the block is still mid-edit. Deliberately does not special-
 /// case a block-scalar body: no layout-block key's value is ever one, so that skip (which
 /// [`crate::indent::indent_for_line`] performs for the on-type-indent use case) is not needed here.
-fn enclosing_layout_block(source: &str, offset: usize) -> bool {
+pub(crate) fn enclosing_layout_block(source: &str, offset: usize) -> bool {
     let lines = indent::split_lines(source);
     let Some(idx) = lines
         .iter()
@@ -304,7 +304,7 @@ fn indented_slot_items(
     // the union of its Lua-declared custom properties and its native C++ `onStyleApply` tags (see
     // `WidgetAncestry::custom_properties`) — the two origins are merged into one flat set there, so
     // they cannot be told apart here either; "widget property" covers both.
-    if let Some(widget) = tree.and_then(|t| enclosing_widget_type(t, source, offset)) {
+    if let Some(widget) = tree.and_then(|t| enclosing_widget_type_at(t, source, offset)) {
         let ancestry = widget_resolve::resolve_ancestry(&widget, styles, lua);
         for prop in ancestry.custom_properties(lua) {
             let insert = Some(property_key_snippet(&prop));
@@ -417,40 +417,22 @@ fn widget_names(styles: &StyleIndex, lua: &LuaWidgetIndex) -> Vec<(String, &'sta
     named.into_iter().collect()
 }
 
-/// The type name of the widget enclosing the cursor: the `tag` of the nearest ancestor `container`
-/// or the `base` of the nearest ancestor `style_header` (the type a property on that widget resolves
-/// against, mirroring the diagnostics pass). `None` when the source cannot be parsed or the cursor
-/// has no enclosing widget. Best-effort mid-edit: the current line is often a broken `ERROR` region,
-/// but the enclosing widget itself is usually intact, so its type still resolves.
+/// The type name of the widget enclosing the cursor at `offset` (the type a property on that widget
+/// resolves against, mirroring the diagnostics pass): the completion-specific entry point onto the
+/// shared [`widget_resolve::enclosing_widget_type`]. `None` when the source cannot be parsed or the
+/// cursor has no enclosing widget. Best-effort mid-edit: the current line is often a broken `ERROR`
+/// region, but the enclosing widget itself is usually intact, so its type still resolves.
 ///
-/// The half-typed key on the cursor's own line frequently parses as a bare `container` tag (a
-/// lowercase word with no `:` yet is grammatically a widget tag), which is **not** the enclosing
-/// widget — it is the property being typed. So any candidate widget that starts on the cursor's line
-/// is skipped; only a widget declared on an earlier line is a genuine encloser.
-fn enclosing_widget_type(tree: &SyntaxTree, source: &str, offset: usize) -> Option<String> {
+/// Passes the cursor's line start as the mid-edit skip threshold: the half-typed key on the cursor's
+/// own line frequently parses as a bare `container` tag (a lowercase word with no `:` yet is
+/// grammatically a widget tag), which is **not** the enclosing widget — it is the property being
+/// typed. So any candidate widget that starts on the cursor's line is skipped; only a widget declared
+/// on an earlier line is a genuine encloser.
+fn enclosing_widget_type_at(tree: &SyntaxTree, source: &str, offset: usize) -> Option<String> {
     let line_start = source[..offset].rfind('\n').map_or(0, |nl| nl + 1);
     let lo = offset.saturating_sub(1);
-    let mut node = tree.root().descendant_for_byte_range(lo, offset)?;
-    loop {
-        // Skip a widget node sitting on the cursor's own line: it is the token being typed, not the
-        // block that encloses it. A real enclosing widget opens on an earlier line.
-        if node.start_byte() < line_start {
-            match node.kind() {
-                "container" => {
-                    return node
-                        .child_by_field_name("tag")
-                        .map(|tag| source[tag.start_byte()..tag.end_byte()].to_owned());
-                }
-                "style_header" => {
-                    return node
-                        .child_by_field_name("base")
-                        .map(|base| source[base.start_byte()..base.end_byte()].to_owned());
-                }
-                _ => {}
-            }
-        }
-        node = node.parent()?;
-    }
+    let node = tree.root().descendant_for_byte_range(lo, offset)?;
+    widget_resolve::enclosing_widget_type(node, source, Some(line_start))
 }
 
 /// Classify the closed-set context from the line `prefix` (line start up to the cursor).
@@ -665,32 +647,16 @@ fn layout_block_key_items() -> Vec<CompletionItem> {
 }
 
 /// The **value** completions for a key inside a `layout:` block ([`schema::is_layout_block_property`]),
-/// each verified individually against the engine's layout `applyStyle` dispatch
-/// (`src/framework/ui/`):
-///
-/// * `type` → the same 4 layout-type keywords as the leaf `layout: <type>` form
-///   ([`schema::LAYOUT_TYPES`]) — both forms are resolved by the identical dispatch,
-///   `uiwidgetbasestyle.cpp:786-803`.
-/// * `fit-children` → `true`/`false`: a genuine `node->value<bool>()` cast, read by both the box
-///   layout (`uiboxlayout.cpp:36-37`) and the grid layout (`uigridlayout.cpp:49-50`).
-/// * `align-right` → `true`/`false`: `uihorizontallayout.cpp:34-35`, `node->value<bool>()`.
-/// * `align-bottom` → `true`/`false`: `uiverticallayout.cpp:34-35`, `node->value<bool>()`.
-/// * `auto-spacing` → `true`/`false`: `uigridlayout.cpp:51-52`, `node->value<bool>()`.
-/// * `flow` → `true`/`false`: `uigridlayout.cpp:53-54`, `setFlow(node->value<bool>())` — despite the
-///   CSS-sounding name this is a plain on/off switch in the engine, not a keyword enum.
-///
-/// Every other layout key is a `node->value<int>()` (`spacing` `uiboxlayout.cpp:34-35`; `cell-width`,
-/// `cell-height`, `cell-spacing`, `num-columns`, `num-lines` — all `uigridlayout.cpp:39-48`) or a
-/// `node->value<Size>()` (`cell-size`, a free `"WxH"` pair, `uigridlayout.cpp:37-38`): free
-/// numeric/dimension input, so no value is offered — never fabricated.
+/// from the audited value kind shared with hover ([`property_hover::classify_layout_value`]): the same
+/// 4 layout-type keywords as the leaf `layout: <type>` form for `type`, `true`/`false` for a boolean
+/// key, or nothing for a free numeric/dimension key (`Integer`/`Size`) — never fabricated. See
+/// `classify_layout_value`'s doc comment for the per-key engine citations.
 fn layout_value_items(key: &str) -> Vec<CompletionItem> {
-    match key {
-        "type" => set_items(
-            schema::LAYOUT_TYPES,
-            CompletionKind::EnumMember,
-            "layout type",
-        ),
-        "fit-children" | "align-right" | "align-bottom" | "auto-spacing" | "flow" => {
+    match property_hover::classify_layout_value(key) {
+        property_hover::PropertyValueKind::Enum { values } => {
+            set_items(values, CompletionKind::EnumMember, "layout type")
+        }
+        property_hover::PropertyValueKind::Boolean => {
             set_items(&["true", "false"], CompletionKind::Value, "value")
         }
         _ => Vec::new(),

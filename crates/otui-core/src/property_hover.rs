@@ -54,7 +54,6 @@ use crate::style_index::StyleIndex;
 use crate::syntax::SyntaxTree;
 use crate::widget_resolve;
 use lang_api::ByteSpan;
-use tree_sitter::Node;
 
 /// A structured, protocol-agnostic description of a property key under the cursor (spec §5.5). The
 /// server maps [`span`](Self::span) to a range and renders [`doc`](Self::doc) + [`value`](Self::value)
@@ -98,6 +97,12 @@ pub enum PropertyValueKind {
     Border,
     /// A known catalog property with no specially-typed value.
     Plain,
+    /// A free integer value, per a `node->value<int>()` cast — a `layout:`-block key such as
+    /// `spacing` or `num-columns`.
+    Integer,
+    /// A free `WxH` size pair, per a `node->value<Size>()` cast — the `layout:`-block `cell-size`
+    /// key.
+    Size,
 }
 
 /// Describe the property key under `offset`, or `None` when the cursor is not on a **known** property
@@ -139,10 +144,28 @@ pub fn property_hover_at(
             name,
         });
     }
-    // Not a global catalog property: does the enclosing widget's resolved ancestry declare it as a
-    // per-widget custom property (Lua-declared or native C++)? Mirrors `completion`'s widget-aware
-    // property-key slot exactly, just answering a membership test instead of enumerating a set.
-    let widget_type = enclosing_widget_type(key, source)?;
+    // Not a global catalog property: is it a `layout:`-block key, AND is the cursor actually sitting
+    // inside a `layout:` block ([`crate::completion::enclosing_layout_block`])? A layout key is never
+    // in the global catalog (the two namespaces are disjoint by design — see
+    // `schema::is_layout_block_property`'s doc comment), so this can never shadow a global property
+    // hover; the block-context guard keeps a bare layout-key name elsewhere (never `is_known_property`)
+    // from getting a spurious layout hover.
+    if schema::is_layout_block_property(&name)
+        && crate::completion::enclosing_layout_block(source, offset)
+    {
+        return Some(PropertyHover {
+            span,
+            doc: None,
+            value: classify_layout_value(&name),
+            widget: None,
+            name,
+        });
+    }
+    // Not a global catalog property or a layout-block key: does the enclosing widget's resolved
+    // ancestry declare it as a per-widget custom property (Lua-declared or native C++)? Mirrors
+    // `completion`'s widget-aware property-key slot exactly, just answering a membership test instead
+    // of enumerating a set.
+    let widget_type = widget_resolve::enclosing_widget_type(key, source, None)?;
     let ancestry = widget_resolve::resolve_ancestry(&widget_type, styles, lua);
     if !ancestry.declares_custom_property(lua, &name) {
         return None;
@@ -154,32 +177,6 @@ pub fn property_hover_at(
         widget: Some(widget_type),
         name,
     })
-}
-
-/// The type name of the widget that owns the property key `key`: the nearest ancestor `container`
-/// (its `tag`) or `style_header` (its `base`). A minimal, hover-specific counterpart to
-/// `completion::enclosing_widget_type` — hover always starts from an already-resolved `property_key`
-/// leaf in a document that parsed successfully (unlike completion, which runs mid-edit against a
-/// possibly-broken CST and must skip a node still being typed on the cursor's own line), so no such
-/// heuristic is needed here: just walk up.
-fn enclosing_widget_type(key: Node, source: &str) -> Option<String> {
-    let mut node = key;
-    loop {
-        node = node.parent()?;
-        match node.kind() {
-            "container" => {
-                return node
-                    .child_by_field_name("tag")
-                    .map(|tag| source[tag.start_byte()..tag.end_byte()].to_owned());
-            }
-            "style_header" => {
-                return node
-                    .child_by_field_name("base")
-                    .map(|base| source[base.start_byte()..base.end_byte()].to_owned());
-            }
-            _ => {}
-        }
-    }
 }
 
 /// The curated one-line behavior for a canonical global property, or `None` if not in the set.
@@ -384,6 +381,44 @@ pub fn classify_value(name: &str) -> PropertyValueKind {
     }
 }
 
+/// Classify a `layout:`-block key's ([`schema::is_layout_block_property`]) expected value — the
+/// single audited source shared by [`completion::layout_value_items`](crate::completion) (value
+/// completion) and layout-key hover, so the two surfaces can never disagree on what a layout key
+/// takes. Each mapping verified individually against the engine's layout `applyStyle` dispatch
+/// (`src/framework/ui/`):
+///
+/// * `type` → the 4 layout-type keywords ([`schema::LAYOUT_TYPES`]) — `uiwidgetbasestyle.cpp:786-803`.
+/// * `fit-children` → `true`/`false`: `node->value<bool>()`, read by both the box layout
+///   (`uiboxlayout.cpp:36-37`) and the grid layout (`uigridlayout.cpp:49-50`).
+/// * `align-right` → `true`/`false`: `uihorizontallayout.cpp:34-35`, `node->value<bool>()`.
+/// * `align-bottom` → `true`/`false`: `uiverticallayout.cpp:34-35`, `node->value<bool>()`.
+/// * `auto-spacing` → `true`/`false`: `uigridlayout.cpp:51-52`, `node->value<bool>()`.
+/// * `flow` → `true`/`false`: `uigridlayout.cpp:53-54`, `setFlow(node->value<bool>())` — despite the
+///   CSS-sounding name this is a plain on/off switch in the engine, not a keyword enum.
+/// * `cell-size` → a `WxH` size pair: `node->value<Size>()`, `uigridlayout.cpp:37-38`.
+/// * `spacing`, `num-columns`, `num-lines`, `cell-width`, `cell-height`, `cell-spacing` → a free
+///   integer: `node->value<int>()` — `spacing` in `uiboxlayout.cpp:34-35`; the rest in
+///   `uigridlayout.cpp:39-48`.
+///
+/// Any other name that `is_layout_block_property` still admits but this `match` does not enumerate
+/// falls back to `Plain`, defensively — every key the catalog currently lists above is covered.
+#[must_use]
+pub(crate) fn classify_layout_value(key: &str) -> PropertyValueKind {
+    match key {
+        "type" => PropertyValueKind::Enum {
+            values: schema::LAYOUT_TYPES,
+        },
+        "fit-children" | "align-right" | "align-bottom" | "auto-spacing" | "flow" => {
+            PropertyValueKind::Boolean
+        }
+        "cell-size" => PropertyValueKind::Size,
+        "spacing" | "num-columns" | "num-lines" | "cell-width" | "cell-height" | "cell-spacing" => {
+            PropertyValueKind::Integer
+        }
+        _ => PropertyValueKind::Plain,
+    }
+}
+
 /// The shared Markdown documentation **body** for `name` — everything worth saying about it except
 /// a `**\`name\`**` header, which every caller prepends itself. The single source both the completion
 /// module (a global property-key item's `documentation`) and the server's property-key hover render
@@ -407,13 +442,22 @@ pub fn classify_value(name: &str) -> PropertyValueKind {
 ///   today by the completion module's `anchors.<edge>`/shorthand key items; `property_hover_at` does
 ///   not (yet) resolve a hover on an anchor-edge token, so this branch is exercised only through
 ///   completion for now.
+/// * a `layout:`-block key ([`schema::is_layout_block_property`], e.g. `type`, `fit-children`,
+///   `cell-size`) — guarded by `&& !schema::is_known_property(name)` so it can never shadow a global
+///   catalog property (the two namespaces are disjoint by design; no [`catalog::LAYOUT_PROPERTIES`]
+///   name collides with [`catalog::PROPERTIES`]). Uses [`classify_layout_value`] for the value-kind
+///   sentence and always ends non-validating ("silently ignored") — layout keys are never in
+///   [`is_validating_property`], mirroring `diagnostics.rs`, which does not flag them either.
 ///
-/// `None` only when `name` is neither — an unknown/misspelled key that resolves to nothing (the
-/// `unknown-property` diagnostic already covers that case as a hint).
+/// `None` only when `name` is none of the above — an unknown/misspelled key that resolves to nothing
+/// (the `unknown-property` diagnostic already covers that case as a hint).
 #[must_use]
 pub fn documentation_body(name: &str) -> Option<String> {
     if schema::is_anchor_edge(name) || schema::is_shorthand_anchor(name) {
         return Some(anchor_edge_body(name));
+    }
+    if schema::is_layout_block_property(name) && !schema::is_known_property(name) {
+        return Some(layout_key_body(name));
     }
     if !schema::is_known_property(name) {
         return None;
@@ -440,8 +484,10 @@ pub fn documentation_body(name: &str) -> Option<String> {
             parts.push(format!("One of: {list}"));
         }
         PropertyValueKind::Boolean => parts.push("Takes `true` or `false`.".to_owned()),
-        // Nothing extra beyond the curated doc (if any) for a plainly-typed property.
-        PropertyValueKind::Plain => {}
+        // Nothing extra beyond the curated doc (if any) for a plainly-typed property. `Integer`/
+        // `Size` are `layout:`-block-only kinds `classify_value` never returns for a global catalog
+        // property (handled instead by `layout_key_body`), so they are unreachable here in practice.
+        PropertyValueKind::Plain | PropertyValueKind::Integer | PropertyValueKind::Size => {}
     }
     parts.push(if is_validating_property(name) {
         "OTClient rejects an invalid value.".to_owned()
@@ -497,6 +543,36 @@ fn anchor_edge_body(edge: &str) -> String {
              {VALIDATION_NOTE} {RESOLUTION_NOTE}"
         ),
     }
+}
+
+/// The documentation body for a `layout:`-block key ([`schema::is_layout_block_property`]) — `name`
+/// is the bare key (`type`, `fit-children`, `cell-size`, …), never a global catalog property (the
+/// caller already guards on that). A value-kind sentence from [`classify_layout_value`], when the kind
+/// warrants one (`Plain` contributes nothing, mirroring [`documentation_body`]'s own catalog-property
+/// match), followed by the non-validating note: unlike the catalog's validating family
+/// ([`is_validating_property`]), no layout key is ever hard-validated — `diagnostics.rs` does not flag
+/// an unrecognized layout value either, so the note always reads "silently ignored".
+fn layout_key_body(name: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    match classify_layout_value(name) {
+        PropertyValueKind::Enum { values } => {
+            let list = values
+                .iter()
+                .map(|v| format!("`{v}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!("One of: {list}"));
+        }
+        PropertyValueKind::Boolean => parts.push("Takes `true` or `false`.".to_owned()),
+        PropertyValueKind::Integer => parts.push("Takes an integer.".to_owned()),
+        PropertyValueKind::Size => parts.push("Takes a `WxH` size.".to_owned()),
+        // Every layout key the catalog lists is covered above; `Color`/`AssetPath`/`Border`/`Plain`
+        // never occur here in practice (`classify_layout_value` never returns them for a real layout
+        // key), so nothing extra is said in that defensive fallback case either.
+        _ => {}
+    }
+    parts.push("An unrecognized value is silently ignored.".to_owned());
+    parts.join("\n\n")
 }
 
 #[cfg(test)]
@@ -954,5 +1030,129 @@ mod tests {
         let lua = LuaWidgetIndex::new();
 
         assert!(hover_with("TextEdit\n  widht: 10\n", "widht", &styles, &lua).is_none());
+    }
+
+    // --- `layout:`-block hover ---------------------------------------------------------------------
+
+    #[test]
+    fn classify_layout_value_maps_every_key_to_its_engine_verified_kind() {
+        assert_eq!(
+            classify_layout_value("type"),
+            PropertyValueKind::Enum {
+                values: schema::LAYOUT_TYPES
+            }
+        );
+        for key in [
+            "fit-children",
+            "align-right",
+            "align-bottom",
+            "auto-spacing",
+            "flow",
+        ] {
+            assert_eq!(
+                classify_layout_value(key),
+                PropertyValueKind::Boolean,
+                "{key}"
+            );
+        }
+        assert_eq!(classify_layout_value("cell-size"), PropertyValueKind::Size);
+        for key in [
+            "spacing",
+            "num-columns",
+            "num-lines",
+            "cell-width",
+            "cell-height",
+            "cell-spacing",
+        ] {
+            assert_eq!(
+                classify_layout_value(key),
+                PropertyValueKind::Integer,
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn hover_on_the_layout_type_key_describes_the_enum() {
+        let h = hover("Panel\n  layout:\n    type: verticalBox\n", "type").expect("hover");
+        assert_eq!(h.name, "type");
+        assert_eq!(
+            h.value,
+            PropertyValueKind::Enum {
+                values: schema::LAYOUT_TYPES
+            }
+        );
+        assert_eq!(h.doc, None);
+        assert_eq!(h.widget, None);
+    }
+
+    #[test]
+    fn hover_on_a_layout_boolean_key_describes_the_boolean() {
+        let h = hover("Panel\n  layout:\n    fit-children: true\n", "fit-children").expect("hover");
+        assert_eq!(h.value, PropertyValueKind::Boolean);
+    }
+
+    #[test]
+    fn hover_on_a_layout_integer_key_describes_the_integer() {
+        let h = hover("Panel\n  layout:\n    num-columns: 3\n", "num-columns").expect("hover");
+        assert_eq!(h.value, PropertyValueKind::Integer);
+    }
+
+    #[test]
+    fn hover_on_the_layout_cell_size_key_describes_a_wxh_size() {
+        let h = hover("Panel\n  layout:\n    cell-size: 32 32\n", "cell-size").expect("hover");
+        assert_eq!(h.value, PropertyValueKind::Size);
+    }
+
+    #[test]
+    fn a_layout_key_outside_a_layout_block_has_no_hover() {
+        // `num-columns` is not a global catalog property and, without an enclosing `layout:` block,
+        // is not a per-widget property of any resolvable widget either — same as a genuinely unknown
+        // key.
+        assert!(hover("Panel\n  num-columns: 3\n", "num-columns").is_none());
+    }
+
+    #[test]
+    fn documentation_body_describes_the_layout_type_enum_and_stays_non_validating() {
+        let body = documentation_body("type").expect("layout `type` has a doc");
+        assert!(body.contains("One of:"), "{body}");
+        for value in schema::LAYOUT_TYPES {
+            assert!(body.contains(&format!("`{value}`")), "{body}");
+        }
+        assert!(body.contains("silently ignored"), "{body}");
+        assert!(!body.contains("rejects an invalid value"), "{body}");
+    }
+
+    #[test]
+    fn documentation_body_describes_a_layout_boolean_key() {
+        let body = documentation_body("fit-children").expect("layout boolean key has a doc");
+        assert!(body.contains("Takes `true` or `false`."), "{body}");
+        assert!(body.contains("silently ignored"), "{body}");
+    }
+
+    #[test]
+    fn documentation_body_describes_a_layout_integer_key() {
+        let body = documentation_body("num-columns").expect("layout integer key has a doc");
+        assert!(body.contains("Takes an integer."), "{body}");
+        assert!(body.contains("silently ignored"), "{body}");
+    }
+
+    #[test]
+    fn documentation_body_describes_the_layout_cell_size_key() {
+        let body = documentation_body("cell-size").expect("layout `cell-size` has a doc");
+        assert!(body.contains("WxH"), "{body}");
+        assert!(body.contains("silently ignored"), "{body}");
+    }
+
+    #[test]
+    fn no_layout_property_name_collides_with_the_global_catalog() {
+        // The two namespaces must stay disjoint: the `documentation_body` layout branch's
+        // `!is_known_property` guard depends on it never shadowing a genuine global property.
+        for &key in catalog::LAYOUT_PROPERTIES {
+            assert!(
+                !schema::is_known_property(key),
+                "`{key}` is both a layout-block key and a global catalog property"
+            );
+        }
     }
 }
