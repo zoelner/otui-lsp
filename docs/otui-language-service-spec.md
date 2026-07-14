@@ -172,9 +172,9 @@ name is **silently ignored by the engine — never an error, never even a warnin
 the validating properties actively validate their *value* and throw on malformed input: `border`,
 `display`, `layout`, `anchors.*`, and every color-typed property (`color`, `background`,
 `background-color`, `border-color*`, `icon-color`, `image-color`, `ttf-stroke-color`, ...) — the
-engine's `Color(node->value())` throws on a value it cannot parse, just like the other four (mirrored
-by `diagnostics.rs`'s `check_property_value`, which validates the whole color-property catalog, not
-just `border-color`). Every other property either applies cleanly or is silently dropped if
+engine's `Color(node->value())` throws on a value it cannot parse, just like the other validating
+properties (mirrored by `diagnostics.rs`'s `check_property_value`, which validates the whole
+color-property catalog, not just `border-color`). Every other property either applies cleanly or is silently dropped if
 misspelled/unknown. Unknown property names are hints ("not a recognized property — ignored by the
 engine"), never error-severity; malformed values for the validating properties are real errors;
 malformed values for everything else are not validated at all.
