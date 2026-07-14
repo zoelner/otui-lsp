@@ -143,18 +143,33 @@ pub fn style_header_at(source: &str, offset: usize) -> Option<StyleHeaderRef> {
     None
 }
 
+/// Which of the two id-token shapes a cursor hit landed on. Spec §5.5 gives these two *different*
+/// hovers: "this widget's id" (plus a reference count) for a [`Declaration`](Self::Declaration), vs.
+/// the resolved sibling's kind (or "not found") for an [`AnchorTarget`](Self::AnchorTarget) — a
+/// separate, later hover this node does not implement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdRefKind {
+    /// The `value` of an `id_property` (`id: <value>`) — the id is *declared* here.
+    Declaration,
+    /// The `id` prefix of a dotted `anchor_target` (`<id>.edge`) — the id is *referenced* here.
+    AnchorTarget,
+}
+
 /// A cursor hit on an `id:` value or on the `id` portion of an anchor target `<id>.edge` (spec §5.4).
 ///
 /// [`id`](Self::id) is the id text; [`span`](Self::span) is its byte span — the `id:` value token
 /// when the cursor is on a declaration, or just the `id` prefix (not the `.edge` suffix) when it is on
-/// an anchor reference. Ids are per-document identities, so resolving occurrences is document-local
-/// (the server's job — see [`references`](crate::references)).
+/// an anchor reference; [`kind`](Self::kind) tells the two shapes apart. Ids are per-document
+/// identities, so resolving occurrences is document-local (the server's job — see
+/// [`references`](crate::references)).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdRef {
     /// The id the cursor is on.
     pub id: String,
     /// The byte span of the id token (the `id:` value, or the `id` prefix of an `<id>.edge` target).
     pub span: ByteSpan,
+    /// Whether this hit is the id's declaration or a reference to it.
+    pub kind: IdRefKind,
 }
 
 /// If `offset` falls on an `id:` value token, or on the `id` portion of an anchor target
@@ -183,6 +198,7 @@ fn find_id_at(node: Node<'_>, source: &str, offset: usize) -> Option<IdRef> {
                     return Some(IdRef {
                         id: source[span.start..span.end].to_owned(),
                         span,
+                        kind: IdRefKind::Declaration,
                     });
                 }
             }
@@ -221,6 +237,7 @@ fn anchor_id_ref(anchor_target: Node<'_>, source: &str, offset: usize) -> Option
         Some(IdRef {
             id: prefix.to_owned(),
             span: ByteSpan::new(span.start, prefix_end),
+            kind: IdRefKind::AnchorTarget,
         })
     } else {
         None
@@ -366,6 +383,8 @@ mod tests {
         let got = id_at(src, at(src, "header")).expect("hit");
         assert_eq!(got.id, "header");
         assert_eq!(&src[got.span.start..got.span.end], "header");
+        // A declaration hit is discriminated `Declaration`, not `AnchorTarget`.
+        assert_eq!(got.kind, IdRefKind::Declaration);
         // A cursor in the middle of the value is the same hit.
         assert_eq!(id_at(src, at(src, "header") + 2).as_ref(), Some(&got));
     }
@@ -377,6 +396,9 @@ mod tests {
         let got = id_at(src, at(src, "header.bottom")).expect("hit");
         assert_eq!(got.id, "header");
         assert_eq!(&src[got.span.start..got.span.end], "header");
+        // An anchor-target hit is discriminated `AnchorTarget`, not `Declaration` — this is the guard
+        // the id-value hover (a later node) relies on to never fire on an anchor target.
+        assert_eq!(got.kind, IdRefKind::AnchorTarget);
     }
 
     #[test]

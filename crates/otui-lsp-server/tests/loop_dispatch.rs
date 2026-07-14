@@ -1644,6 +1644,134 @@ fn otui_lua_bridge_resolves_both_directions_via_the_disk_scan() {
     shutdown_and_exit(&client, server_thread, next_id);
 }
 
+/// Hover on an `id:` **declaration** value (spec §5.5): "this widget's id" plus a reference count —
+/// end to end, through the real disk scan, proving the count the hover renders is EXACTLY the count a
+/// `textDocument/references` request (`include_declaration: false`, mirroring the fact that the
+/// declaration is never its own reference) on the same token returns. This is not incidental: the
+/// hover handler calls the very same `lua_forward_references` the `references` handler calls
+/// (`Backend::references`), so the two can never drift apart by construction — this test is the
+/// end-to-end proof of that invariant.
+///
+/// Mirrors `otui_lua_bridge_resolves_both_directions_via_the_disk_scan`'s setup (a paired
+/// `.otui`/`.lua` module, only the `.otui` ever opened, so every Lua-side count can only have come
+/// from the background disk scan), but adds a same-document anchor-target reference too, so the count
+/// mixes BOTH origins — proving the hover's breakdown line as well.
+#[test]
+fn hover_on_an_id_declaration_reference_count_matches_the_references_response() {
+    let base = std::env::temp_dir().join(format!(
+        "otui-id-hover-count-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _cleanup = TempDirGuard(base.clone());
+
+    let login_dir = base.join("modules").join("login");
+    std::fs::create_dir_all(&login_dir).expect("mkdir login");
+    // One anchor-target reference to `closeButton` in this same document, PLUS a `getChildById` use
+    // in the paired `.lua` controller below — the count must combine both.
+    let login_otui_src = "MainWindow < UIWidget\n  Button\n    id: closeButton\n  \
+         Button2\n    anchors.top: closeButton.bottom\n";
+    let login_otui_path = login_dir.join("login.otui");
+    std::fs::write(&login_otui_path, login_otui_src).expect("write login.otui");
+
+    let login_lua_src = "function onCreate(rootWidget)\n  local btn = rootWidget:getChildById('closeButton')\n  \
+         btn:hide()\nend\n";
+    let login_lua_path = login_dir.join("login.lua");
+    std::fs::write(&login_lua_path, login_lua_src).expect("write login.lua");
+
+    let login_otui_uri = file_uri(&login_otui_path);
+    let login_lua_uri = file_uri(&login_lua_path);
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+
+    #[allow(deprecated)]
+    client_handshake_with_params(
+        &client,
+        InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: file_uri(&base),
+                name: "ws".to_owned(),
+            }]),
+            ..InitializeParams::default()
+        },
+    );
+
+    // Open only the `.otui` file — never `login.lua` — so the Lua-side half of the count can only
+    // have come from the background disk scan, exactly as the sibling bridge test does.
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: login_otui_uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: login_otui_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+
+    let mut next_id = 2i32;
+    let decl_position = position_of(login_otui_src, "closeButton");
+
+    // Poll `references` (declaration excluded, mirroring the hover's own count) until the paired
+    // login.lua's getChildById use has been indexed by the background scan — convergence here is what
+    // makes the single, unretried hover request below reliable.
+    let references = references_until(
+        &client,
+        &mut next_id,
+        &login_otui_uri,
+        decl_position,
+        false,
+        |locs| locs.iter().any(|l| l.uri == login_lua_uri),
+    );
+    // Exactly two references: the same-document anchor target, plus the paired Lua use.
+    assert_eq!(references.len(), 2, "{references:#?}");
+
+    let hover_id = next_id;
+    next_id += 1;
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(hover_id),
+            "textDocument/hover".to_owned(),
+            HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: login_otui_uri.clone(),
+                    },
+                    position: decl_position,
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            },
+        )))
+        .expect("send hover");
+    let hover_resp = recv_response(&client, &RequestId::from(hover_id));
+    assert!(hover_resp.error.is_none(), "hover errored: {hover_resp:?}");
+    let value = hover_markdown(&hover_resp);
+
+    assert!(
+        value.contains("**`closeButton`** — this widget's id."),
+        "{value}"
+    );
+    // The load-bearing assertion: the hover's rendered count is EXACTLY `references.len()`, and the
+    // breakdown names both origins (1 same-document anchor, 1 paired-Lua use).
+    assert!(
+        value.contains("2 references (1 anchor in this file, 1 in the paired Lua controller(s))."),
+        "{value}"
+    );
+    assert_eq!(
+        references.len(),
+        2,
+        "hover's rendered total must equal the references response's length"
+    );
+
+    shutdown_and_exit(&client, server_thread, next_id);
+}
+
 /// The module-association half of the OTUI↔Lua bridge (node `smart-pairing`): a controller and its
 /// UI file that share NEITHER a directory NOR a stem — the shape `paired_uri`'s same-directory/
 /// same-stem fast path alone cannot resolve — must still pair, via the module's `.otmod` `scripts:`
