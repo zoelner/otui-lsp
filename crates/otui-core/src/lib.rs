@@ -8,7 +8,7 @@
 //! Behavior is a faithful mirror of the real OTClient engine (opentibiabr), per the spec vendored at
 //! `docs/otui-language-service-spec.md`. The [`syntax`] tree-sitter substrate underpins every
 //! feature module: [`diagnostics`], [`completion`], [`hover`], [`property_hover`], [`id_hover`],
-//! [`symbols`], [`navigation`], [`references`], [`hierarchy`], [`format`], [`indent`], [`folding`], [`semantic`],
+//! [`alias_hover`], [`symbols`], [`navigation`], [`references`], [`hierarchy`], [`format`], [`indent`], [`folding`], [`semantic`],
 //! [`colors`], [`links`], [`fixes`], [`lenses`], [`inlay`], plus the workspace-index building blocks
 //! ([`style_index`], [`lua_widgets`], [`lua_refs`], [`lua_ui_loads`], [`otmod`], [`widget_resolve`],
 //! [`ids`]), the module-manifest-flavored diagnostics pass ([`manifest`]), and the engine data
@@ -16,6 +16,7 @@
 //! The [`LanguageService`] trait
 //! and the inherent [`OtuiService`] methods below are the entry points the server drives.
 
+pub mod alias_hover;
 pub mod catalog;
 pub mod colors;
 pub mod completion;
@@ -223,6 +224,21 @@ impl OtuiService {
         offset: usize,
     ) -> Option<AnchorTargetResolution> {
         navigation::resolve_anchor_target(source, offset)
+    }
+
+    /// Describe the `&tag:` alias-property key under `offset` for hover (spec §2.6 / §5.5): every
+    /// `&` node is *simultaneously* an OTML variable/alias (`OTMLParser::resolveVariablesRecursive`)
+    /// and a Lua-evaluated widget-instance field (`UIWidget::parseBaseStyle`), so the returned
+    /// [`alias_hover::AliasHover`] always carries enough to describe both roles at once — the
+    /// server never has to pick one. `None` when the cursor is not on an alias-property key (a
+    /// value position, a different property kind, or an unparseable document).
+    ///
+    /// Inherent (not on the [`LanguageService`] trait) so the protocol-agnostic trait stays minimal,
+    /// mirroring [`id_at`](Self::id_at); unlike [`property_hover_at`](Self::property_hover_at) it
+    /// needs no workspace state, since both roles are unconditional on every `&` node.
+    #[must_use]
+    pub fn alias_hover_at(&self, source: &str, offset: usize) -> Option<alias_hover::AliasHover> {
+        alias_hover::alias_hover_at(source, offset)
     }
 
     /// Find every occurrence of the style name `name` in one document (spec §5.4): the top-level

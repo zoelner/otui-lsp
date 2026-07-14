@@ -68,6 +68,7 @@ use lsp_types::{
     InlayHintParams,
 };
 use otui_core::OtuiService;
+use otui_core::alias_hover::{AliasHover, alias_hover_body};
 use otui_core::fixes::Fix;
 use otui_core::hover::{Inheritance, StyleHover, StyleHoverKind};
 use otui_core::id_hover::id_hover_body;
@@ -2665,6 +2666,29 @@ fn magic_anchor_target_hover_body(keyword: &str) -> String {
     }
 }
 
+/// Format an [`AliasHover`] (an `&tag:` alias-property key under the cursor) into an LSP Markdown
+/// [`Hover`] — the header names the alias with its `&` sigil, then [`alias_hover_body`] states both
+/// engine-simultaneous roles (spec §2.6 / §5.5): the OTML variable/alias and the Lua-evaluated
+/// widget-instance field. The range covers just the alias-name span (the `&` sigil is not included,
+/// mirroring [`AliasHover::span`]).
+fn render_alias_hover(
+    desc: &AliasHover,
+    line_index: &LineIndex,
+    encoding: PositionEncoding,
+) -> Hover {
+    let name = &desc.name;
+    let header = format!("**`&{name}`**");
+    let body = alias_hover_body(name, desc.is_hash_literal);
+    let value = format!("{header}\n\n{body}");
+    Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value,
+        }),
+        range: Some(line_index.range(desc.span.start, desc.span.end, encoding)),
+    }
+}
+
 /// Format a [`PathRef`] (an asset path *value* under the cursor) into an LSP Markdown [`Hover`] —
 /// the sprite-preview hover. `resolved` is the on-disk target file, already found by the caller via
 /// [`resolve_asset_candidates`] (the same resolution `document_link` and the missing-asset
@@ -4484,6 +4508,14 @@ impl Backend {
         // a per-widget property of the enclosing widget's resolved ancestry — same indexes as above.
         if let Some(pdesc) = self.service.property_hover_at(&text, offset, &index, &lua) {
             return Some(render_property_hover(&pdesc, &line_index, encoding));
+        }
+        // `property_hover_at` walks up looking for `property_key`, so it correctly returns `None`
+        // for an `&tag:` alias key (a distinct grammar node, `alias_name`) — try that next. Every
+        // `&` node is *simultaneously* an OTML variable/alias and a Lua-evaluated widget-instance
+        // field (spec §2.6), so this hover always states both roles at once (see
+        // [`render_alias_hover`]). Needs no workspace state, unlike the branches above/below.
+        if let Some(adesc) = self.service.alias_hover_at(&text, offset) {
+            return Some(render_alias_hover(&adesc, &line_index, encoding));
         }
         // Not a property key either — is the cursor on an `id:` **declaration** value (spec §5.5:
         // "this widget's id" plus a reference count)? An anchor-target id (`IdRefKind::AnchorTarget`)

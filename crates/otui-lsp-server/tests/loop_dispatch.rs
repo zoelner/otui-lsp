@@ -478,6 +478,122 @@ fn memory_connection_hover_on_a_layout_block_key_describes_its_value_kind() {
     shutdown_and_exit(&client, server_thread, 3);
 }
 
+/// Hovering an `&tag:` alias-property key whose value is an ordinary Lua expression (`bar()`, not
+/// the `#` carve-out) must show BOTH engine-simultaneous meanings (spec §2.6 / §5.5): the OTML
+/// variable/alias AND the Lua-evaluated widget-instance field, with the "evaluated as a Lua
+/// expression" wording (not the plain-string carve-out wording).
+#[test]
+fn memory_connection_hover_on_an_alias_key_shows_both_meanings_eval_variant() {
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+
+    client_handshake(&client);
+
+    let uri = Uri::from_str("file:///scratch/alias_eval.otui").expect("uri");
+    let text = "Panel\n  &foo: bar()\n".to_owned();
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: text.clone(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+
+    let mut position = position_of(&text, "foo");
+    position.character += 1;
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(2),
+            "textDocument/hover".to_owned(),
+            HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position,
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            },
+        )))
+        .expect("send hover");
+    let hover_resp = recv_response(&client, &RequestId::from(2));
+    assert!(hover_resp.error.is_none(), "hover errored: {hover_resp:?}");
+    let value = hover_markdown(&hover_resp);
+
+    assert!(value.contains("`&foo`"), "{value}");
+    assert!(value.contains("OTML variable"), "{value}");
+    assert!(value.contains("$foo"), "{value}");
+    assert!(value.contains("Lua widget field"), "{value}");
+    assert!(value.contains("evaluated as a Lua expression"), "{value}");
+    assert!(!value.contains("plain string, not"), "{value}");
+
+    shutdown_and_exit(&client, server_thread, 3);
+}
+
+/// Hovering an `&tag:` alias-property key whose value hits the §2.6 `#` carve-out (`#33AAFF`) must
+/// show both meanings too, but with the "plain string, not evaluated" wording for the Lua-field
+/// role — the hex-literal carve-out that lets a color survive instead of parsing as a Lua comment.
+#[test]
+fn memory_connection_hover_on_an_alias_key_shows_both_meanings_hash_literal_variant() {
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+
+    client_handshake(&client);
+
+    let uri = Uri::from_str("file:///scratch/alias_hash.otui").expect("uri");
+    let text = "Panel\n  &color: #33AAFF\n".to_owned();
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: text.clone(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+
+    let mut position = position_of(&text, "color");
+    position.character += 1;
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(2),
+            "textDocument/hover".to_owned(),
+            HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position,
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            },
+        )))
+        .expect("send hover");
+    let hover_resp = recv_response(&client, &RequestId::from(2));
+    assert!(hover_resp.error.is_none(), "hover errored: {hover_resp:?}");
+    let value = hover_markdown(&hover_resp);
+
+    assert!(value.contains("`&color`"), "{value}");
+    assert!(value.contains("OTML variable"), "{value}");
+    assert!(value.contains("$color"), "{value}");
+    assert!(value.contains("Lua widget field"), "{value}");
+    assert!(value.contains("plain string, not"), "{value}");
+    assert!(value.contains("carve-out"), "{value}");
+    assert!(!value.contains("evaluated as a Lua expression"), "{value}");
+
+    shutdown_and_exit(&client, server_thread, 3);
+}
+
 /// `textDocument/completion` end-to-end, with the client advertising Markdown
 /// `documentationFormat`: a completion item for a curated global property (`width`) must come back
 /// with its `documentation` populated as Markdown — the curated one-line note surfaced from
