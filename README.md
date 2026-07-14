@@ -78,6 +78,37 @@ point an editor's LSP client at it for `.otui` / `.otmod` / `.otfont` files.
 
 Open the project **folder** (not a single file) so the server can index the whole workspace.
 
+## Command-line (CI)
+
+The same binary also runs as a one-shot CLI, useful in CI without speaking LSP at all:
+
+```bash
+otui-lsp fmt <paths...> [--check|--write]                       # format .otui files (default: --check)
+otui-lsp check <paths...> [--deny error|warnings|hints] [--format human|sarif]
+                                                                  # lint .otui/.otmod/.otfont + asset refs
+```
+
+`check` builds the same widget-aware workspace index the language server uses (so a widget class
+declared only in a `.lua` module is still recognized), then exits non-zero when a finding at or
+above `--deny`'s severity (`error` by default) is present.
+
+`--format sarif` prints a single [SARIF 2.1.0](https://json.schemastore.org/sarif-2.1.0.json) log
+on stdout instead of the default rustc-style lines — useful for GitHub code-scanning annotations on
+a pull request:
+
+```yaml
+- name: otui-lsp check
+  run: otui-lsp check --format sarif . > otui.sarif
+
+- uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: otui.sarif
+```
+
+The exit code is unaffected by `--format`: it is still governed entirely by `--deny`, so pair the
+`check` step above with `continue-on-error: true` if you want the SARIF upload to run (and annotate
+the PR) even when the lint step itself would otherwise fail the job.
+
 ## Building
 
 `rust-toolchain.toml` pins the compiler, and rustup installs it on first use — CI and local

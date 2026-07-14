@@ -25,7 +25,8 @@ const USAGE: &str = "otui-lsp — Language Server (LSP 3.17) for OTUI/OTML\n\n\
 Usage:\n  \
 otui-lsp                                        run the language server over stdio\n  \
 otui-lsp fmt <paths...> [--check|--write]       format .otui files (default: --check)\n  \
-otui-lsp check <paths...> [--deny <level>]      lint .otui/.otmod/.otfont + asset refs (default: --deny error)\n  \
+otui-lsp check <paths...> [--deny <level>] [--format human|sarif]\n  \
+                                                 lint .otui/.otmod/.otfont + asset refs (default: --deny error, --format human)\n  \
 otui-lsp --help | -h                            print this message\n  \
 otui-lsp --version | -V                         print the version";
 

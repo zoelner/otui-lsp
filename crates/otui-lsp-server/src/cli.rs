@@ -20,6 +20,8 @@ use crate::{
     uri_from_file_path,
 };
 
+mod sarif;
+
 /// A manifest analyzer: `analyze_manifest` (`.otmod`) or `analyze_font_manifest` (`.otfont`), both
 /// `&str -> Vec<Diagnostic>`. Aliased so the dispatch table's type stays readable (clippy).
 type ManifestAnalyzer = fn(&str) -> Vec<lang_api::Diagnostic>;
@@ -258,18 +260,44 @@ impl DenyLevel {
     }
 }
 
+/// `check`'s output shape: human-readable rustc-style lines (the default) or a single SARIF 2.1.0
+/// log on stdout (`--format sarif`), for GitHub code-scanning's `upload-sarif` action. This choice
+/// never affects the exit code — [`DenyLevel`] alone decides that, so switching format for CI
+/// tooling can never silently loosen or tighten the gate.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OutputFormat {
+    /// `path:line:col: severity[code]: message`, one per line, plus a one-line summary (unchanged
+    /// default behavior).
+    Human,
+    /// A single SARIF 2.1.0 JSON document on stdout; no summary line (the log itself is complete).
+    Sarif,
+}
+
+impl OutputFormat {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "human" => Ok(Self::Human),
+            "sarif" => Ok(Self::Sarif),
+            other => Err(format!("unknown --format '{other}' (expected human|sarif)")),
+        }
+    }
+}
+
 /// Parsed `check` invocation.
 #[derive(Debug)]
 struct CheckArgs {
     paths: Vec<PathBuf>,
     deny: DenyLevel,
+    format: OutputFormat,
 }
 
 /// Parse `check` subcommand arguments: positional paths plus `--deny <level>` (`error` — the
-/// default — `warnings`, or `hints`). Accepts both `--deny <level>` (two tokens) and `--deny=<level>`
-/// (one token).
+/// default — `warnings`, or `hints`) and `--format <shape>` (`human` — the default — or `sarif`).
+/// Both accept either the two-token form (`--deny <level>`/`--format <shape>`) or the
+/// single-token `--deny=<level>`/`--format=<shape>` form.
 fn parse_check_args(args: impl Iterator<Item = String>) -> Result<CheckArgs, String> {
     let mut deny: Option<DenyLevel> = None;
+    let mut format: Option<OutputFormat> = None;
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -280,6 +308,13 @@ fn parse_check_args(args: impl Iterator<Item = String>) -> Result<CheckArgs, Str
             deny = Some(DenyLevel::parse(&value)?);
         } else if let Some(value) = arg.strip_prefix("--deny=") {
             deny = Some(DenyLevel::parse(value)?);
+        } else if arg == "--format" {
+            let value = iter
+                .next()
+                .ok_or_else(|| "`--format` requires a value (human|sarif)".to_owned())?;
+            format = Some(OutputFormat::parse(&value)?);
+        } else if let Some(value) = arg.strip_prefix("--format=") {
+            format = Some(OutputFormat::parse(value)?);
         } else if arg.starts_with('-') {
             return Err(format!("unexpected flag '{arg}'"));
         } else {
@@ -288,13 +323,14 @@ fn parse_check_args(args: impl Iterator<Item = String>) -> Result<CheckArgs, Str
     }
     if paths.is_empty() {
         return Err(
-            "no path given. Usage: otui-lsp check <paths...> [--deny error|warnings|hints]"
+            "no path given. Usage: otui-lsp check <paths...> [--deny error|warnings|hints] [--format human|sarif]"
                 .to_owned(),
         );
     }
     Ok(CheckArgs {
         paths,
         deny: deny.unwrap_or(DenyLevel::Error),
+        format: format.unwrap_or(OutputFormat::Human),
     })
 }
 
@@ -361,10 +397,18 @@ fn severity_label(severity: Severity) -> &'static str {
 
 /// One rendered finding: an already-resolved 1-based `(line, column)` plus the diagnostic's
 /// severity/code/message, ready to print and to sort by.
+///
+/// `column` and `column_utf16` are two encodings of the SAME position, kept side by side rather
+/// than computed once — `column` (UTF-8 bytes) drives the human `path:line:col:` output (matching
+/// rustc/most terminal tooling's byte-column convention), while `column_utf16` drives SARIF's
+/// `region.startColumn` (SARIF 2.1.0's default `columnKind` is `utf16CodeUnits`). The two diverge
+/// on any line with multibyte text before the finding's span, so collapsing them into one field
+/// would silently misplace either the terminal output or the SARIF annotation.
 struct Finding {
     path: PathBuf,
     line: u32,
     column: u32,
+    column_utf16: u32,
     severity: Severity,
     code: String,
     message: String,
@@ -379,6 +423,7 @@ fn record(
     path: &Path,
     line: u32,
     column: u32,
+    column_utf16: u32,
     severity: Severity,
     code: String,
     message: String,
@@ -392,6 +437,7 @@ fn record(
         path: path.to_path_buf(),
         line,
         column,
+        column_utf16,
         severity,
         code,
         message,
@@ -441,7 +487,7 @@ fn collect_by_ext(paths: &[PathBuf], ext: &str) -> Result<Vec<PathBuf>, String> 
     Ok(out)
 }
 
-/// `otui-lsp check <paths...> [--deny error|warnings|hints]`.
+/// `otui-lsp check <paths...> [--deny error|warnings|hints] [--format human|sarif]`.
 ///
 /// A CLI-native linter, rust-analyzer-`check`-style: for every target `.otui` file (expanded from
 /// `paths` exactly like [`run_fmt`]'s [`resolve_targets`]) it computes the same widget-aware
@@ -451,13 +497,20 @@ fn collect_by_ext(paths: &[PathBuf], ext: &str) -> Result<Vec<PathBuf>, String> 
 /// exact same [`build_indexes`] the server's own initial scan uses — see its doc comment for why
 /// that sharing is load-bearing, not incidental.
 ///
-/// Prints one line per finding in rustc's `path:line:col: severity[code]: message` shape (1-based
-/// line/column, byte columns — see [`LineIndex`]/[`PositionEncoding::Utf8`]), sorted by path then
-/// line then column for deterministic output, followed by a one-line summary. Exit code is governed
-/// entirely by [`DenyLevel`] against each [`lang_api::Diagnostic::severity`] — never a hard-coded
-/// diagnostic code list, so a future diagnostic's severity is automatically honored here without a
-/// matching update to this file (spec §2.10: the LSP is never *stricter* than the engine unless a
-/// caller opts into it via `--deny`).
+/// By default (`--format human`) prints one line per finding in rustc's
+/// `path:line:col: severity[code]: message` shape (1-based line/column, byte columns — see
+/// [`LineIndex`]/[`PositionEncoding::Utf8`]), sorted by path then line then column for
+/// deterministic output, followed by a one-line summary. `--format sarif` instead prints a single
+/// [SARIF 2.1.0](https://json.schemastore.org/sarif-2.1.0.json) log (see [`sarif::render`]),
+/// consumable by e.g. `github/codeql-action/upload-sarif` for GitHub code-scanning annotations —
+/// no summary line, so the redirected stdout is valid JSON on its own.
+///
+/// Either way the exit code is governed entirely by [`DenyLevel`] against each
+/// [`lang_api::Diagnostic::severity`] — never a hard-coded diagnostic code list, so a future
+/// diagnostic's severity is automatically honored here without a matching update to this file
+/// (spec §2.10: the LSP is never *stricter* than the engine unless a caller opts into it via
+/// `--deny`) — and is completely independent of `--format`: SARIF is a report shape, not a
+/// leniency knob.
 #[must_use]
 pub fn run_check(args: impl Iterator<Item = String>) -> ExitCode {
     let parsed = match parse_check_args(args) {
@@ -542,19 +595,24 @@ pub fn run_check(args: impl Iterator<Item = String>) -> ExitCode {
         let line_index = LineIndex::new(&text);
         for diagnostic in diagnostics {
             let pos = line_index.position(diagnostic.span.start, PositionEncoding::Utf8);
+            // Byte span in hand: the UTF-16 column is a second, independent conversion of the same
+            // offset (see `Finding`'s doc comment for why SARIF needs it alongside the byte one).
+            let pos_utf16 = line_index.position(diagnostic.span.start, PositionEncoding::Utf16);
             record(
                 &mut findings,
                 &mut counts,
                 path,
                 pos.line + 1,
                 pos.character + 1,
+                pos_utf16.character + 1,
                 diagnostic.severity,
                 diagnostic.code.to_owned(),
                 diagnostic.message,
             );
         }
         // Asset-existence findings come back as `lsp_types::Diagnostic` (already position-resolved
-        // in the encoding we pass); normalize each into the same severity/code/message shape.
+        // in the encoding we pass, i.e. byte columns); normalize each into the same
+        // severity/code/message shape.
         let doc_dir = path.parent();
         for lsp_diag in missing_asset_diagnostics(
             asset_links,
@@ -564,12 +622,24 @@ pub fn run_check(args: impl Iterator<Item = String>) -> ExitCode {
             &otpkg_cache,
             PositionEncoding::Utf8,
         ) {
+            // No byte `ByteSpan` survives past `missing_asset_diagnostics` (it returns an
+            // already-resolved `lsp_types::Range`), so the UTF-16 column is re-derived rather than
+            // computed alongside the byte one: `offset_at` inverts the byte `Position` back to a
+            // byte offset, then `position` re-encodes that SAME offset in UTF-16. Two conversions of
+            // one offset, not two independent lookups, so they can never disagree about *where* the
+            // finding is — only how its column is counted.
+            let offset = line_index.offset_at(lsp_diag.range.start, PositionEncoding::Utf8);
+            let column_utf16 = line_index
+                .position(offset, PositionEncoding::Utf16)
+                .character
+                + 1;
             record(
                 &mut findings,
                 &mut counts,
                 path,
                 lsp_diag.range.start.line + 1,
                 lsp_diag.range.start.character + 1,
+                column_utf16,
                 lsp_severity(lsp_diag.severity),
                 lsp_code(lsp_diag.code),
                 lsp_diag.message,
@@ -603,12 +673,14 @@ pub fn run_check(args: impl Iterator<Item = String>) -> ExitCode {
             let line_index = LineIndex::new(&text);
             for diagnostic in analyze(&text) {
                 let pos = line_index.position(diagnostic.span.start, PositionEncoding::Utf8);
+                let pos_utf16 = line_index.position(diagnostic.span.start, PositionEncoding::Utf16);
                 record(
                     &mut findings,
                     &mut counts,
                     &path,
                     pos.line + 1,
                     pos.character + 1,
+                    pos_utf16.character + 1,
                     diagnostic.severity,
                     diagnostic.code.to_owned(),
                     diagnostic.message,
@@ -625,18 +697,34 @@ pub fn run_check(args: impl Iterator<Item = String>) -> ExitCode {
             .then(a.line.cmp(&b.line))
             .then(a.column.cmp(&b.column))
     });
-    for finding in &findings {
-        println!(
-            "{}:{}:{}: {}[{}]: {}",
-            finding.path.display(),
-            finding.line,
-            finding.column,
-            severity_label(finding.severity),
-            finding.code,
-            finding.message
-        );
+
+    match parsed.format {
+        OutputFormat::Human => {
+            for finding in &findings {
+                println!(
+                    "{}:{}:{}: {}[{}]: {}",
+                    finding.path.display(),
+                    finding.line,
+                    finding.column,
+                    severity_label(finding.severity),
+                    finding.code,
+                    finding.message
+                );
+            }
+            println!("{error_count} error(s), {warning_count} warning(s), {hint_count} hint(s)");
+        }
+        OutputFormat::Sarif => {
+            // Stdout carries ONLY the SARIF document in this mode — no rustc-style lines, no
+            // summary — so a `check --format sarif ... > otui.sarif` redirect is valid JSON, full
+            // stop. Human-readable status still belongs on stderr if ever needed; today there is
+            // none to print.
+            let log = sarif::render(&findings, &root_paths);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&log).expect("SARIF log serializes")
+            );
+        }
     }
-    println!("{error_count} error(s), {warning_count} warning(s), {hint_count} hint(s)");
 
     if parsed.deny.fails(error_count, warning_count, hint_count) {
         ExitCode::FAILURE
@@ -755,6 +843,50 @@ mod tests {
         let parsed = parse_check_args(vec!["a.otui".to_owned()].into_iter()).expect("parses");
         assert_eq!(parsed.deny, DenyLevel::Error);
         assert_eq!(parsed.paths, vec![PathBuf::from("a.otui")]);
+    }
+
+    #[test]
+    fn check_args_default_to_format_human() {
+        let parsed = parse_check_args(vec!["a.otui".to_owned()].into_iter()).expect("parses");
+        assert_eq!(parsed.format, OutputFormat::Human);
+    }
+
+    #[test]
+    fn check_args_accept_format_as_two_tokens_and_as_one() {
+        let parsed = parse_check_args(
+            vec![
+                "a.otui".to_owned(),
+                "--format".to_owned(),
+                "sarif".to_owned(),
+            ]
+            .into_iter(),
+        )
+        .expect("parses");
+        assert_eq!(parsed.format, OutputFormat::Sarif);
+
+        let parsed =
+            parse_check_args(vec!["a.otui".to_owned(), "--format=human".to_owned()].into_iter())
+                .expect("parses");
+        assert_eq!(parsed.format, OutputFormat::Human);
+    }
+
+    #[test]
+    fn check_args_reject_an_unknown_format() {
+        let err = parse_check_args(
+            vec!["a.otui".to_owned(), "--format".to_owned(), "xml".to_owned()].into_iter(),
+        )
+        .expect_err("unknown format must be rejected");
+        assert!(
+            err.contains("xml"),
+            "error should name the bad value: {err}"
+        );
+    }
+
+    #[test]
+    fn check_args_reject_format_with_no_value() {
+        let err = parse_check_args(vec!["a.otui".to_owned(), "--format".to_owned()].into_iter())
+            .expect_err("a trailing --format with no value must be rejected");
+        assert!(err.contains("--format"));
     }
 
     #[test]
