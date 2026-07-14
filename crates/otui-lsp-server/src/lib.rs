@@ -81,7 +81,7 @@ use otui_core::lua_ui_loads::scan_ui_loads;
 use otui_core::lua_widgets::LuaWidgetIndex;
 use otui_core::manifest::{analyze_font_manifest, analyze_manifest};
 use otui_core::otmod::otmod_scripts;
-use otui_core::property_hover::{PropertyHover, PropertyValueKind};
+use otui_core::property_hover::PropertyHover;
 use otui_core::style_index::{DocId, StyleDef, StyleIndex, is_native_base};
 
 use crate::position::{LineIndex, PositionEncoding};
@@ -269,6 +269,12 @@ pub struct Backend {
     /// the plain label — see [`convert::completion_item_to_lsp`]. Defaults to `false` (the LSP
     /// default when the capability is absent). Guarded like [`encoding`].
     snippet_support: Mutex<bool>,
+    /// Whether the client advertised `MarkupKind::Markdown` in
+    /// `textDocument.completion.completionItem.documentationFormat` during `initialize`; gates
+    /// whether a `textDocument/completion` item's `documentation` is rendered as Markdown or plain
+    /// text — see [`convert::completion_item_to_lsp`]. Defaults to `false` (the LSP default when the
+    /// capability is absent). Guarded like [`encoding`].
+    markdown_docs: Mutex<bool>,
     /// Whether the client advertised `workspace.codeLens.refreshSupport` during `initialize`;
     /// gates whether a workspace-index mutation (a watched-file change, or the initial scan's
     /// completion — see [`republish_open_documents`](Self::republish_open_documents) and
@@ -407,6 +413,7 @@ impl Backend {
             encoding: Mutex::new(negotiate_encoding(params)),
             hierarchical_symbols: Mutex::new(client_supports_hierarchical_symbols(params)),
             snippet_support: Mutex::new(client_supports_snippets(params)),
+            markdown_docs: Mutex::new(client_supports_markdown_docs(params)),
             code_lens_refresh_support: Mutex::new(client_supports_code_lens_refresh(params)),
             inlay_hint_refresh_support: Mutex::new(client_supports_inlay_hint_refresh(params)),
             documents: Arc::new(RwLock::new(HashMap::new())),
@@ -480,6 +487,13 @@ impl Backend {
             .snippet_support
             .lock()
             .expect("snippet_support mutex poisoned")
+    }
+
+    fn markdown_docs(&self) -> bool {
+        *self
+            .markdown_docs
+            .lock()
+            .expect("markdown_docs mutex poisoned")
     }
 
     fn code_lens_refresh_support(&self) -> bool {
@@ -2553,40 +2567,19 @@ fn render_hover(desc: &StyleHover, line_index: &LineIndex, encoding: PositionEnc
 }
 
 /// Format a [`PropertyHover`] (a property-key description from the engine) into an LSP Markdown
-/// [`Hover`]. Pure presentation: [`otui_core`] decided the property's value kind from its catalog +
-/// schema metadata; here we only word it and map the key span to a range.
+/// [`Hover`]. Pure presentation: the body markdown itself comes from
+/// [`otui_core::property_hover::documentation_body`] — the single formatter also used for a global
+/// property-key completion item's `documentation`, so the two surfaces never diverge; this only
+/// prepends the `**\`name\`**` header and maps the key span to a range.
 fn render_property_hover(
     desc: &PropertyHover,
     line_index: &LineIndex,
     encoding: PositionEncoding,
 ) -> Hover {
     let name = &desc.name;
-    // Prefer the curated behavior sentence; fall back to a value-kind description when the property
-    // is known but outside the curated canonical set.
-    let title = match desc.doc {
-        Some(doc) => format!("**`{name}`** — {doc}"),
-        None => {
-            let body = match &desc.value {
-                PropertyValueKind::Color => "a color value",
-                PropertyValueKind::AssetPath => {
-                    "an asset path (a texture) — the `.png` extension is optional"
-                }
-                PropertyValueKind::Enum { .. } => "one of a fixed value set (see below)",
-                PropertyValueKind::Border => "a border shorthand: a width and a color (or `none`)",
-                PropertyValueKind::Plain => "an OTUI style property",
-            };
-            format!("**`{name}`** — {body}")
-        }
-    };
-    let mut value = title;
-    // For a fixed-value-set property (display, layout), always append the full accepted list.
-    if let PropertyValueKind::Enum { values } = &desc.value {
-        let list = values
-            .iter()
-            .map(|v| format!("`{v}`"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        value.push_str(&format!("\n\nOne of: {list}"));
+    let mut value = format!("**`{name}`**");
+    if let Some(body) = otui_core::property_hover::documentation_body(name) {
+        value.push_str(&format!(" — {body}"));
     }
     Hover {
         contents: HoverContents::Markup(MarkupContent {
@@ -2863,6 +2856,23 @@ fn client_supports_snippets(params: &InitializeParams) -> bool {
         .and_then(|c| c.completion_item.as_ref())
         .and_then(|ci| ci.snippet_support)
         .unwrap_or(false)
+}
+
+/// Whether the client can render Markdown in a completion item's `documentation`. Per LSP 3.17, a
+/// client lists its preferred formats via `textDocument.completion.completionItem.documentationFormat`
+/// **in preference order** (first = most preferred), so this gates on the *first* entry being
+/// `Markdown` — a client that lists `[PlainText, Markdown]` prefers plain text and must get it, even
+/// though Markdown is technically supported further down its list. When the capability is absent the
+/// default is plain text — see [`convert::completion_item_to_lsp`] for where this is enforced.
+fn client_supports_markdown_docs(params: &InitializeParams) -> bool {
+    params
+        .capabilities
+        .text_document
+        .as_ref()
+        .and_then(|td| td.completion.as_ref())
+        .and_then(|c| c.completion_item.as_ref())
+        .and_then(|ci| ci.documentation_format.as_ref())
+        .is_some_and(|formats| formats.first() == Some(&MarkupKind::Markdown))
 }
 
 /// Whether the client can be asked to refresh its code lenses via a server-initiated
@@ -4350,6 +4360,7 @@ impl Backend {
                     .service
                     .complete_with_widgets(&text, offset, &styles, &lua),
                 self.snippet_support(),
+                self.markdown_docs(),
             )
         };
         Some(CompletionResponse::Array(items))
@@ -4854,6 +4865,78 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let backend = Backend::new(tx, &InitializeParams::default());
         assert!(!backend.snippet_support());
+    }
+
+    fn params_with_documentation_format(formats: Option<Vec<MarkupKind>>) -> InitializeParams {
+        InitializeParams {
+            capabilities: ClientCapabilities {
+                text_document: Some(TextDocumentClientCapabilities {
+                    completion: Some(CompletionClientCapabilities {
+                        completion_item: Some(CompletionItemCapability {
+                            documentation_format: formats,
+                            ..CompletionItemCapability::default()
+                        }),
+                        ..CompletionClientCapabilities::default()
+                    }),
+                    ..TextDocumentClientCapabilities::default()
+                }),
+                ..ClientCapabilities::default()
+            },
+            ..InitializeParams::default()
+        }
+    }
+
+    #[test]
+    fn markdown_docs_default_false_when_client_is_silent() {
+        // No textDocument capabilities at all → the LSP default (plain text) applies.
+        assert!(!client_supports_markdown_docs(&InitializeParams::default()));
+        // completion/completionItem present but the format list omitted → still the default.
+        assert!(!client_supports_markdown_docs(
+            &params_with_documentation_format(None)
+        ));
+    }
+
+    #[test]
+    fn markdown_docs_true_only_when_markdown_is_the_clients_first_preference() {
+        // A single-entry list naming Markdown.
+        assert!(client_supports_markdown_docs(
+            &params_with_documentation_format(Some(vec![MarkupKind::Markdown]))
+        ));
+        // Markdown listed first (most preferred), plain text as a fallback further down: still
+        // Markdown.
+        assert!(client_supports_markdown_docs(
+            &params_with_documentation_format(Some(vec![
+                MarkupKind::Markdown,
+                MarkupKind::PlainText
+            ]))
+        ));
+        // Plain text listed FIRST (most preferred), Markdown merely supported further down: the
+        // client's stated preference is plain text, so this must NOT count as Markdown support —
+        // sending Markdown here would ignore the client's own preference order (LSP 3.17).
+        assert!(!client_supports_markdown_docs(
+            &params_with_documentation_format(Some(vec![
+                MarkupKind::PlainText,
+                MarkupKind::Markdown
+            ]))
+        ));
+        // A list that never mentions Markdown stays plain text.
+        assert!(!client_supports_markdown_docs(
+            &params_with_documentation_format(Some(vec![MarkupKind::PlainText]))
+        ));
+    }
+
+    #[test]
+    fn backend_new_reads_markdown_docs_from_init_params() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let backend = Backend::new(
+            tx,
+            &params_with_documentation_format(Some(vec![MarkupKind::Markdown])),
+        );
+        assert!(backend.markdown_docs());
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let backend = Backend::new(tx, &InitializeParams::default());
+        assert!(!backend.markdown_docs());
     }
 
     fn params_with_refresh_support(
@@ -7249,6 +7332,8 @@ end
         // Enum properties always append the full accepted value list.
         assert!(t.contains("One of:"), "{t}");
         assert!(t.contains("`flex`"), "{t}");
+        // `display` is one of the validating properties: the note says so.
+        assert!(t.contains("rejects an invalid value"), "{t}");
     }
 
     #[test]
@@ -7256,19 +7341,30 @@ end
         let t = property_hover_text("Panel\n  color: red\n", "color");
         // Curated behavior for color describes the draw color.
         assert!(t.contains("**`color`**") && t.contains("draw color"), "{t}");
+        // Every color-typed property validates (the engine's `Color(node->value())` throws).
+        assert!(t.contains("rejects an invalid value"), "{t}");
     }
 
     #[test]
-    fn hover_on_a_known_uncurated_property_uses_the_value_kind_fallback() {
-        // `min-width` is a real catalog property with no curated doc → the plain value-kind fallback.
+    fn hover_on_a_known_uncurated_property_always_gets_a_body() {
+        // `min-width` is a real catalog property, no curated doc, Plain-valued: no curated prose and
+        // no value-kind sentence, but a KNOWN property's hover is never header-only — it always
+        // carries at least the validation note (spec §5.5: "whether it's one of the four
+        // hard-error-validating properties or silently-ignored-if-misspelled"). `min-width` is not
+        // one of those, so an invalid value is silently ignored.
         let t = property_hover_text("Panel\n  min-width: 10\n", "min-width");
-        assert!(
-            t.contains("**`min-width`**") && t.contains("OTUI style property"),
-            "{t}"
-        );
-        // `border-color-bottom` is a color property with no curated doc → the color-value fallback.
+        assert!(t.contains("**`min-width`**"), "{t}");
+        assert!(t.contains("silently ignored"), "{t}");
+        assert!(!t.contains("rejects an invalid value"), "{t}");
+
+        // `border-color-bottom` is a color property with no curated doc → the color-value sentence,
+        // plus the validating note (colors validate too — see `documentation_body`'s doc comment).
         let t2 = property_hover_text("Panel\n  border-color-bottom: red\n", "border-color-bottom");
-        assert!(t2.contains("a color value"), "{t2}");
+        assert!(
+            t2.contains("**`border-color-bottom`**") && t2.contains("Takes a color."),
+            "{t2}"
+        );
+        assert!(t2.contains("rejects an invalid value"), "{t2}");
     }
 
     /// The [`CodeAction`] inside a [`CodeActionOrCommand`] (panics if it is a bare command).

@@ -169,11 +169,15 @@ visible, checked, on, draggable, opacity, rotation, clipping, ...`).
 
 **The rule that must not be violated by any diagnostic (§4):** an unrecognized/misspelled property
 name is **silently ignored by the engine — never an error, never even a warning at runtime.** Only
-four properties actively validate their *value* and throw on malformed input: `border`, `display`,
-`layout`, `anchors.*`. Every other property either applies cleanly or is silently dropped if
+the validating properties actively validate their *value* and throw on malformed input: `border`,
+`display`, `layout`, `anchors.*`, and every color-typed property (`color`, `background`,
+`background-color`, `border-color*`, `icon-color`, `image-color`, `ttf-stroke-color`, ...) — the
+engine's `Color(node->value())` throws on a value it cannot parse, just like the other validating
+properties (mirrored by `diagnostics.rs`'s `check_property_value`, which validates the whole
+color-property catalog, not just `border-color`). Every other property either applies cleanly or is silently dropped if
 misspelled/unknown. Unknown property names are hints ("not a recognized property — ignored by the
-engine"), never error-severity; malformed values for the four validating properties are real
-errors; malformed values for everything else are not validated at all.
+engine"), never error-severity; malformed values for the validating properties are real errors;
+malformed values for everything else are not validated at all.
 
 ## 3. Tokenizer / grammar interface
 
@@ -243,8 +247,8 @@ many multi-byte characters precede them on that line — the realistic trigger i
     diagnostic at all** — a "style-only" file is valid.
 - **Property level** (enforcing the 2.10 rule):
   - Unrecognized/misspelled property name → **`hint`** only, never `warning` or `error`.
-  - Malformed value for one of the four validating properties (`border`, `display`, `layout`,
-    `anchors.*`) → **`error`**.
+  - Malformed value for one of the validating properties (`border`, `display`, `layout`,
+    `anchors.*`, and every color-typed property) → **`error`**.
   - Malformed value for any other property → **no diagnostic**.
 - **Selector level**: a `$state` name outside the closed 14-name set (2.8) → **`hint`**.
 
@@ -281,7 +285,7 @@ of the paired `.lua` controller for the same Lua-reference shapes (dot chains an
 
 ### 5.5 Hover content requirements
 
-- Property key → schema description (2.10), value-kind, and whether it's one of the four
+- Property key → schema description (2.10), value-kind, and whether it's one of the
   hard-error-validating properties or silently-ignored-if-misspelled.
 - `id:` value → "this widget's id" plus a reference count (from 5.4).
 - `&tag:` key → **both** meanings from 2.6, rendered together.

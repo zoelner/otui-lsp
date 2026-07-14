@@ -27,11 +27,12 @@ reviews:
         This is the pure, protocol-agnostic OTUI/OTML language engine. It must faithfully
         mirror the OTClient engine, per docs/otui-language-service-spec.md. Flag any divergence
         from these fidelity rules: an unknown/misspelled property name is a HINT, never an error
-        or warning (only border, display, layout and anchors.* validate their value and may
-        error); tab indentation and invalid depth jumps are hard errors; a $state name outside
-        the closed 14-name set is a HINT (never matches, but not an engine error); all spans are
-        byte offsets. Also flag any I/O or lsp-types dependency leaking into this crate — it must
-        stay pure.
+        or warning (only border, display, layout, anchors.*, and every color-typed property
+        validate their value and may warn/error; malformed values for any OTHER property are
+        silently ignored); tab indentation and invalid depth jumps are hard errors; a $state name
+        outside the closed 14-name set is a HINT (never matches, but not an engine error); all
+        spans are byte offsets. Also flag any I/O or lsp-types dependency leaking into this crate
+        — it must stay pure.
     - path: "crates/otui-lsp-server/**"
       instructions: >
         This is the thin LSP transport shell (tower-lsp + lsp-types). It must conform to LSP 3.17

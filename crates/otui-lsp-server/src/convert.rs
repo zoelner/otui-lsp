@@ -11,8 +11,9 @@ use lang_api::{
 use lsp_types::{
     Color, ColorInformation, CompletionItem as LspCompletionItem,
     CompletionItemKind as LspCompletionItemKind, Diagnostic as LspDiagnostic, DiagnosticSeverity,
-    DocumentSymbol as LspSymbol, FoldingRange, FoldingRangeKind, InsertTextFormat, Location,
-    NumberOrString, Position, Range, SymbolInformation, SymbolKind as LspSymbolKind, TextEdit, Uri,
+    DocumentSymbol as LspSymbol, Documentation, FoldingRange, FoldingRangeKind, InsertTextFormat,
+    Location, MarkupContent, MarkupKind, NumberOrString, Position, Range, SymbolInformation,
+    SymbolKind as LspSymbolKind, TextEdit, Uri,
 };
 use otui_core::folding::{FoldKind as CoreFoldKind, FoldRange as CoreFoldRange};
 use otui_core::schema::Rgba;
@@ -212,18 +213,35 @@ fn completion_kind_to_lsp(kind: CoreCompletionKind) -> LspCompletionItemKind {
     }
 }
 
+/// Strip the minimal inline Markdown marks the engine's documentation text uses — code-span
+/// backticks and `**bold**` emphasis — for a client that did not advertise Markdown support in
+/// `documentationFormat`. Deliberately not a full Markdown parser (there is no nesting, no links, no
+/// block structure in this text — just backticks and bold): a plain character strip is exact for the
+/// text the engine actually produces and keeps the words themselves untouched, e.g.
+/// `` "`#ff0000`" `` → `"#ff0000"`, `` "**`width`**" `` → `"width"`.
+fn strip_markdown_marks(text: &str) -> String {
+    text.replace("**", "").replace('`', "")
+}
+
 /// Convert a single core [`CompletionItem`](CoreCompletionItem) into an `lsp_types::CompletionItem`,
-/// carrying its label, kind and detail. Completion labels are already the value to insert (no span
-/// remapping needed — the client applies them at the cursor).
+/// carrying its label, kind, detail and documentation. Completion labels are already the value to
+/// insert (no span remapping needed — the client applies them at the cursor).
 ///
 /// `snippet_support` gates whether the item's snippet (`insert_text` + `Snippet` format) is sent at
 /// all: a client that never advertised
 /// `textDocument.completion.completionItem.snippetSupport` would paste `$0`/`$1` placeholders into
 /// the buffer **literally** — it has no tab-stop engine to interpret them — so with `false` this
 /// always falls back to the plain `label`, exactly as before snippets existed.
+///
+/// `markdown_docs` gates the format of `item.documentation` (when present): a client that advertised
+/// `MarkupKind::Markdown` in `textDocument.completion.completionItem.documentationFormat` gets the
+/// engine's doc text unchanged (it is already valid Markdown); a client that did not gets it run
+/// through [`strip_markdown_marks`] first, so it never sees a literal `` ` `` / `**` mark it has no
+/// renderer for.
 pub fn completion_item_to_lsp(
     item: &CoreCompletionItem,
     snippet_support: bool,
+    markdown_docs: bool,
 ) -> LspCompletionItem {
     let (insert_text, insert_text_format) = match (&item.insert_text, item.insert_format) {
         (Some(text), CoreInsertFormat::Snippet) if snippet_support => {
@@ -234,10 +252,24 @@ pub fn completion_item_to_lsp(
         // omitted, but stated explicitly here for clarity).
         _ => (None, Some(InsertTextFormat::PLAIN_TEXT)),
     };
+    let documentation = item.documentation.clone().map(|value| {
+        if markdown_docs {
+            Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value,
+            })
+        } else {
+            Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: strip_markdown_marks(&value),
+            })
+        }
+    });
     LspCompletionItem {
         label: item.label.clone(),
         kind: Some(completion_kind_to_lsp(item.kind)),
         detail: item.detail.clone(),
+        documentation,
         sort_text: item.sort_text.clone(),
         insert_text,
         insert_text_format,
@@ -245,15 +277,17 @@ pub fn completion_item_to_lsp(
     }
 }
 
-/// Convert every core completion item into its LSP form, preserving order. `snippet_support` is
-/// forwarded to [`completion_item_to_lsp`] for every item — see its doc for why the gate exists.
+/// Convert every core completion item into its LSP form, preserving order. `snippet_support` and
+/// `markdown_docs` are forwarded to [`completion_item_to_lsp`] for every item — see its doc for why
+/// each gate exists.
 pub fn completions_to_lsp(
     items: &[CoreCompletionItem],
     snippet_support: bool,
+    markdown_docs: bool,
 ) -> Vec<LspCompletionItem> {
     items
         .iter()
-        .map(|item| completion_item_to_lsp(item, snippet_support))
+        .map(|item| completion_item_to_lsp(item, snippet_support, markdown_docs))
         .collect()
 }
 
@@ -489,8 +523,9 @@ mod tests {
             sort_text: Some("0_hover".to_owned()),
             insert_text: None,
             insert_format: CoreInsertFormat::Plain,
+            documentation: None,
         };
-        let lsp = completion_item_to_lsp(&core, true);
+        let lsp = completion_item_to_lsp(&core, true, true);
         assert_eq!(lsp.label, "hover");
         assert_eq!(lsp.kind, Some(LspCompletionItemKind::ENUM_MEMBER));
         assert_eq!(lsp.detail.as_deref(), Some("state"));
@@ -498,6 +533,8 @@ mod tests {
         // No snippet on this item: insert_text stays unset, format is plain text.
         assert_eq!(lsp.insert_text, None);
         assert_eq!(lsp.insert_text_format, Some(InsertTextFormat::PLAIN_TEXT));
+        // No documentation on this item.
+        assert_eq!(lsp.documentation, None);
     }
 
     #[test]
@@ -509,8 +546,9 @@ mod tests {
             sort_text: None,
             insert_text: Some("width: $0".to_owned()),
             insert_format: CoreInsertFormat::Snippet,
+            documentation: None,
         };
-        let lsp = completion_item_to_lsp(&core, true);
+        let lsp = completion_item_to_lsp(&core, true, true);
         assert_eq!(lsp.insert_text.as_deref(), Some("width: $0"));
         assert_eq!(lsp.insert_text_format, Some(InsertTextFormat::SNIPPET));
     }
@@ -527,11 +565,68 @@ mod tests {
             sort_text: None,
             insert_text: Some("width: $0".to_owned()),
             insert_format: CoreInsertFormat::Snippet,
+            documentation: None,
         };
-        let lsp = completion_item_to_lsp(&core, false);
+        let lsp = completion_item_to_lsp(&core, false, true);
         assert_eq!(lsp.insert_text, None);
         assert_eq!(lsp.insert_text_format, Some(InsertTextFormat::PLAIN_TEXT));
         assert_eq!(lsp.label, "width");
+    }
+
+    #[test]
+    fn documentation_renders_as_markdown_when_the_client_advertised_it() {
+        let core = CoreCompletionItem {
+            label: "width".to_owned(),
+            kind: CoreCompletionKind::Keyword,
+            detail: Some("property".to_owned()),
+            sort_text: None,
+            insert_text: None,
+            insert_format: CoreInsertFormat::Plain,
+            documentation: Some("**`width`** — a dimension.".to_owned()),
+        };
+        let lsp = completion_item_to_lsp(&core, true, true);
+        match lsp.documentation {
+            Some(Documentation::MarkupContent(content)) => {
+                assert_eq!(content.kind, MarkupKind::Markdown);
+                assert_eq!(content.value, "**`width`** — a dimension.");
+            }
+            other => panic!("expected Markdown MarkupContent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn documentation_renders_as_plain_text_when_the_client_did_not_advertise_markdown() {
+        // A color value's documentation is exactly the kind of text that must not leak raw
+        // Markdown marks to a PlainText-only client: `` `#ff0000` `` must come back as `#ff0000`,
+        // with the backticks stripped, not carried through literally.
+        let core = CoreCompletionItem {
+            label: "red".to_owned(),
+            kind: CoreCompletionKind::Value,
+            detail: Some("named color".to_owned()),
+            sort_text: None,
+            insert_text: None,
+            insert_format: CoreInsertFormat::Plain,
+            documentation: Some("`#ff0000`".to_owned()),
+        };
+        let lsp = completion_item_to_lsp(&core, true, false);
+        match lsp.documentation {
+            Some(Documentation::MarkupContent(content)) => {
+                assert_eq!(content.kind, MarkupKind::PlainText);
+                assert_eq!(content.value, "#ff0000");
+            }
+            other => panic!("expected PlainText MarkupContent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strip_markdown_marks_removes_backticks_and_bold_emphasis() {
+        assert_eq!(strip_markdown_marks("plain"), "plain");
+        assert_eq!(strip_markdown_marks("`#ff0000`"), "#ff0000");
+        assert_eq!(strip_markdown_marks("**`width`**"), "width");
+        assert_eq!(
+            strip_markdown_marks("One of: `flex`, `grid`, `none`"),
+            "One of: flex, grid, none"
+        );
     }
 
     #[test]
@@ -564,7 +659,7 @@ mod tests {
         let position = Position::new(1, 3);
         let offset = LineIndex::new(text).offset_at(position, PositionEncoding::Utf16);
         let core = OtuiService::new().complete_at(text, offset);
-        let lsp = completions_to_lsp(&core, true);
+        let lsp = completions_to_lsp(&core, true, true);
         // Every state name comes back, as ENUM_MEMBER, in schema order.
         let labels: Vec<&str> = lsp.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels, otui_core::schema::STATES);

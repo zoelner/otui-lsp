@@ -14,13 +14,16 @@ use std::time::{Duration, Instant};
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
-    CodeActionContext, CodeActionOrCommand, CodeActionParams, DiagnosticSeverity,
-    DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, FileChangeType, FileEvent, HoverParams, InitializeParams,
-    InitializedParams, InlayHintParams, Location, NumberOrString, PartialResultParams, Position,
-    PublishDiagnosticsParams, ReferenceContext, ReferenceParams, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Uri,
-    VersionedTextDocumentIdentifier, WorkDoneProgressParams, WorkspaceFolder,
+    ClientCapabilities, CodeActionContext, CodeActionOrCommand, CodeActionParams,
+    CompletionClientCapabilities, CompletionItemCapability, CompletionParams, CompletionResponse,
+    DiagnosticSeverity, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, Documentation, FileChangeType,
+    FileEvent, HoverParams, InitializeParams, InitializedParams, InlayHintParams, Location,
+    MarkupKind, NumberOrString, PartialResultParams, Position, PublishDiagnosticsParams,
+    ReferenceContext, ReferenceParams, TextDocumentClientCapabilities,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, Uri, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
+    WorkspaceFolder,
 };
 use otui_lsp_server::{Backend, Termination, serve};
 
@@ -353,6 +356,102 @@ fn memory_connection_hover_shows_the_full_multi_hop_inheritance_chain() {
         value.contains("Bar") && value.find("Bar").unwrap() < value.find("UIButton").unwrap(),
         "chain must read Bar before UIButton: {value}"
     );
+
+    shutdown_and_exit(&client, server_thread, 3);
+}
+
+/// `textDocument/completion` end-to-end, with the client advertising Markdown
+/// `documentationFormat`: a completion item for a curated global property (`width`) must come back
+/// with its `documentation` populated as Markdown — the curated one-line note surfaced from
+/// `property_hover::property_doc`, not just a one-word `detail`.
+#[test]
+fn memory_connection_drives_initialize_open_completion_shutdown() {
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+
+    // Advertise Markdown documentation support so the server's Markdown branch is exercised.
+    let init_params = InitializeParams {
+        capabilities: ClientCapabilities {
+            text_document: Some(TextDocumentClientCapabilities {
+                completion: Some(CompletionClientCapabilities {
+                    completion_item: Some(CompletionItemCapability {
+                        documentation_format: Some(vec![MarkupKind::Markdown]),
+                        ..CompletionItemCapability::default()
+                    }),
+                    ..CompletionClientCapabilities::default()
+                }),
+                ..TextDocumentClientCapabilities::default()
+            }),
+            ..ClientCapabilities::default()
+        },
+        ..InitializeParams::default()
+    };
+    client_handshake_with_params(&client, init_params);
+
+    // didOpen a document with a half-typed property key on an indented line.
+    let uri = Uri::from_str("file:///scratch/completion.otui").expect("uri");
+    let text = "Panel < UIWidget\n  wid\n";
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: text.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+
+    // Cursor right after "wid" on line 1.
+    let position = position_of(text, "wid");
+    let position = Position::new(position.line, position.character + "wid".len() as u32);
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(2),
+            "textDocument/completion".to_owned(),
+            CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position,
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+                context: None,
+            },
+        )))
+        .expect("send completion");
+    let completion_resp = recv_response(&client, &RequestId::from(2));
+    assert!(
+        completion_resp.error.is_none(),
+        "completion errored: {completion_resp:?}"
+    );
+    let completion_value = completion_resp.result.expect("completion result present");
+    let response: CompletionResponse =
+        serde_json::from_value(completion_value).expect("deserialize CompletionResponse");
+    let items = match response {
+        CompletionResponse::Array(items) => items,
+        CompletionResponse::List(list) => list.items,
+    };
+    let width = items
+        .iter()
+        .find(|i| i.label == "width")
+        .expect("width completion item offered");
+    match &width.documentation {
+        Some(Documentation::MarkupContent(content)) => {
+            assert_eq!(content.kind, MarkupKind::Markdown);
+            assert!(
+                content.value.contains("dimension"),
+                "expected width's curated doc, got {:?}",
+                content.value
+            );
+        }
+        other => panic!("expected width to carry Markdown documentation, got {other:?}"),
+    }
 
     shutdown_and_exit(&client, server_thread, 3);
 }

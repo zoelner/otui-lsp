@@ -184,7 +184,8 @@ fn rest_of_line_is_special_form(source: &str, offset: usize) -> bool {
 /// consolidated LSPs, we return **all** valid candidates tagged by [`CompletionKind`] and ranked via
 /// `sort_text`, and let the client's filter + icons disambiguate as the user types:
 ///
-/// 1. the enclosing widget's **Lua-added properties** (most specific → ranked first), then
+/// 1. the enclosing widget's **per-widget properties** — Lua-declared plus native C++
+///    `onStyleApply` tags (most specific → ranked first), then
 /// 2. the global C++ **property catalog**, then
 /// 3. **child-widget names** — workspace `.otui` styles, Lua widget classes, and the native `UI*`
 ///    bases in use.
@@ -206,7 +207,8 @@ fn indented_slot_items(
                     kind: CompletionKind,
                     detail: &str,
                     group: char,
-                    insert_text: Option<String>| {
+                    insert_text: Option<String>,
+                    documentation: Option<String>| {
         if seen.insert(label.clone()) {
             let sort_text = Some(format!("{group}_{label}"));
             let insert_format = if insert_text.is_some() {
@@ -221,19 +223,30 @@ fn indented_slot_items(
                 sort_text,
                 insert_text,
                 insert_format,
+                documentation,
             });
         }
     };
 
-    // 1. The enclosing widget's Lua-added properties (ranked first — most specific to this widget).
+    // 1. The enclosing widget's per-widget properties (ranked first — most specific to this widget):
+    // the union of its Lua-declared custom properties and its native C++ `onStyleApply` tags (see
+    // `WidgetAncestry::custom_properties`) — the two origins are merged into one flat set there, so
+    // they cannot be told apart here either; "widget property" covers both.
     if let Some(widget) = tree.and_then(|t| enclosing_widget_type(t, source, offset)) {
         let ancestry = widget_resolve::resolve_ancestry(&widget, styles, lua);
         for prop in ancestry.custom_properties(lua) {
             let insert = Some(property_key_snippet(&prop));
-            push(prop, CompletionKind::Keyword, "lua property", '0', insert);
+            push(
+                prop,
+                CompletionKind::Keyword,
+                "widget property",
+                '0',
+                insert,
+                None,
+            );
         }
     }
-    // 2. The global C++ property catalog.
+    // 2. The global C++ property catalog, documented from the curated property-hover notes.
     for &prop in catalog::PROPERTIES {
         let insert = Some(property_key_snippet(prop));
         push(
@@ -242,6 +255,7 @@ fn indented_slot_items(
             "property",
             '1',
             insert,
+            property_hover::documentation_body(prop),
         );
     }
     // 3. Child-widget names in scope across the workspace. Each carries a snippet: the widget name
@@ -250,7 +264,7 @@ fn indented_slot_items(
     let child_indent = format!("{}  ", line_indent(source, offset));
     for (name, detail) in widget_names(styles, lua) {
         let insert = Some(child_widget_snippet(&name, &child_indent));
-        push(name, CompletionKind::Class, detail, '2', insert);
+        push(name, CompletionKind::Class, detail, '2', insert, None);
     }
     items
 }
@@ -566,17 +580,23 @@ fn property_value_items(key: &str) -> Vec<CompletionItem> {
         }
         property_hover::PropertyValueKind::Color => catalog::NAMED_COLORS
             .iter()
-            .map(|(name, _)| CompletionItem {
+            .map(|(name, rgb)| CompletionItem {
                 label: (*name).to_owned(),
                 kind: CompletionKind::Value,
                 detail: Some("named color".to_owned()),
                 sort_text: None,
                 insert_text: None,
                 insert_format: InsertFormat::Plain,
+                documentation: Some(format!("`{}`", packed_rgb_to_hex(*rgb))),
             })
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// Format a packed `0xRRGGBB` value ([`catalog::NAMED_COLORS`]) as a lowercase `#rrggbb` hex string.
+fn packed_rgb_to_hex(rgb: u32) -> String {
+    format!("#{rgb:06x}")
 }
 
 /// Build the anchor **target** candidates: the magic pseudo-targets (`parent` / `next` / `prev`)
@@ -602,6 +622,7 @@ fn anchor_target_items(source: &str, offset: usize) -> Vec<CompletionItem> {
             sort_text: None,
             insert_text: None,
             insert_format: InsertFormat::Plain,
+            documentation: None,
         });
     }
     items
@@ -697,6 +718,7 @@ fn set_items(set: &[&str], kind: CompletionKind, detail: &str) -> Vec<Completion
             sort_text: None,
             insert_text: None,
             insert_format: InsertFormat::Plain,
+            documentation: None,
         })
         .collect()
 }
@@ -704,6 +726,10 @@ fn set_items(set: &[&str], kind: CompletionKind, detail: &str) -> Vec<Completion
 /// Like [`set_items`], but each item's insert text continues straight into the value slot the key
 /// always opens onto: `{label}: $0`. Used for the `@event` and `anchors.<edge>` closed sets, whose
 /// grammar shape (`key: value`) is fixed the moment the key is chosen.
+///
+/// Each item's `documentation` comes from the shared [`property_hover::documentation_body`]: this is
+/// `Some` for an anchor edge/shorthand label (`top`, `fill`, …) and `None` for an `@event` name (no
+/// curated note exists for those; see the module docs).
 fn key_snippet_items(set: &[&str], kind: CompletionKind, detail: &str) -> Vec<CompletionItem> {
     set.iter()
         .map(|&label| CompletionItem {
@@ -713,6 +739,7 @@ fn key_snippet_items(set: &[&str], kind: CompletionKind, detail: &str) -> Vec<Co
             sort_text: None,
             insert_text: Some(property_key_snippet(label)),
             insert_format: InsertFormat::Snippet,
+            documentation: property_hover::documentation_body(label),
         })
         .collect()
 }
@@ -1052,6 +1079,71 @@ Panel
     }
 
     #[test]
+    fn catalog_property_completion_carries_its_curated_documentation() {
+        // `width` has a curated one-line note in `property_hover::PROPERTY_DOCS`; the completion
+        // item must surface it, not just the one-word `detail`.
+        let src = "Button\n  wid\n";
+        let items = complete_at(src, at(src, "wid") + "wid".len());
+        let width = items.iter().find(|i| i.label == "width").expect("width");
+        let doc = width.documentation.as_deref().expect("width has a doc");
+        assert!(
+            doc.contains("dimension"),
+            "expected width's curated doc, got {doc:?}"
+        );
+    }
+
+    #[test]
+    fn enum_valued_property_completion_documentation_lists_its_values() {
+        // `display` is both curated AND enum-valued: its documentation must end with the same
+        // "One of: `a`, `b`, …" line the server's property-key hover renders for the same data.
+        let src = "Button\n  disp\n";
+        let items = complete_at(src, at(src, "disp") + "disp".len());
+        let display = items
+            .iter()
+            .find(|i| i.label == "display")
+            .expect("display");
+        let doc = display.documentation.as_deref().expect("display has a doc");
+        assert!(
+            doc.contains("One of:"),
+            "expected an enum list, got {doc:?}"
+        );
+        for value in schema::DISPLAY_VALUES {
+            assert!(
+                doc.contains(&format!("`{value}`")),
+                "expected `{value}` listed in {doc:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_known_property_outside_the_curated_set_still_gets_the_validation_note() {
+        // `min-width` is known but neither curated nor enum-valued (mirrors
+        // `property_hover`'s equivalent test): a known property always gets a body from the shared
+        // formatter now, at minimum the "silently ignored" validation note (`min-width` is not one
+        // of the validating families).
+        let src = "Button\n  min-wid\n";
+        let items = complete_at(src, at(src, "min-wid") + "min-wid".len());
+        let min_width = items
+            .iter()
+            .find(|i| i.label == "min-width")
+            .expect("min-width");
+        let doc = min_width
+            .documentation
+            .as_deref()
+            .expect("min-width has a doc");
+        assert!(doc.contains("silently ignored"), "{doc}");
+    }
+
+    #[test]
+    fn named_color_completion_documentation_carries_its_hex_value() {
+        // A named-color value item's documentation is the color's packed hex, not prose.
+        let src = "Widget\n  color: re\n";
+        let items = complete_at(src, at(src, "re\n") + 2);
+        let red = items.iter().find(|i| i.label == "red").expect("red");
+        assert_eq!(red.documentation.as_deref(), Some("`#ff0000`"));
+    }
+
+    #[test]
     fn property_key_context_is_deterministic() {
         // The returned labels equal exactly the catalog set, in const (sorted) order.
         let src = "Button\n  colo\n";
@@ -1261,7 +1353,7 @@ end
             .iter()
             .find(|i| i.label == "column-style")
             .expect("lua prop offered");
-        assert_eq!(col.detail.as_deref(), Some("lua property"));
+        assert_eq!(col.detail.as_deref(), Some("widget property"));
         assert_eq!(col.kind, CompletionKind::Keyword);
         assert_eq!(col.sort_text.as_deref(), Some("0_column-style"));
         assert!(items.iter().any(|i| i.label == "row-style"));
@@ -1305,9 +1397,9 @@ Window < UIWindow
         let src = "Button < UIButton\n  col\n";
         let items = complete_at_with_widgets(src, at(src, "col") + "col".len(), &styles, &lua);
         assert!(
-            !items
-                .iter()
-                .any(|i| i.label == "column-style" && i.detail.as_deref() == Some("lua property"))
+            !items.iter().any(
+                |i| i.label == "column-style" && i.detail.as_deref() == Some("widget property")
+            )
         );
         assert!(items.iter().any(|i| i.label == "width"));
     }
@@ -1495,6 +1587,39 @@ Window < UIWindow
                 Some(format!("{shorthand}: $0")).as_deref()
             );
         }
+    }
+
+    #[test]
+    fn anchor_edge_and_shorthand_completions_carry_documentation() {
+        // Anchor edges/shorthands are not catalog properties, but they get their own documentation
+        // from the shared `property_hover::documentation_body` formatter, stating BOTH that an
+        // invalid edge is rejected (spec §2.4, INVALID_ANCHOR_EDGE) and the precise resolution scope:
+        // a direct sibling id or a magic pseudo-target only.
+        let src = "Widget\n  anchors.\n";
+        let items = complete_at(src, at(src, "anchors.") + "anchors.".len());
+        let top = items.iter().find(|i| i.label == "top").expect("top edge");
+        let top_doc = top.documentation.as_deref().expect("top has a doc");
+        assert!(top_doc.contains("edge"), "{top_doc}");
+        assert!(top_doc.contains("rejects an invalid"), "{top_doc}");
+        assert!(top_doc.contains("direct sibling"), "{top_doc}");
+
+        let fill = items.iter().find(|i| i.label == "fill").expect("fill");
+        let fill_doc = fill.documentation.as_deref().expect("fill has a doc");
+        assert!(
+            fill_doc.to_lowercase().contains("all four edges"),
+            "{fill_doc}"
+        );
+        assert!(fill_doc.contains("rejects an invalid"), "{fill_doc}");
+        assert!(fill_doc.contains("direct sibling"), "{fill_doc}");
+
+        // An `@event` name gets no documentation — no curated note exists for those.
+        let src = "Button\n  @onCl\n";
+        let items = complete_at(src, at(src, "@onCl") + "@onCl".len());
+        let on_click = items
+            .iter()
+            .find(|i| i.label == "onClick")
+            .expect("onClick");
+        assert_eq!(on_click.documentation, None);
     }
 
     #[test]
