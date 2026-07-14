@@ -743,7 +743,7 @@ fn anchor_target_items(source: &str, offset: usize) -> Vec<CompletionItem> {
         CompletionKind::Value,
         "anchor target",
     );
-    for id in scope_anchor_ids(source, offset) {
+    for id in sibling_anchor_ids(source, offset) {
         if items.iter().any(|item| item.label == id) {
             continue;
         }
@@ -760,12 +760,19 @@ fn anchor_target_items(source: &str, offset: usize) -> Vec<CompletionItem> {
     items
 }
 
-/// Collect the widget `id:` values reachable as anchor targets from the widget owning the anchor at
-/// `offset`: the owner's sibling widgets (same parent) plus its ancestor widgets, in source order,
-/// de-duplicated. A purely **local** CST walk over the current document — anchor targets resolve
-/// within one widget tree, never across files, so the cross-file style index is intentionally not
-/// consulted. Returns empty on a parse failure or when the owner cannot be located.
-fn scope_anchor_ids(source: &str, offset: usize) -> Vec<String> {
+/// Collect the widget `id:` values reachable as concrete anchor targets from the widget owning the
+/// anchor at `offset`: the owner's **direct sibling widgets** (same parent, excluding the owner
+/// itself), in source order, de-duplicated. A purely **local** CST walk over the current document —
+/// anchor targets resolve within one widget tree, never across files, so the cross-file style index
+/// is intentionally not consulted. Returns empty on a parse failure or when the owner cannot be
+/// located.
+///
+/// Engine rule: `UIAnchor::getHookedWidget` (uianchorlayout.cpp:26-42) resolves the magic
+/// `parent`/`next`/`prev` targets and otherwise calls `parentWidget->getChildById(targetId)`, a
+/// single non-recursive lookup in `m_childrenById` (uiwidget.cpp:1487-1494) that only ever holds
+/// direct children. An ancestor's id can never satisfy that lookup, so ancestors are not offered
+/// here (they would never resolve at runtime).
+fn sibling_anchor_ids(source: &str, offset: usize) -> Vec<String> {
     let Some(tree) = SyntaxTree::parse(source) else {
         return Vec::new();
     };
@@ -785,8 +792,7 @@ fn scope_anchor_ids(source: &str, offset: usize) -> Vec<String> {
         }
     };
 
-    // In-scope widgets: the owner's sibling widgets (same parent, excluding the owner itself) and
-    // its ancestor widgets.
+    // In-scope widgets: the owner's sibling widgets (same parent, excluding the owner itself).
     let mut scope: Vec<Node> = Vec::new();
     if let Some(parent) = owner.parent() {
         let mut cursor = parent.walk();
@@ -795,13 +801,6 @@ fn scope_anchor_ids(source: &str, offset: usize) -> Vec<String> {
                 scope.push(sibling);
             }
         }
-    }
-    let mut ancestor = owner.parent();
-    while let Some(node) = ancestor {
-        if is_widget(node) {
-            scope.push(node);
-        }
-        ancestor = node.parent();
     }
 
     // Source order, de-duplicated by id text.
@@ -1322,9 +1321,12 @@ mod tests {
     }
 
     #[test]
-    fn anchor_target_includes_sibling_and_ancestor_ids() {
-        // Button owns the anchor. Reachable ids: its sibling `Label` (id `lbl`) and its ancestor
-        // `Panel` (id `root`); Button's own id `btn` is excluded (a widget cannot anchor to itself).
+    fn anchor_target_offers_direct_siblings_not_ancestors() {
+        // Button owns the anchor. `UIAnchor::getHookedWidget` resolves a concrete target only via
+        // `parentWidget->getChildById`, a non-recursive lookup over direct children — so only
+        // Button's sibling `Label` (id `lbl`) is offered. Its ancestor `Panel` (id `root`) can never
+        // be reached that way and must NOT be offered; Button's own id `btn` is excluded too (a
+        // widget cannot anchor to itself).
         let src = "\
 Panel
   id: root
@@ -1339,18 +1341,18 @@ Panel
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
-        // Source order: `root` (ancestor Panel, earlier in the file) then `lbl` (sibling Label).
-        expected.push("root".to_owned());
         expected.push("lbl".to_owned());
         assert_eq!(labels(&complete_at(src, offset)), expected);
-        // Button's own id is not a target; magic targets stay `Value`, ids are tagged `widget id`.
+        // Button's own id and its ancestor's id are not targets; magic targets stay `Value`, ids
+        // are tagged `widget id`.
         let items = complete_at(src, offset);
         assert!(items.iter().all(|i| i.kind == CompletionKind::Value));
         assert!(!items.iter().any(|i| i.label == "btn"));
+        assert!(!items.iter().any(|i| i.label == "root"));
         assert_eq!(
             items
                 .iter()
-                .find(|i| i.label == "root")
+                .find(|i| i.label == "lbl")
                 .and_then(|i| i.detail.as_deref()),
             Some("widget id")
         );
