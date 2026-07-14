@@ -30,10 +30,17 @@
 //! **validating** family: a malformed value is a hard engine error. Every other known property either
 //! applies cleanly or is silently ignored if the value doesn't parse the way the code expects.
 //!
-//! An **unknown** key yields `None` (no hover): the `unknown-property` diagnostic already tells the
-//! author it has no effect, and the widget-aware Lua-added properties are a separate concern (a later
-//! slice can describe them via the workspace indexes, mirroring `completion`). Pure: byte offsets in,
-//! a structured [`PropertyHover`] out — the server formats it into Markdown.
+//! A key that is **not** in the global catalog is next checked against the **enclosing widget**'s
+//! resolved ancestry ([`widget_resolve`]) — the same workspace-aware resolution [`completion`] already
+//! uses to offer a widget's Lua-added / native per-widget properties (`placeholder` on a `TextEdit`,
+//! `item-id` on a `UIItem`, a Lua-declared custom property, …). A match there still yields a hover
+//! (see [`property_hover_at`]'s doc), just without the catalog's curated one-liner or value-kind info,
+//! since the two origins (Lua-declared vs. native C++) cannot be told apart at that point (mirroring
+//! [`widget_resolve::WidgetAncestry::custom_properties`]'s own union).
+//!
+//! Only a key that is neither a global catalog property nor a property of the enclosing widget yields
+//! `None` (no hover): the `unknown-property` diagnostic already tells the author it has no effect.
+//! Pure: byte offsets in, a structured [`PropertyHover`] out — the server formats it into Markdown.
 //!
 //! [`documentation_body`] is the single shared formatter for "what does this property mean" markdown
 //! *body* text (everything but a `**\`name\`**` header): both the completion module (a global
@@ -41,9 +48,13 @@
 //! two surfaces can never drift apart on wording.
 
 use crate::catalog;
+use crate::lua_widgets::LuaWidgetIndex;
 use crate::schema;
+use crate::style_index::StyleIndex;
 use crate::syntax::SyntaxTree;
+use crate::widget_resolve;
 use lang_api::ByteSpan;
+use tree_sitter::Node;
 
 /// A structured, protocol-agnostic description of a property key under the cursor (spec §5.5). The
 /// server maps [`span`](Self::span) to a range and renders [`doc`](Self::doc) + [`value`](Self::value)
@@ -55,11 +66,17 @@ pub struct PropertyHover {
     /// The property name (the key text).
     pub name: String,
     /// A one-line behavior description for the canonical global properties (what the property does),
-    /// or `None` for a known property outside the curated set. Sourced from the engine's widget
-    /// style parsers; see [`PROPERTY_DOCS`].
+    /// or `None` for a known property outside the curated set (including every widget-aware property
+    /// — see [`widget`](Self::widget)). Sourced from the engine's widget style parsers; see
+    /// [`PROPERTY_DOCS`].
     pub doc: Option<&'static str>,
     /// What value the property expects.
     pub value: PropertyValueKind,
+    /// `Some(widget_type)` when `name` is **not** a global catalog property but resolved instead as a
+    /// per-widget property of the enclosing widget's type (a Lua-declared or native C++ custom style
+    /// property — see [`widget_resolve::WidgetAncestry::custom_properties`], whose union cannot tell
+    /// the two origins apart). `None` for the global-catalog path (the common case).
+    pub widget: Option<String>,
 }
 
 /// The value a property expects, derived from the catalog/schema metadata.
@@ -85,8 +102,19 @@ pub enum PropertyValueKind {
 
 /// Describe the property key under `offset`, or `None` when the cursor is not on a **known** property
 /// key (an unknown key, a value position, a non-property token, or an unparseable document).
+///
+/// `styles`/`lua` are the workspace indexes ([`StyleIndex`]/[`LuaWidgetIndex`]) used, when `name` is
+/// not a global catalog property, to resolve the enclosing widget's ancestry and check whether it
+/// declares `name` as a per-widget property (mirroring [`completion`](crate::completion)'s
+/// widget-aware property-key completion). Pass empty indexes when no workspace is available (or in a
+/// test) — the global-catalog path is unaffected either way.
 #[must_use]
-pub fn property_hover_at(source: &str, offset: usize) -> Option<PropertyHover> {
+pub fn property_hover_at(
+    source: &str,
+    offset: usize,
+    styles: &StyleIndex,
+    lua: &LuaWidgetIndex,
+) -> Option<PropertyHover> {
     let tree = SyntaxTree::parse(source)?;
     // The smallest node at the cursor. On a property key this is the `property_key` leaf itself; on a
     // value or elsewhere it is some other node, and the walk below finds no `property_key` ancestor
@@ -102,15 +130,56 @@ pub fn property_hover_at(source: &str, offset: usize) -> Option<PropertyHover> {
 
     let span = SyntaxTree::span_of(key);
     let name = source[span.start..span.end].to_owned();
-    if !schema::is_known_property(&name) {
+    if schema::is_known_property(&name) {
+        return Some(PropertyHover {
+            span,
+            doc: property_doc(&name),
+            value: classify_value(&name),
+            widget: None,
+            name,
+        });
+    }
+    // Not a global catalog property: does the enclosing widget's resolved ancestry declare it as a
+    // per-widget custom property (Lua-declared or native C++)? Mirrors `completion`'s widget-aware
+    // property-key slot exactly, just answering a membership test instead of enumerating a set.
+    let widget_type = enclosing_widget_type(key, source)?;
+    let ancestry = widget_resolve::resolve_ancestry(&widget_type, styles, lua);
+    if !ancestry.declares_custom_property(lua, &name) {
         return None;
     }
     Some(PropertyHover {
         span,
-        doc: property_doc(&name),
-        value: classify_value(&name),
+        doc: None,
+        value: PropertyValueKind::Plain,
+        widget: Some(widget_type),
         name,
     })
+}
+
+/// The type name of the widget that owns the property key `key`: the nearest ancestor `container`
+/// (its `tag`) or `style_header` (its `base`). A minimal, hover-specific counterpart to
+/// `completion::enclosing_widget_type` — hover always starts from an already-resolved `property_key`
+/// leaf in a document that parsed successfully (unlike completion, which runs mid-edit against a
+/// possibly-broken CST and must skip a node still being typed on the cursor's own line), so no such
+/// heuristic is needed here: just walk up.
+fn enclosing_widget_type(key: Node, source: &str) -> Option<String> {
+    let mut node = key;
+    loop {
+        node = node.parent()?;
+        match node.kind() {
+            "container" => {
+                return node
+                    .child_by_field_name("tag")
+                    .map(|tag| source[tag.start_byte()..tag.end_byte()].to_owned());
+            }
+            "style_header" => {
+                return node
+                    .child_by_field_name("base")
+                    .map(|base| source[base.start_byte()..base.end_byte()].to_owned());
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The curated one-line behavior for a canonical global property, or `None` if not in the set.
@@ -440,7 +509,16 @@ mod tests {
     }
 
     fn hover(src: &str, needle: &str) -> Option<PropertyHover> {
-        property_hover_at(src, at(src, needle) + 1)
+        hover_with(src, needle, &StyleIndex::new(), &LuaWidgetIndex::new())
+    }
+
+    fn hover_with(
+        src: &str,
+        needle: &str,
+        styles: &StyleIndex,
+        lua: &LuaWidgetIndex,
+    ) -> Option<PropertyHover> {
+        property_hover_at(src, at(src, needle) + 1, styles, lua)
     }
 
     #[test]
@@ -601,7 +679,15 @@ mod tests {
     #[test]
     fn a_non_property_token_has_no_hover() {
         // The style header name / base is a style hover, not a property hover.
-        assert!(property_hover_at("Panel < UIWidget\n", 2).is_none());
+        assert!(
+            property_hover_at(
+                "Panel < UIWidget\n",
+                2,
+                &StyleIndex::new(),
+                &LuaWidgetIndex::new()
+            )
+            .is_none()
+        );
     }
 
     // --- documentation_body: the shared completion/hover formatter -------------------------------
@@ -774,5 +860,99 @@ mod tests {
         assert!(!is_validating_property("clear"));
         assert!(!is_validating_property("justify-items"));
         assert!(!is_validating_property("auto-focus"));
+    }
+
+    // --- widget-aware hover: per-widget properties (native C++ and Lua-declared) ------------------
+
+    #[test]
+    fn describes_a_native_per_widget_property() {
+        // `placeholder` is not a global catalog property, but `schema::native_widget_declares` says
+        // `UITextEdit` reads it in its `onStyleApply` override. The instance's ancestry (TextEdit <
+        // UITextEdit) reaches that native class, so hover must describe it as a widget property.
+        let mut styles = StyleIndex::new();
+        let tree = SyntaxTree::parse("TextEdit < UITextEdit\n").expect("parse otui");
+        styles.set_document("base.otui", crate::style_index::extract_style_defs(&tree));
+        let lua = LuaWidgetIndex::new();
+
+        let src = "TextEdit\n  placeholder: Search...\n";
+        let h = hover_with(src, "placeholder", &styles, &lua).expect("hover");
+        assert_eq!(h.name, "placeholder");
+        assert_eq!(h.widget.as_deref(), Some("TextEdit"));
+        // No curated global doc / value-kind for a widget-only property.
+        assert_eq!(h.doc, None);
+        assert_eq!(h.value, PropertyValueKind::Plain);
+    }
+
+    #[test]
+    fn describes_a_lua_declared_custom_property() {
+        // `column-style` is declared only in Lua (`UITable::onStyleApply`), not by the native schema
+        // table nor the global catalog.
+        let mut styles = StyleIndex::new();
+        let tree = SyntaxTree::parse("MyTable < UITable\n").expect("parse otui");
+        styles.set_document("base.otui", crate::style_index::extract_style_defs(&tree));
+        let mut lua = LuaWidgetIndex::new();
+        lua.set_document(
+            "uitable.lua",
+            crate::lua_widgets::scan_widgets(
+                "UITable = extends(UIWidget, 'UITable')\n\
+                 function UITable:onStyleApply(styleName, styleNode)\n\
+                   for name, value in pairs(styleNode) do\n\
+                     if name == 'column-style' then end\n\
+                   end\n\
+                 end\n",
+            ),
+        );
+
+        let src = "MyTable\n  column-style: Column\n";
+        let h = hover_with(src, "column-style", &styles, &lua).expect("hover");
+        assert_eq!(h.name, "column-style");
+        assert_eq!(h.widget.as_deref(), Some("MyTable"));
+    }
+
+    #[test]
+    fn a_global_property_still_hovers_with_workspace_indexes_present() {
+        // The global-catalog path must be unaffected by non-empty workspace indexes.
+        let mut styles = StyleIndex::new();
+        let tree = SyntaxTree::parse("TextEdit < UITextEdit\n").expect("parse otui");
+        styles.set_document("base.otui", crate::style_index::extract_style_defs(&tree));
+        let lua = LuaWidgetIndex::new();
+
+        let h = hover_with("TextEdit\n  color: red\n", "color", &styles, &lua).expect("hover");
+        assert_eq!(h.value, PropertyValueKind::Color);
+        assert_eq!(h.widget, None);
+    }
+
+    #[test]
+    fn a_property_unknown_to_this_widget_still_has_no_hover() {
+        // `column-style` is UITable's — hovering it on an unrelated widget stays `None`, exactly as an
+        // unknown key does: the per-widget table must not become a global one.
+        let mut styles = StyleIndex::new();
+        let tree = SyntaxTree::parse("Button < UIButton\n").expect("parse otui");
+        styles.set_document("base.otui", crate::style_index::extract_style_defs(&tree));
+        let mut lua = LuaWidgetIndex::new();
+        lua.set_document(
+            "uitable.lua",
+            crate::lua_widgets::scan_widgets(
+                "UITable = extends(UIWidget, 'UITable')\n\
+                 function UITable:onStyleApply(styleName, styleNode)\n\
+                   for name, value in pairs(styleNode) do\n\
+                     if name == 'column-style' then end\n\
+                   end\n\
+                 end\n",
+            ),
+        );
+
+        let src = "Button\n  column-style: Column\n";
+        assert!(hover_with(src, "column-style", &styles, &lua).is_none());
+    }
+
+    #[test]
+    fn a_genuinely_unknown_key_still_has_no_hover_with_workspace_indexes_present() {
+        let mut styles = StyleIndex::new();
+        let tree = SyntaxTree::parse("TextEdit < UITextEdit\n").expect("parse otui");
+        styles.set_document("base.otui", crate::style_index::extract_style_defs(&tree));
+        let lua = LuaWidgetIndex::new();
+
+        assert!(hover_with("TextEdit\n  widht: 10\n", "widht", &styles, &lua).is_none());
     }
 }

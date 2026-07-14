@@ -2567,10 +2567,14 @@ fn render_hover(desc: &StyleHover, line_index: &LineIndex, encoding: PositionEnc
 }
 
 /// Format a [`PropertyHover`] (a property-key description from the engine) into an LSP Markdown
-/// [`Hover`]. Pure presentation: the body markdown itself comes from
+/// [`Hover`]. Pure presentation: the body markdown for a **global** catalog property comes from
 /// [`otui_core::property_hover::documentation_body`] — the single formatter also used for a global
-/// property-key completion item's `documentation`, so the two surfaces never diverge; this only
-/// prepends the `**\`name\`**` header and maps the key span to a range.
+/// property-key completion item's `documentation`, so the two surfaces never diverge. A
+/// **widget-aware** property ([`PropertyHover::widget`] is `Some`) instead gets a short generic note
+/// naming the widget it resolved against — the Lua-declared and native C++ origins are indistinguishable
+/// at this point (see [`otui_core::widget_resolve::WidgetAncestry::custom_properties`]), so the
+/// wording deliberately does not claim either. Either way this only prepends the `**\`name\`**` header
+/// and maps the key span to a range.
 fn render_property_hover(
     desc: &PropertyHover,
     line_index: &LineIndex,
@@ -2578,7 +2582,9 @@ fn render_property_hover(
 ) -> Hover {
     let name = &desc.name;
     let mut value = format!("**`{name}`**");
-    if let Some(body) = otui_core::property_hover::documentation_body(name) {
+    if let Some(widget) = &desc.widget {
+        value.push_str(&format!(" — a property of `{widget}`."));
+    } else if let Some(body) = otui_core::property_hover::documentation_body(name) {
         value.push_str(&format!(" — {body}"));
     }
     Hover {
@@ -4311,13 +4317,13 @@ impl Backend {
         if let Some(desc) = self.service.style_hover_at(&text, offset, &index, &lua) {
             return Some(render_hover(&desc, &line_index, encoding));
         }
-        drop(lua);
-        drop(index);
-        // Not a style token — fall back to a property-key hover (value type from the catalog/schema
-        // metadata; no workspace index needed).
-        if let Some(pdesc) = self.service.property_hover_at(&text, offset) {
+        // Not a style token — fall back to a property-key hover: the global catalog, or (widget-aware)
+        // a per-widget property of the enclosing widget's resolved ancestry — same indexes as above.
+        if let Some(pdesc) = self.service.property_hover_at(&text, offset, &index, &lua) {
             return Some(render_property_hover(&pdesc, &line_index, encoding));
         }
+        drop(lua);
+        drop(index);
         // Not a property key either — is the cursor on an asset path *value* (a sprite-preview
         // hover)? Same resolution as `document_link`/the missing-asset diagnostic; unlike the
         // diagnostic this is not a claim of absence, so it degrades silently (no image, no note) when
@@ -7303,12 +7309,24 @@ end
         );
     }
 
-    /// Render the property-key hover at `needle` in `text` (the fallback path of the hover handler).
+    /// Render the property-key hover at `needle` in `text` (the fallback path of the hover handler),
+    /// with empty workspace indexes — the global-catalog path needs none.
     fn property_hover_text(text: &str, needle: &str) -> String {
+        property_hover_text_with(text, needle, &StyleIndex::new(), &LuaWidgetIndex::new())
+    }
+
+    /// Like [`property_hover_text`], but against the given workspace `styles`/`lua` indexes — for the
+    /// widget-aware branch.
+    fn property_hover_text_with(
+        text: &str,
+        needle: &str,
+        styles: &StyleIndex,
+        lua: &LuaWidgetIndex,
+    ) -> String {
         let offset = text.find(needle).expect("needle present") + 1;
         let desc = OtuiService::new()
-            .property_hover_at(text, offset)
-            .expect("cursor is on a known property key");
+            .property_hover_at(text, offset, styles, lua)
+            .expect("cursor resolves to a property hover");
         let line_index = LineIndex::new(text);
         let h = render_property_hover(&desc, &line_index, PositionEncoding::Utf16);
         match h.contents {
@@ -7365,6 +7383,79 @@ end
             "{t2}"
         );
         assert!(t2.contains("rejects an invalid value"), "{t2}");
+    }
+
+    #[test]
+    fn hover_on_a_native_per_widget_property_describes_it_as_the_widgets() {
+        // `placeholder` is not a global catalog property, but is native `UITextEdit`'s per-widget
+        // property (schema::native_widget_declares): hovering it on a widget whose ancestry reaches
+        // `UITextEdit` must describe it as such, not stay silent.
+        let mut styles = StyleIndex::new();
+        styles.set_document(
+            DocId::from("file:///a.otui"),
+            OtuiService::new().style_defs("TextEdit < UITextEdit\n"),
+        );
+        let lua = LuaWidgetIndex::new();
+
+        let t = property_hover_text_with(
+            "TextEdit\n  placeholder: Search...\n",
+            "placeholder",
+            &styles,
+            &lua,
+        );
+        assert!(t.contains("**`placeholder`**"), "{t}");
+        assert!(t.contains("property of") && t.contains("`TextEdit`"), "{t}");
+    }
+
+    #[test]
+    fn hover_on_a_lua_declared_custom_property_describes_it_as_the_widgets() {
+        // `column-style` is declared only in Lua (`UITable::onStyleApply`).
+        let mut styles = StyleIndex::new();
+        styles.set_document(
+            DocId::from("file:///a.otui"),
+            OtuiService::new().style_defs("MyTable < UITable\n"),
+        );
+        let mut lua = LuaWidgetIndex::new();
+        lua.set_document(
+            "uitable.lua",
+            otui_core::lua_widgets::scan_widgets(
+                "UITable = extends(UIWidget, 'UITable')\n\
+                 function UITable:onStyleApply(styleName, styleNode)\n\
+                   for name, value in pairs(styleNode) do\n\
+                     if name == 'column-style' then end\n\
+                   end\n\
+                 end\n",
+            ),
+        );
+
+        let t = property_hover_text_with(
+            "MyTable\n  column-style: Column\n",
+            "column-style",
+            &styles,
+            &lua,
+        );
+        assert!(t.contains("**`column-style`**"), "{t}");
+        assert!(t.contains("property of") && t.contains("`MyTable`"), "{t}");
+    }
+
+    #[test]
+    fn hover_on_a_genuinely_unknown_property_stays_empty_even_with_workspace_indexes() {
+        // An unknown/misspelled key stays hint-only (the `unknown-property` diagnostic covers it) even
+        // when workspace indexes are populated — it must not be confused with a widget property.
+        let mut styles = StyleIndex::new();
+        styles.set_document(
+            DocId::from("file:///a.otui"),
+            OtuiService::new().style_defs("TextEdit < UITextEdit\n"),
+        );
+        let lua = LuaWidgetIndex::new();
+
+        let text = "TextEdit\n  widht: 10\n";
+        let offset = text.find("widht").expect("present") + 1;
+        assert!(
+            OtuiService::new()
+                .property_hover_at(text, offset, &styles, &lua)
+                .is_none()
+        );
     }
 
     /// The [`CodeAction`] inside a [`CodeActionOrCommand`] (panics if it is a bare command).
