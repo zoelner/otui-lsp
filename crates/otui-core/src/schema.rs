@@ -128,23 +128,25 @@ pub const LAYOUT_TYPES: &[&str] = &["horizontalBox", "verticalBox", "grid", "anc
 /// `node->tag() == "phantom"`'s bool branch) call, not a string-equality trick:
 ///
 /// * `checked`, `clipping`, `draggable`, `enabled`, `fixed-size`, `focusable`, `on`, `phantom`,
-///   `visible` — `src/framework/ui/uiwidgetbasestyle.cpp` (base widget style: `enabled` line 376,
-///   `visible` 378, `checked` 382, `draggable` 384, `on` 386, `focusable` 388, `phantom` 392–396,
-///   `fixed-size` 403, `clipping` 409).
+///   `visible` — `src/framework/ui/uiwidgetbasestyle.cpp`, each cited at its `node->value<bool>()`
+///   cast (base widget style: `enabled` line 377, `visible` 379, `checked` 383, `draggable` 385,
+///   `on` 387, `focusable` 389, `phantom` 396 (the non-`pointer-events` branch of the shared
+///   `phantom`/`pointer-events` block starting at line 392), `fixed-size` 403, `clipping` 409).
 /// * `image-smooth`, `image-fixed-ratio`, `image-repeated`, `image-auto-resize`,
-///   `image-individual-animation` — `src/framework/ui/uiwidgetimage.cpp` (`image-smooth` line 40,
-///   `image-fixed-ratio` 72, `image-repeated` 74, `image-auto-resize` 88,
-///   `image-individual-animation` 90).
+///   `image-individual-animation` — `src/framework/ui/uiwidgetimage.cpp`, each cited at its
+///   `value<bool>()` cast (`image-smooth` line 41, `image-fixed-ratio` 73, `image-repeated` 75,
+///   `image-auto-resize` 89, `image-individual-animation` 91).
 /// * `text-wrap`, `text-auto-resize`, `text-horizontal-auto-resize`, `text-vertical-auto-resize`,
-///   `text-only-upper-case` — `src/framework/ui/uiwidgettext.cpp` (`text-wrap` line 278,
-///   `text-auto-resize` 280, `text-horizontal-auto-resize` 282, `text-vertical-auto-resize` 284,
-///   `text-only-upper-case` 286).
+///   `text-only-upper-case` — `src/framework/ui/uiwidgettext.cpp`, each cited at its
+///   `value<bool>()` cast (`text-wrap` line 279, `text-auto-resize` 281,
+///   `text-horizontal-auto-resize` 283, `text-vertical-auto-resize` 285,
+///   `text-only-upper-case` 287).
 ///
 /// **Deliberately excludes** two properties that look boolean-ish but are not: `visibility` (reads
 /// `node->value<std::string>() == "visible"`, a string-equality test, not a bool cast — the same
-/// file, line 380) and `pointer-events` (an alias for `phantom` compared against the string literal
-/// `"none"`, line 392–394). Both accept any text; they are not genuinely two-valued, so they are
-/// left free-text rather than folded in here.
+/// file, line 381) and `pointer-events` (an alias for `phantom` compared against the string literal
+/// `"none"`, line 394). Both accept any text; they are not genuinely two-valued, so they are left
+/// free-text rather than folded in here.
 ///
 /// Scoped to the **global** catalog only (properties dispatched by the base/image/text style
 /// parsers, i.e. members of [`crate::catalog::PROPERTIES`]): the several more boolean tags a native
@@ -253,6 +255,112 @@ pub const ALIGN_ITEMS_VALUES: &[&str] = &[
 /// canonical default spelling `visible` — silently leaves the widget at the initial `Visible` type.
 /// `visible` is included as that default's canonical spelling. Not a validating property.
 pub const OVERFLOW_VALUES: &[&str] = &["visible", "hidden", "scroll", "auto", "clip"];
+
+/// The `flex-wrap` keyword set, from `parseFlexWrap` (`src/framework/ui/uiwidgetbasestyle.cpp:101`),
+/// dispatched from the `flex-wrap` tag at line 544. Verified against the source: the value is
+/// lowercased; `wrap` and `wrap-reverse` are explicitly matched, and anything unmatched — including
+/// the canonical default spelling `nowrap` — silently falls through to `NoWrap`; `nowrap` is
+/// included as that default's canonical spelling. Not a validating property.
+pub const FLEX_WRAP_VALUES: &[&str] = &["nowrap", "wrap", "wrap-reverse"];
+
+/// The `align-content` keyword set, from `parseAlignContent`
+/// (`src/framework/ui/uiwidgetbasestyle.cpp:130`), dispatched from the `align-content` tag at line
+/// 561. Verified against the source: the value is lowercased; `start`/`top` are synonyms for
+/// `flex-start`, `end`/`bottom` for `flex-end`. Anything unmatched (including the canonical default
+/// spelling `stretch`) silently falls through to `Stretch`; `stretch` is included as that default's
+/// canonical spelling. Not a validating property.
+pub const ALIGN_CONTENT_VALUES: &[&str] = &[
+    "stretch",
+    "flex-start",
+    "start",
+    "top",
+    "flex-end",
+    "end",
+    "bottom",
+    "center",
+    "space-between",
+    "space-around",
+    "space-evenly",
+];
+
+/// The `align-self` keyword set, from `parseAlignSelf`
+/// (`src/framework/ui/uiwidgetbasestyle.cpp:142`), dispatched from the `align-self` tag at line 592.
+/// Verified against the source: the value is lowercased; `auto` is its own explicit keyword (unlike
+/// [`ALIGN_ITEMS_VALUES`], which has no `auto`); `start`/`top` are synonyms for `flex-start`,
+/// `end`/`bottom` for `flex-end`. Anything unmatched (including the canonical default spelling
+/// `stretch`) silently falls through to `Stretch`; `stretch` is included as that default's canonical
+/// spelling. Not a validating property.
+pub const ALIGN_SELF_VALUES: &[&str] = &[
+    "stretch",
+    "auto",
+    "flex-start",
+    "start",
+    "top",
+    "flex-end",
+    "end",
+    "bottom",
+    "center",
+    "baseline",
+];
+
+/// The `position` keyword set (`src/framework/ui/uiwidgetbasestyle.cpp:604`). Verified against the
+/// source: the value is lowercased; `absolute` and `relative` are explicitly matched, and anything
+/// unmatched — including the canonical default spelling `static` — silently leaves the widget at
+/// `PositionType::Static`. `static` is included as that default's canonical spelling. Not a
+/// validating property.
+pub const POSITION_VALUES: &[&str] = &["static", "absolute", "relative"];
+
+/// The `float` keyword set (`src/framework/ui/uiwidgetbasestyle.cpp:613`). Verified against the
+/// source: the value is lowercased; `left`, `right`, `inline-start`, and `inline-end` are explicitly
+/// matched, and anything unmatched — including the canonical default spelling `none` — silently
+/// leaves the widget at `FloatType::None`. `none` is included as that default's canonical spelling.
+/// Not a validating property.
+pub const FLOAT_VALUES: &[&str] = &["none", "left", "right", "inline-start", "inline-end"];
+
+/// The `clear` keyword set (`src/framework/ui/uiwidgetbasestyle.cpp:622`). Verified against the
+/// source: the value is lowercased; `left`, `right`, `both`, `inline-start`, and `inline-end` are
+/// explicitly matched, and anything unmatched — including the canonical default spelling `none` —
+/// silently leaves the widget at `ClearType::None`. `none` is included as that default's canonical
+/// spelling. Not a validating property.
+pub const CLEAR_VALUES: &[&str] = &[
+    "none",
+    "left",
+    "right",
+    "both",
+    "inline-start",
+    "inline-end",
+];
+
+/// The `justify-items` keyword set (`src/framework/ui/uiwidgetbasestyle.cpp:632`). Verified against
+/// the source: `center` maps to `Center`; `left`/`flex-start`/`start`/`inline-start` all map to
+/// `Left`; `right`/`flex-end`/`end`/`inline-end` all map to `Right`; anything unmatched — including
+/// the canonical default spelling `normal` — silently leaves the widget at `JustifyItemsType::Normal`
+/// (`normal` is included as that default's canonical spelling). Unlike every other keyword-set
+/// property in this module, this dispatch does **not** lowercase the value first (no `tolower` call
+/// in the block, unlike its `overflow`/`position`/`float`/`clear`/flexbox neighbors) — so, strictly,
+/// only the exact-case spellings below are recognized by the real engine; `Center`/`LEFT`/etc. fall
+/// through to `Normal` just like an unrelated typo would. Not a validating property.
+pub const JUSTIFY_ITEMS_VALUES: &[&str] = &[
+    "normal",
+    "center",
+    "left",
+    "flex-start",
+    "start",
+    "inline-start",
+    "right",
+    "flex-end",
+    "end",
+    "inline-end",
+];
+
+/// The `auto-focus` keyword set, from `Fw::translateAutoFocusPolicy`
+/// (`src/framework/ui/uitranslator.cpp:139`), dispatched from the `auto-focus` tag at
+/// `src/framework/ui/uiwidgetbasestyle.cpp:390` (the cast/call itself at line 391). Verified against
+/// the source: the value is lowercased and trimmed; `first` and `last` are explicitly matched, and
+/// anything unmatched — including the canonical default spelling `none` — silently falls through to
+/// `AutoFocusNone`; `none` is included as that default's canonical spelling. Not a validating
+/// property.
+pub const AUTO_FOCUS_VALUES: &[&str] = &["none", "first", "last"];
 
 /// The `border` shorthand **style** keywords, consumed (and ignored) by the engine's `border` parser
 /// while it scans for a width and a color. Validated against the engine source: each is matched
@@ -1525,5 +1633,45 @@ mod tests {
         assert!(ALIGN_ITEMS_VALUES.contains(&"top")); // engine-specific `flex-start` synonym
         assert!(OVERFLOW_VALUES.contains(&"clip"));
         assert!(OVERFLOW_VALUES.contains(&"visible"));
+    }
+
+    #[test]
+    fn the_second_batch_of_flexbox_and_box_model_enum_sets_are_populated() {
+        assert!(FLEX_WRAP_VALUES.contains(&"nowrap"));
+        assert!(FLEX_WRAP_VALUES.contains(&"wrap-reverse"));
+        assert!(ALIGN_CONTENT_VALUES.contains(&"stretch"));
+        assert!(ALIGN_CONTENT_VALUES.contains(&"space-evenly"));
+        assert!(ALIGN_SELF_VALUES.contains(&"auto")); // unlike ALIGN_ITEMS_VALUES
+        assert!(ALIGN_SELF_VALUES.contains(&"baseline"));
+        assert!(POSITION_VALUES.contains(&"static"));
+        assert!(POSITION_VALUES.contains(&"absolute"));
+        assert!(FLOAT_VALUES.contains(&"none"));
+        assert!(FLOAT_VALUES.contains(&"inline-end"));
+        assert!(CLEAR_VALUES.contains(&"both"));
+        assert!(JUSTIFY_ITEMS_VALUES.contains(&"normal"));
+        assert!(JUSTIFY_ITEMS_VALUES.contains(&"inline-start")); // an alias of `left`
+        assert!(AUTO_FOCUS_VALUES.contains(&"first"));
+        assert!(AUTO_FOCUS_VALUES.contains(&"last"));
+    }
+
+    #[test]
+    fn every_new_keyword_enum_property_is_a_real_catalog_property() {
+        // Every property these sets attach to must be a genuine, dispatched global property —
+        // otherwise the set would be dead weight, never reachable through `classify_value`.
+        for prop in [
+            "flex-wrap",
+            "align-content",
+            "align-self",
+            "position",
+            "float",
+            "clear",
+            "justify-items",
+            "auto-focus",
+        ] {
+            assert!(
+                is_known_property(prop),
+                "{prop} should be a known catalog property"
+            );
+        }
     }
 }

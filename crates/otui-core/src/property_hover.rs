@@ -10,11 +10,15 @@
 //! * a **color** property ([`catalog::COLOR_PROPERTIES`]) → takes a color;
 //! * an **asset-path** property ([`schema::PATH_PROPERTIES`]) → a texture path;
 //! * a **boolean** property ([`schema::BOOLEAN_PROPERTIES`]) → `true`/`false`;
-//! * `display` / `layout` / `text-align` / `icon-align` / `flex-direction` / `justify-content` /
-//!   `align-items` / `overflow` → one of a fixed value set ([`schema::DISPLAY_VALUES`] /
-//!   [`schema::LAYOUT_TYPES`] / [`schema::ALIGNMENT_VALUES`] / [`schema::FLEX_DIRECTION_VALUES`] /
-//!   [`schema::JUSTIFY_CONTENT_VALUES`] / [`schema::ALIGN_ITEMS_VALUES`] /
-//!   [`schema::OVERFLOW_VALUES`]);
+//! * `display` / `layout` / `text-align` / `icon-align` / `flex-direction` / `flex-wrap` /
+//!   `justify-content` / `justify-items` / `align-items` / `align-content` / `align-self` /
+//!   `overflow` / `position` / `float` / `clear` / `auto-focus` → one of a fixed value set
+//!   ([`schema::DISPLAY_VALUES`] / [`schema::LAYOUT_TYPES`] / [`schema::ALIGNMENT_VALUES`] /
+//!   [`schema::FLEX_DIRECTION_VALUES`] / [`schema::FLEX_WRAP_VALUES`] /
+//!   [`schema::JUSTIFY_CONTENT_VALUES`] / [`schema::JUSTIFY_ITEMS_VALUES`] /
+//!   [`schema::ALIGN_ITEMS_VALUES`] / [`schema::ALIGN_CONTENT_VALUES`] /
+//!   [`schema::ALIGN_SELF_VALUES`] / [`schema::OVERFLOW_VALUES`] / [`schema::POSITION_VALUES`] /
+//!   [`schema::FLOAT_VALUES`] / [`schema::CLEAR_VALUES`] / [`schema::AUTO_FOCUS_VALUES`]);
 //! * `border` → the width-and-color shorthand;
 //! * any other **known** catalog property → no extra value-kind sentence, but still says whether an
 //!   invalid value is rejected or silently ignored (see [`documentation_body`]).
@@ -282,6 +286,30 @@ pub fn classify_value(name: &str) -> PropertyValueKind {
         "overflow" => PropertyValueKind::Enum {
             values: schema::OVERFLOW_VALUES,
         },
+        "flex-wrap" => PropertyValueKind::Enum {
+            values: schema::FLEX_WRAP_VALUES,
+        },
+        "align-content" => PropertyValueKind::Enum {
+            values: schema::ALIGN_CONTENT_VALUES,
+        },
+        "align-self" => PropertyValueKind::Enum {
+            values: schema::ALIGN_SELF_VALUES,
+        },
+        "position" => PropertyValueKind::Enum {
+            values: schema::POSITION_VALUES,
+        },
+        "float" => PropertyValueKind::Enum {
+            values: schema::FLOAT_VALUES,
+        },
+        "clear" => PropertyValueKind::Enum {
+            values: schema::CLEAR_VALUES,
+        },
+        "justify-items" => PropertyValueKind::Enum {
+            values: schema::JUSTIFY_ITEMS_VALUES,
+        },
+        "auto-focus" => PropertyValueKind::Enum {
+            values: schema::AUTO_FOCUS_VALUES,
+        },
         "border" => PropertyValueKind::Border,
         _ => PropertyValueKind::Plain,
     }
@@ -480,6 +508,34 @@ mod tests {
     }
 
     #[test]
+    fn describes_the_second_batch_of_keyword_enum_properties() {
+        // One representative assertion per newly wired property, pairing it with its authored set.
+        let cases: &[(&str, &str, &'static [&'static str])] = &[
+            ("flex-wrap: wrap", "flex-wrap", schema::FLEX_WRAP_VALUES),
+            (
+                "align-content: center",
+                "align-content",
+                schema::ALIGN_CONTENT_VALUES,
+            ),
+            ("align-self: auto", "align-self", schema::ALIGN_SELF_VALUES),
+            ("position: absolute", "position", schema::POSITION_VALUES),
+            ("float: left", "float", schema::FLOAT_VALUES),
+            ("clear: both", "clear", schema::CLEAR_VALUES),
+            (
+                "justify-items: center",
+                "justify-items",
+                schema::JUSTIFY_ITEMS_VALUES,
+            ),
+            ("auto-focus: first", "auto-focus", schema::AUTO_FOCUS_VALUES),
+        ];
+        for (line, key, values) in cases {
+            let src = format!("Panel\n  {line}\n");
+            let h = hover(&src, key).unwrap_or_else(|| panic!("{key} should hover"));
+            assert_eq!(h.value, PropertyValueKind::Enum { values }, "{key}");
+        }
+    }
+
+    #[test]
     fn the_span_covers_exactly_the_key_token() {
         let src = "Panel\n  width: 10\n";
         let h = hover(src, "width").expect("hover");
@@ -616,6 +672,19 @@ mod tests {
     }
 
     #[test]
+    fn documentation_body_appends_one_of_for_the_second_batch_of_enum_properties() {
+        // `position` is one of the eight newly-wired keyword-enum properties: same shape as
+        // `overflow` above — "One of: ..." plus the non-validating "silently ignored" note.
+        let body = documentation_body("position").expect("position has a doc");
+        assert!(body.contains("One of:"), "{body}");
+        for value in schema::POSITION_VALUES {
+            assert!(body.contains(&format!("`{value}`")), "{body}");
+        }
+        assert!(body.contains("silently ignored"), "{body}");
+        assert!(!body.contains("rejects an invalid value"), "{body}");
+    }
+
+    #[test]
     fn documentation_body_is_always_some_for_a_known_property_even_uncurated_and_plain() {
         // `min-width` is known, Plain-valued and uncurated: no curated prose, no value-kind
         // sentence — but it is still a KNOWN property, so the body is never `None`; it carries at
@@ -697,5 +766,13 @@ mod tests {
         assert!(!is_validating_property("justify-content"));
         assert!(!is_validating_property("align-items"));
         assert!(!is_validating_property("overflow"));
+        assert!(!is_validating_property("flex-wrap"));
+        assert!(!is_validating_property("align-content"));
+        assert!(!is_validating_property("align-self"));
+        assert!(!is_validating_property("position"));
+        assert!(!is_validating_property("float"));
+        assert!(!is_validating_property("clear"));
+        assert!(!is_validating_property("justify-items"));
+        assert!(!is_validating_property("auto-focus"));
     }
 }

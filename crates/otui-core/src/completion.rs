@@ -902,6 +902,26 @@ mod tests {
     }
 
     #[test]
+    fn value_position_for_the_second_batch_of_keyword_enums_offers_their_keywords() {
+        // One completion round-trip per newly-wired property, each checked against its authored set.
+        let cases: &[(&str, &'static [&'static str])] = &[
+            ("flex-wrap: no", schema::FLEX_WRAP_VALUES),
+            ("align-content: ce", schema::ALIGN_CONTENT_VALUES),
+            ("align-self: au", schema::ALIGN_SELF_VALUES),
+            ("position: ab", schema::POSITION_VALUES),
+            ("float: le", schema::FLOAT_VALUES),
+            ("clear: bo", schema::CLEAR_VALUES),
+            ("justify-items: ce", schema::JUSTIFY_ITEMS_VALUES),
+            ("auto-focus: fi", schema::AUTO_FOCUS_VALUES),
+        ];
+        for (line, values) in cases {
+            let src = format!("Widget\n  {line}\n");
+            let offset = at(&src, line) + line.len();
+            assert_eq!(labels(&complete_at(&src, offset)), *values, "{line}");
+        }
+    }
+
+    #[test]
     fn an_unverified_property_still_offers_no_values() {
         // `min-width` is a known catalog property but carries no audited value kind: it must not
         // spuriously gain a completion set.
