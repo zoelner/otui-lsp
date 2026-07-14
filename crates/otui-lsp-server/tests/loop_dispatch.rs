@@ -18,9 +18,9 @@ use lsp_types::{
     CompletionClientCapabilities, CompletionItemCapability, CompletionParams, CompletionResponse,
     DiagnosticSeverity, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, Documentation, FileChangeType,
-    FileEvent, HoverParams, InitializeParams, InitializedParams, InlayHintParams, Location,
-    MarkupKind, NumberOrString, PartialResultParams, Position, PublishDiagnosticsParams,
-    ReferenceContext, ReferenceParams, TextDocumentClientCapabilities,
+    FileEvent, GotoDefinitionResponse, HoverParams, InitializeParams, InitializedParams,
+    InlayHintParams, Location, MarkupKind, NumberOrString, PartialResultParams, Position,
+    PublishDiagnosticsParams, ReferenceContext, ReferenceParams, TextDocumentClientCapabilities,
     TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, Uri, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
     WorkspaceFolder,
@@ -1374,6 +1374,35 @@ fn send_references(
         .map(|v| serde_json::from_value(v).expect("Vec<Location>"))
 }
 
+/// [`send_references`]'s counterpart for `textDocument/definition`.
+fn send_definition(
+    client: &Connection,
+    id: i32,
+    uri: &Uri,
+    position: Position,
+) -> Option<GotoDefinitionResponse> {
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(id),
+            "textDocument/definition".to_owned(),
+            lsp_types::GotoDefinitionParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position,
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            },
+        )))
+        .expect("send definition");
+    let resp = recv_response(client, &RequestId::from(id));
+    assert!(resp.error.is_none(), "definition errored: {resp:?}");
+    resp.result
+        .filter(|v| !v.is_null())
+        .map(|v| serde_json::from_value(v).expect("GotoDefinitionResponse"))
+}
+
 /// Poll `textDocument/references` for `uri`/`position` until `accept` returns `true` for a `Some`
 /// result, or the overall [`RECV_TIMEOUT`] deadline elapses — whichever comes first.
 ///
@@ -2192,6 +2221,291 @@ fn reverse_references_resolve_a_set_id_call_in_the_same_lua_document() {
     );
 
     shutdown_and_exit(&client, server_thread, 3);
+}
+
+/// `textDocument/definition` originating in a `.lua` document (spec §5.3): the cursor on a
+/// `controller.ui.<id>` dotted-chain segment must jump to the `id:` declaration in the paired
+/// `.otui`. Exercises `Backend::lua_definition` / `resolve_lua_id_declarations` — the only NEW
+/// surface this node adds; the resolution pipeline itself is exactly what
+/// `reverse_references_honor_include_declaration` already exercises via `textDocument/references`.
+#[test]
+fn lua_definition_resolves_a_dot_ui_chain_segment_to_the_paired_otui_declaration() {
+    let panel_otui_src = "Panel < UIWidget\n  Button\n    id: closeButton\n";
+    let panel_otui_uri = Uri::from_str("file:///scratch/lua-def/panel.otui").expect("uri");
+    let panel_lua_uri = Uri::from_str("file:///scratch/lua-def/panel.lua").expect("uri");
+    let panel_lua_src = "function onCreate(controller)\n  \
+                          controller.ui.closeButton:setText('x')\nend\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: panel_otui_uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: panel_otui_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen otui");
+    let _ = recv_diagnostics(&client, &panel_otui_uri);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: panel_lua_uri.clone(),
+                    language_id: "lua".to_owned(),
+                    version: 1,
+                    text: panel_lua_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen lua");
+    let _ = recv_diagnostics(&client, &panel_lua_uri);
+
+    let resp = send_definition(
+        &client,
+        2,
+        &panel_lua_uri,
+        position_of(panel_lua_src, "closeButton"),
+    )
+    .expect("definition present");
+    match resp {
+        GotoDefinitionResponse::Scalar(loc) => {
+            assert_eq!(loc.uri, panel_otui_uri);
+            assert_eq!(loc.range, range_of(panel_otui_src, "closeButton"));
+        }
+        other => panic!("expected a single Scalar location: {other:?}"),
+    }
+
+    shutdown_and_exit(&client, server_thread, 3);
+}
+
+/// [`lua_definition_resolves_a_dot_ui_chain_segment_to_the_paired_otui_declaration`]'s counterpart
+/// for the `getChildById('<id>')` string-argument shape, and for a same-file runtime `setId(...)`
+/// declaration — mirrors `reverse_references_resolve_a_set_id_call_in_the_same_lua_document`'s
+/// fixture exactly (an id with NO `.otui id:` at all, declared purely via `setId` in Lua), proving
+/// go-to-definition covers that source too, not just the `.otui` one.
+#[test]
+fn lua_definition_resolves_a_get_child_by_id_call_against_a_same_file_set_id() {
+    let panel_otui_src = "Panel < UIWidget\n  Button\n    id: closeButton\n";
+    let panel_otui_uri = Uri::from_str("file:///scratch/lua-def-setid/panel.otui").expect("uri");
+    let panel_lua_uri = Uri::from_str("file:///scratch/lua-def-setid/panel.lua").expect("uri");
+    let panel_lua_src = "function onCreate(w)\n  \
+                          local button = g_ui.createWidget('Button', w)\n  \
+                          button:setId('bidButton')\n  \
+                          local btn = w:getChildById('bidButton')\nend\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: panel_otui_uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: panel_otui_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen otui");
+    let _ = recv_diagnostics(&client, &panel_otui_uri);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: panel_lua_uri.clone(),
+                    language_id: "lua".to_owned(),
+                    version: 1,
+                    text: panel_lua_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen lua");
+    let _ = recv_diagnostics(&client, &panel_lua_uri);
+
+    // Cursor on the getChildById('bidButton') reference — the LAST "bidButton" occurrence (the
+    // FIRST is the setId call itself, its own definition site).
+    let resp = send_definition(
+        &client,
+        2,
+        &panel_lua_uri,
+        position_of_last(panel_lua_src, "bidButton"),
+    )
+    .expect("definition present");
+    match resp {
+        GotoDefinitionResponse::Scalar(loc) => {
+            assert_eq!(loc.uri, panel_lua_uri);
+            assert_eq!(
+                loc.range,
+                range_of(panel_lua_src, "bidButton"),
+                "must land on the setId literal (the FIRST occurrence — its own definition site)"
+            );
+        }
+        other => panic!("expected a single Scalar location: {other:?}"),
+    }
+
+    shutdown_and_exit(&client, server_thread, 3);
+}
+
+/// A `getChildById` call whose id has no `.otui` declaration anywhere and no same-file `setId` must
+/// resolve to nothing — `textDocument/definition`'s "no target" answer is an absent result, exactly
+/// like a native base in the OTUI-local case ([`resolve_base_definition`]).
+#[test]
+fn lua_definition_for_an_unresolved_id_is_none() {
+    let panel_otui_src = "Panel < UIWidget\n  Button\n    id: closeButton\n";
+    let panel_otui_uri = Uri::from_str("file:///scratch/lua-def-missing/panel.otui").expect("uri");
+    let panel_lua_uri = Uri::from_str("file:///scratch/lua-def-missing/panel.lua").expect("uri");
+    let panel_lua_src = "function onCreate(w)\n  local btn = w:getChildById('doesNotExist')\nend\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: panel_otui_uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: panel_otui_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen otui");
+    let _ = recv_diagnostics(&client, &panel_otui_uri);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: panel_lua_uri.clone(),
+                    language_id: "lua".to_owned(),
+                    version: 1,
+                    text: panel_lua_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen lua");
+    let _ = recv_diagnostics(&client, &panel_lua_uri);
+
+    let resp = send_definition(
+        &client,
+        2,
+        &panel_lua_uri,
+        position_of(panel_lua_src, "doesNotExist"),
+    );
+    assert!(
+        resp.is_none(),
+        "an id with no .otui declaration and no local setId must resolve to nothing: {resp:?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 3);
+}
+
+/// Regression: extracting `resolve_lua_id_declarations` out of `lua_references` must not change
+/// `textDocument/references`'s own answer. Re-runs
+/// `reverse_references_honor_include_declaration`'s exact fixture and both `include_declaration`
+/// values, asserting the SAME two-location result the pre-refactor implementation produced.
+#[test]
+fn references_are_unchanged_by_the_lua_definition_refactor() {
+    let panel_otui_src = "Panel < UIWidget\n  Button\n    id: closeButton\n";
+    let panel_otui_uri =
+        Uri::from_str("file:///scratch/lua-def-regression/panel.otui").expect("uri");
+    let panel_lua_uri = Uri::from_str("file:///scratch/lua-def-regression/panel.lua").expect("uri");
+    let panel_lua_src = "function onCreate(w)\n  \
+                          button:setId('closeButton')\n  \
+                          local btn = w:getChildById('closeButton')\nend\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: panel_otui_uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: panel_otui_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen otui");
+    let _ = recv_diagnostics(&client, &panel_otui_uri);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: panel_lua_uri.clone(),
+                    language_id: "lua".to_owned(),
+                    version: 1,
+                    text: panel_lua_src.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen lua");
+    let _ = recv_diagnostics(&client, &panel_lua_uri);
+
+    let cursor = position_of_last(panel_lua_src, "closeButton");
+
+    let excluded =
+        send_references(&client, 2, &panel_lua_uri, cursor, false).expect("references present");
+    assert!(
+        excluded.is_empty(),
+        "include_declaration = false must still suppress both declaration sites: {excluded:#?}"
+    );
+
+    let included =
+        send_references(&client, 3, &panel_lua_uri, cursor, true).expect("references present");
+    assert_eq!(
+        included.len(),
+        2,
+        "include_declaration = true must surface both the .otui id: declaration and the setId \
+         declaration: {included:#?}"
+    );
+    assert!(
+        included
+            .iter()
+            .any(|l| l.uri == panel_otui_uri && l.range == range_of(panel_otui_src, "closeButton")),
+        "missing the .otui id: declaration: {included:#?}"
+    );
+    assert!(
+        included
+            .iter()
+            .any(|l| l.uri == panel_lua_uri && l.range == range_of(panel_lua_src, "closeButton")),
+        "missing the setId declaration site (the FIRST occurrence, its own definition): {included:#?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 4);
 }
 
 /// The forward direction of the bridge must see an **unsaved** edit to an open `.lua` buffer — not
