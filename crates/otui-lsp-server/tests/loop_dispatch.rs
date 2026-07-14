@@ -360,6 +360,68 @@ fn memory_connection_hover_shows_the_full_multi_hop_inheritance_chain() {
     shutdown_and_exit(&client, server_thread, 3);
 }
 
+/// Hovering a **per-widget** property key — one the global catalog does not know, but the enclosing
+/// widget's resolved ancestry declares (here, `placeholder`, native `UITextEdit`'s per-widget style
+/// tag) — must still return a non-empty hover, naming the widget it resolved against.
+#[test]
+fn memory_connection_hover_on_a_per_widget_property_describes_it() {
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+
+    client_handshake(&client);
+
+    let uri = Uri::from_str("file:///scratch/textedit.otui").expect("uri");
+    let text = "TextEdit < UITextEdit\nSearchBox < TextEdit\n  placeholder: Search...\n".to_owned();
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: text.clone(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+
+    // One character INTO the `placeholder` token, not its exact start: `descendant_for_byte_range`
+    // resolves a zero-width range sitting exactly at a token boundary to an ancestor, not the leaf
+    // itself (the same reason the unit-level helpers offset `+ 1` past the needle's start).
+    let mut position = position_of(&text, "placeholder");
+    position.character += 1;
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(2),
+            "textDocument/hover".to_owned(),
+            HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position,
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            },
+        )))
+        .expect("send hover");
+    let hover_resp = recv_response(&client, &RequestId::from(2));
+    assert!(hover_resp.error.is_none(), "hover errored: {hover_resp:?}");
+    let value = hover_markdown(&hover_resp);
+
+    assert!(value.contains("`placeholder`"), "{value}");
+    // The enclosing widget is `SearchBox`'s style_header, whose `base` field is `TextEdit` — the
+    // ancestry-resolution entry point mirrors `completion::enclosing_widget_type`'s own choice (a
+    // `style_header`'s enclosing type is its declared base, not its own name).
+    assert!(
+        value.contains("property of") && value.contains("TextEdit"),
+        "expected a widget-aware property hover naming the enclosing widget: {value}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 3);
+}
+
 /// `textDocument/completion` end-to-end, with the client advertising Markdown
 /// `documentationFormat`: a completion item for a curated global property (`width`) must come back
 /// with its `documentation` populated as Markdown — the curated one-line note surfaced from

@@ -251,16 +251,24 @@ impl OtuiService {
 
     /// Describe the **property key** under `offset` for hover (spec §5.5): what value the property
     /// expects (color / asset path / a fixed value set / border shorthand / a plain known property),
-    /// derived from the catalog + schema metadata. `None` when the cursor is not on a known property
-    /// key. Pure — needs no workspace index (property meaning is global). The server renders the
-    /// returned [`property_hover::PropertyHover`] into Markdown; see [`property_hover`].
+    /// derived from the catalog + schema metadata; or, when `name` is not a global catalog property,
+    /// whether the enclosing widget's resolved ancestry (across the workspace `styles`/`lua` indexes)
+    /// declares it as a per-widget property (mirroring [`completion`]'s widget-aware completion).
+    /// `None` when the cursor is not on a property key that resolves either way. The server renders
+    /// the returned [`property_hover::PropertyHover`] into Markdown; see [`property_hover`].
+    ///
+    /// Inherent (not on the [`LanguageService`] trait) because the widget-aware branch consumes
+    /// server-owned state (the workspace [`StyleIndex`] and [`LuaWidgetIndex`]), mirroring
+    /// [`style_hover_at`](Self::style_hover_at).
     #[must_use]
     pub fn property_hover_at(
         &self,
         source: &str,
         offset: usize,
+        styles: &StyleIndex,
+        lua: &LuaWidgetIndex,
     ) -> Option<property_hover::PropertyHover> {
-        property_hover::property_hover_at(source, offset)
+        property_hover::property_hover_at(source, offset, styles, lua)
     }
 
     /// Locate the style name the symbol under `offset` resolves to for type navigation
