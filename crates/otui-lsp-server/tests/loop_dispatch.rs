@@ -456,6 +456,74 @@ fn memory_connection_drives_initialize_open_completion_shutdown() {
     shutdown_and_exit(&client, server_thread, 3);
 }
 
+/// `textDocument/completion` at a boolean property's **value** position (right after `enabled:`)
+/// must return exactly `true`/`false`, not the property-key catalog — the N2 boolean-value-completion
+/// slice (`property_hover::PropertyValueKind::Boolean`), exercised end-to-end through the real LSP
+/// request/response loop and its byte-offset <-> UTF-16 `Position` conversion, not just the pure
+/// `otui-core` unit test.
+#[test]
+fn completion_at_a_boolean_property_value_position_offers_true_and_false() {
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    let uri = Uri::from_str("file:///scratch/bool-completion.otui").expect("uri");
+    let text = "Panel < UIWidget\n  enabled:\n";
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: text.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+
+    let position = position_of_last(text, "enabled:");
+    let position = Position::new(position.line, position.character + "enabled:".len() as u32);
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(2),
+            "textDocument/completion".to_owned(),
+            CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position,
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+                context: None,
+            },
+        )))
+        .expect("send completion");
+    let completion_resp = recv_response(&client, &RequestId::from(2));
+    assert!(
+        completion_resp.error.is_none(),
+        "completion errored: {completion_resp:?}"
+    );
+    let completion_value = completion_resp.result.expect("completion result present");
+    let response: CompletionResponse =
+        serde_json::from_value(completion_value).expect("deserialize CompletionResponse");
+    let items = match response {
+        CompletionResponse::Array(items) => items,
+        CompletionResponse::List(list) => list.items,
+    };
+    let labels: std::collections::BTreeSet<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        std::collections::BTreeSet::from(["true", "false"]),
+        "expected exactly true/false, got {labels:?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 3);
+}
+
 /// A standalone `exit` notification (no preceding `shutdown`) must terminate the loop and be
 /// classified as an abnormal exit (process status 1), never silently dropped.
 #[test]
