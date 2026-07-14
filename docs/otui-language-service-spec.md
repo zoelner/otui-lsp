@@ -79,9 +79,23 @@ Every widget with an `id:` becomes a literal field on its parent, in the C++ eng
 (`UIWidget::setId`, which maintains a `m_childrenById` map) and in Lua. This is the basis for:
 
 - Dotted Lua access: `controller.ui.someId.childId` — every identifier after `.ui.` is an `id:`
-  value from the paired `.otui` file's tree (pairing convention: module directory name ==
-  `.otui` base filename, e.g. `modules/game_inventory/inventory.otui` ↔
-  `modules/game_inventory/inventory.lua`).
+  value from the paired `.otui` file's tree. Pairing is resolved by two mechanisms, not one:
+  1. **Same-directory/same-stem fast path** — `module_dir/name.lua` ↔ `module_dir/name.otui`
+     (e.g. `modules/game_inventory/inventory.otui` ↔ `modules/game_inventory/inventory.lua`). This
+     is a convenience heuristic only, and is **not** a general rule: the module directory name need
+     not match either file's stem, and a module can load more than one `.otui` (or none). A real
+     counterexample from the corpus: `modules/game_wheel/wheel.lua` loads `styles/wheelMenu`,
+     `styles/gemMenu`, and several more via `g_ui.loadUI(...)` — relocated, oddly-named `.otui`
+     files under one module, none matching the `wheel` stem.
+  2. **The `loadUI`/`displayUI`/`importStyle` load-string association — authoritative.** A
+     controller's Lua source is scanned for a `g_ui.loadUI(...)`/`displayUI(...)`/`importStyle(...)`
+     call; its string argument is resolved as a filename **relative to the calling file's own
+     directory** (or, if `/`-rooted, against the detected client root's `modules/` overlay) to find
+     the actual `.otui` it loads. This is the general case and subsumes the fast path — a module
+     with several controllers, or a controller loading an oddly-named/relocated `.otui`, is only
+     ever paired correctly through this mechanism. Not yet scanned: `setUI(...)` (the corelib
+     `Controller` wrapper that internally calls `g_ui.loadUI`) — a controller whose `setUI` name
+     differs from a same-stem `.otui` is a known pairing-coverage gap, falling back to the fast path.
 - `widget:getChildById('id')` / `widget:recursiveGetChildById('id')`.
 - `anchors.<edge>: <id>.<edge>` targets (2.4).
 
@@ -275,7 +289,7 @@ source location" — distinct from "unresolved" (a diagnostic, §4) and from "re
 |---|---|
 | A `Name < Base` header's base-name token | The workspace style index (5.2); `UI*` → built-in, no jump |
 | An `anchors.<edge>` target id | The current file's `id:` tree; `parent`/`next`/`prev` are pseudo-targets |
-| A Lua `self.ui.<id>...` dotted-chain segment, or a `getChildById('<id>')` string argument | The paired `.otui` file's `id:` tree (2.3) |
+| A Lua `self.ui.<id>...` dotted-chain segment, or a `getChildById('<id>')`/`recursiveGetChildById('<id>')` string argument | The paired `.otui` file's `id:` tree (2.3), PLUS any `setId('<id>')` call in that same `.lua` document (a widget id'd purely at runtime, with no `.otui id:` at all) |
 
 ### 5.4 Find-references
 

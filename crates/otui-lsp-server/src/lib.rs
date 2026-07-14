@@ -3899,9 +3899,14 @@ impl Backend {
         let position = params.text_document_position_params.position;
         let encoding = self.encoding();
 
-        // Read the request document's text (unknown document → nothing to resolve; the OTUI-only
-        // language guard applies the same "nothing" to a `.lua` document — go-to-definition for Lua
-        // is a later node, and belongs to `lua-language-server` until then).
+        // Reverse direction: the request document is Lua, not OTUI — branch here rather than
+        // through `otui_document_text` (which is `None` for a `.lua` document by construction; see
+        // its doc comment). Mirrors the same branch in `references` (spec §2.3/§5.3).
+        if self.document_language(&uri) == Language::Lua {
+            return self.lua_definition(&uri, position, encoding);
+        }
+
+        // Read the request document's text (unknown document → nothing to resolve).
         let text = self.otui_document_text(&uri)?;
 
         // Map the cursor Position to a byte offset, then classify the token under it.
@@ -4153,14 +4158,51 @@ impl Backend {
         include_declaration: bool,
         encoding: PositionEncoding,
     ) -> Option<Vec<Location>> {
+        // `references` treats a declaration site as one more reference, gated the same as the
+        // OTUI-local `Id` case (see this method's doc comment on why `false` legitimately yields an
+        // empty `Vec`, not `None`). Still probe for a recognized ref shape first, so a cursor NOT on
+        // one keeps returning `None` regardless of the flag.
+        if !include_declaration {
+            let text = self.lua_text_for(lua_uri)?;
+            let offset = LineIndex::new(&text).offset_at(position, encoding);
+            otui_core::lua_refs::ref_at(&text, offset)?;
+            return Some(Vec::new());
+        }
+        self.resolve_lua_id_declarations(lua_uri, position, encoding)
+    }
+
+    /// The shared core of the reverse OTUI↔Lua bridge (spec §5.3/§5.4): the cursor sits in `lua_uri`
+    /// on a `getChildById`/`recursiveGetChildById`/`.ui.` token — resolve it to every declaration
+    /// site of that id, from both sources [`lua_references`](Self::lua_references)'s doc comment
+    /// describes:
+    ///
+    /// 1. The `id:` declaration site(s) in every `.otui` file associated with `lua_uri`
+    ///    ([`Backend::associated_uris`]; spec §2.3), including any inherited style body that
+    ///    declares it ([`visible_ids`]).
+    /// 2. Every `setId("id")` call in this same `.lua` document ([`lua_refs::scan_id_defs`]) — the
+    ///    id's real, runtime declaration site: a widget created and id'd purely in Lua has no
+    ///    `.otui id:` at all.
+    ///
+    /// Both candidate sources are offered TOGETHER, never one suppressing the other (see
+    /// [`lua_references`](Self::lua_references)'s original doc comment for the full rationale —
+    /// unchanged by this extraction). `None` when the cursor is not on any recognized reference form
+    /// ([`lua_refs::ref_at`]); once a ref IS found, this always returns `Some` (an empty `Vec` is a
+    /// legitimate "no declaration found").
+    ///
+    /// Shared, unconditionally, by both [`lua_references`](Self::lua_references) (gated by
+    /// `include_declaration`) and [`lua_definition`](Self::lua_definition) (never gated —
+    /// go-to-definition always wants the declaration; it has no analogous flag to gate on).
+    fn resolve_lua_id_declarations(
+        &self,
+        lua_uri: &Uri,
+        position: lsp_types::Position,
+        encoding: PositionEncoding,
+    ) -> Option<Vec<Location>> {
         let text = self.lua_text_for(lua_uri)?;
         let offset = LineIndex::new(&text).offset_at(position, encoding);
         let target_ref = otui_core::lua_refs::ref_at(&text, offset)?;
 
         let mut out = Vec::new();
-        if !include_declaration {
-            return Some(out);
-        }
         let documents = self.merged_documents();
         let styles = self.style_index.read().expect("style_index lock poisoned");
         let lua_widgets = self.lua_index.read().expect("lua_index lock poisoned");
@@ -4195,6 +4237,38 @@ impl Backend {
                 .map(|d| convert::location_of(lua_uri.clone(), &text, d.span, encoding)),
         );
         Some(out)
+    }
+
+    /// The reverse half of the OTUI↔Lua bridge for `textDocument/definition` (spec §5.3): the cursor
+    /// sits in a `.lua` document on a `self.ui.<id>`/`controller.ui.<id>` dotted-chain segment, or on
+    /// a `getChildById('<id>')`/`recursiveGetChildById('<id>')` string argument — jump to every
+    /// declaration site [`resolve_lua_id_declarations`](Self::resolve_lua_id_declarations) finds
+    /// (both the paired `.otui` `id:` and any same-file runtime `setId(...)`), unconditionally —
+    /// go-to-definition has no `include_declaration` flag to gate on; resolving to a declaration is
+    /// the entire point.
+    ///
+    /// `None` when the cursor is not on a recognized ref shape, or the ref resolves to zero
+    /// candidates (no `.otui` id and no local `setId`) — the same "nothing to jump to" answer
+    /// [`resolve_base_definition`] gives for a native base with no user definition. One candidate is a
+    /// `Scalar`, several are an `Array` — deliberately not collapsed to a single "best" hit: the same
+    /// id can legitimately be declared in more than one widget/file (recursive vs direct
+    /// `getChildById` are NOT distinguished either — both resolve to any matching declaration, per
+    /// [`visible_ids`]'s over-approximation), and definition here is navigation, not a uniqueness
+    /// claim (mirrors [`resolve_base_definition`]'s duplicate-def handling).
+    fn lua_definition(
+        &self,
+        lua_uri: &Uri,
+        position: lsp_types::Position,
+        encoding: PositionEncoding,
+    ) -> Option<GotoDefinitionResponse> {
+        let mut locations = self.resolve_lua_id_declarations(lua_uri, position, encoding)?;
+        match locations.len() {
+            0 => None,
+            1 => Some(GotoDefinitionResponse::Scalar(
+                locations.pop().expect("len 1"),
+            )),
+            _ => Some(GotoDefinitionResponse::Array(locations)),
+        }
     }
 
     fn document_highlight(
