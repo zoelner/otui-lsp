@@ -1,14 +1,21 @@
 //! Go-to-definition locators (spec §5.3): pure byte-offset cursor queries over the CST.
 //!
-//! This module answers "what is the cursor sitting on?" for the navigation features. It does **not**
-//! resolve anything — resolution against the workspace [`StyleIndex`](crate::style_index::StyleIndex)
-//! is the server's job. It only classifies the token under a byte offset and reports its text + span.
+//! This module answers "what is the cursor sitting on?" for the navigation features. Most of it does
+//! **not** resolve anything — resolution against the workspace
+//! [`StyleIndex`](crate::style_index::StyleIndex) is the server's job, and these functions only
+//! classify the token under a byte offset and report its text + span. [`resolve_anchor_target`] is the
+//! one exception: an anchor target resolves entirely within the **current document** (direct siblings
+//! only — never cross-file), so its full resolution is pure and lives here too.
 //!
-//! ## Scope (deliberately narrow)
+//! ## Scope
 //!
-//! The only reference kind this node locates is the **base** of a top-level `Name < Base` header
-//! (spec §5.3, first row): the inheritance target that resolves against the global style namespace.
-//! `id:`/anchor navigation and Lua cross-references are later nodes and are not handled here.
+//! * the **base** of a top-level `Name < Base` header (spec §5.3, first row) — [`base_reference_at`]:
+//!   the inheritance target that resolves against the global style namespace (still the server's job);
+//! * the **id** of an `id:` declaration or a dotted `<id>.edge` anchor reference — [`id_at`];
+//! * an **anchor target** (dotted or the bare `fill:`/`centerIn:` shorthand) — [`resolve_anchor_target`]:
+//!   resolved, in full, against the owner's direct siblings (spec §5.3/§5.5).
+//!
+//! Lua cross-references are a later/separate node and are not handled here.
 //!
 //! Everything here is byte-offset based. No I/O, no `lsp-types`.
 
@@ -244,6 +251,133 @@ fn anchor_id_ref(anchor_target: Node<'_>, source: &str, offset: usize) -> Option
     }
 }
 
+/// How an anchor **target** resolves (spec §5.3 go-to-definition / §5.5 hover), from
+/// [`resolve_anchor_target`]. The engine rule ( `UIAnchor::getHookedWidget`,
+/// `uianchorlayout.cpp:26-42`): the magic keywords `parent`/`next`/`prev` resolve to the parent widget
+/// / the next or previous sibling in source order; anything else is looked up by
+/// `parentWidget->getChildById(id)`, a single non-recursive lookup (`uiwidget.cpp:1487-1493`) over the
+/// owner's parent's **direct children only** — i.e. the owner's direct siblings. An ancestor or any
+/// other non-sibling id is not a parse error; the lookup returns null and the anchor silently becomes
+/// a runtime no-op (`uianchorlayout.cpp:252-254`), never a diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnchorTargetResolution {
+    /// The target id names exactly one of the anchor owner's **direct sibling** widgets (last-wins
+    /// when more than one shares the id, mirroring the engine's single-valued `m_childrenById` map:
+    /// each `addChild` overwrites any earlier entry for the same id).
+    Sibling {
+        /// The target id (the sibling's declared `id:` value).
+        id: String,
+        /// The sibling's widget kind: its `container` tag, or its `style_header` base (spec §5.5 —
+        /// the same "what type is this widget" question [`widget_resolve::enclosing_widget_type`]
+        /// answers elsewhere).
+        kind: String,
+        /// The byte span of the sibling's own `id:` value — the go-to-definition jump target.
+        id_decl_span: ByteSpan,
+        /// The byte span of the target id token the cursor was on.
+        target_span: ByteSpan,
+    },
+    /// The target is one of the magic pseudo-targets (`parent` / `next` / `prev`) — not a user id, so
+    /// there is nothing to jump to; hover explains what the keyword means instead.
+    Magic {
+        /// The magic keyword (`parent`, `next`, or `prev`).
+        keyword: String,
+        /// The byte span of the target id token the cursor was on.
+        target_span: ByteSpan,
+    },
+    /// The target id is not a magic keyword and does not name any direct sibling — an ancestor's id,
+    /// a typo, or an id declared elsewhere entirely. The engine's lookup would return null and the
+    /// anchor silently fails to resolve; this is never a diagnostic (spec §4/§5.3), just "not found".
+    Unresolved {
+        /// The target id text (unresolved).
+        id: String,
+        /// The byte span of the target id token the cursor was on.
+        target_span: ByteSpan,
+    },
+}
+
+/// Resolve the anchor **target** under `offset` — the id/magic-keyword portion of an
+/// `anchors.<edge>: <target>` value, dotted (`<id>.edge`) or bare (the whole `anchors.fill:`/
+/// `anchors.centerIn:` shorthand value, which carries no `.edge` suffix of its own) — against the
+/// anchor owner's direct siblings (spec §5.3 go-to-definition, §5.5 hover). `None` when `offset` is
+/// not on a target token at all (mirrors [`id_at`]'s boundary convention: a hit on the `.edge` suffix
+/// is not a target-id hit).
+///
+/// Deliberately **not** built on [`references::id_occurrences`](crate::references::id_occurrences):
+/// that scan is document-wide, first-declaration-wins, and would happily resolve an ancestor's or an
+/// unrelated widget's id — exactly the false positive the engine's direct-children-only
+/// `getChildById` lookup never produces (see [`AnchorTargetResolution`]'s doc for the citation).
+/// Scoping to direct siblings only is delegated to [`completion::anchor_owner_widget`] and
+/// [`completion::direct_sibling_widgets`] — the identical CST walk completion's own anchor-target
+/// suggestions already use, so the two features can never disagree on what counts as "in scope".
+#[must_use]
+pub fn resolve_anchor_target(source: &str, offset: usize) -> Option<AnchorTargetResolution> {
+    let tree = SyntaxTree::parse(source)?;
+    let root = tree.root();
+    let (prefix, target_span) = find_anchor_target_prefix_at(root, source, offset)?;
+
+    if crate::schema::is_magic_anchor_target(&prefix) {
+        return Some(AnchorTargetResolution::Magic {
+            keyword: prefix,
+            target_span,
+        });
+    }
+
+    let owner = crate::completion::anchor_owner_widget(root, offset);
+    let mut resolved = None;
+    if let Some(owner) = owner {
+        // Last sibling wins on a duplicate id, mirroring the engine's single-valued `m_childrenById`
+        // map: each later `addChild` overwrites any earlier entry under the same id.
+        for sibling in crate::completion::direct_sibling_widgets(owner) {
+            if let Some((id, id_decl_span)) = crate::completion::widget_id_ref(sibling, source)
+                && id == prefix
+            {
+                let kind = crate::widget_resolve::enclosing_widget_type(sibling, source, None)
+                    .unwrap_or_else(|| "widget".to_owned());
+                resolved = Some(AnchorTargetResolution::Sibling {
+                    id,
+                    kind,
+                    id_decl_span,
+                    target_span,
+                });
+            }
+        }
+    }
+
+    Some(resolved.unwrap_or(AnchorTargetResolution::Unresolved {
+        id: prefix,
+        target_span,
+    }))
+}
+
+/// Depth-first search for the `anchor_target` node whose target's **prefix** — the id/magic-keyword
+/// portion before any `.edge` suffix, or the whole token when there is no dot (the bare
+/// `anchors.fill:`/`anchors.centerIn:` shorthand) — contains `offset`. Returns the prefix text and its
+/// own byte span (dot-exclusive); a hit on the `.edge` suffix itself is not a match.
+fn find_anchor_target_prefix_at(
+    node: Node<'_>,
+    source: &str,
+    offset: usize,
+) -> Option<(String, ByteSpan)> {
+    if node.kind() == "anchor_target" {
+        let target = node.child_by_field_name("target")?;
+        let span = SyntaxTree::span_of(target);
+        let text = &source[span.start..span.end];
+        let prefix_end = text.find('.').map_or(span.end, |dot| span.start + dot);
+        if span.start <= offset && offset < prefix_end {
+            let prefix = &text[..prefix_end - span.start];
+            return Some((prefix.to_owned(), ByteSpan::new(span.start, prefix_end)));
+        }
+        return None;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(hit) = find_anchor_target_prefix_at(child, source, offset) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,5 +568,157 @@ mod tests {
         let src = "MainWindow < UIWindow\n";
         assert!(id_at(src, at(src, "UIWindow")).is_none());
         assert!(id_at("", 0).is_none());
+    }
+
+    #[test]
+    fn resolve_anchor_target_dotted_sibling_resolves_to_its_kind_and_id_span() {
+        let src = "Outer < UIWidget\n  Header < UILabel\n    id: header\n  Body < UIWidget\n    anchors.top: header.bottom\n";
+        let got = resolve_anchor_target(src, at(src, "header.bottom")).expect("hit");
+        let AnchorTargetResolution::Sibling {
+            id,
+            kind,
+            id_decl_span,
+            target_span,
+        } = got
+        else {
+            panic!("expected Sibling, got {got:?}");
+        };
+        assert_eq!(id, "header");
+        assert_eq!(kind, "UILabel");
+        // `id_decl_span` points at the sibling's own `id: header` value, not the anchor target.
+        assert_eq!(&src[id_decl_span.start..id_decl_span.end], "header");
+        assert_eq!(
+            id_decl_span,
+            ByteSpan::new(at(src, "id: header") + 4, at(src, "id: header") + 10)
+        );
+        assert_eq!(&src[target_span.start..target_span.end], "header");
+    }
+
+    #[test]
+    fn resolve_anchor_target_bare_fill_shorthand_resolves_the_sibling() {
+        // The bare `fill:`/`centerIn:` shorthand target carries no `.edge` suffix at all — `id_at`
+        // does not recognize this shape, but the resolver must.
+        let src = "Outer < UIWidget\n  Header < UILabel\n    id: header\n  Body < UIWidget\n    anchors.fill: header\n";
+        // The target `header` (not the earlier `id: header` declaration) is the last occurrence.
+        let got = resolve_anchor_target(src, src.rfind("header").expect("present")).expect("hit");
+        match got {
+            AnchorTargetResolution::Sibling { id, kind, .. } => {
+                assert_eq!(id, "header");
+                assert_eq!(kind, "UILabel");
+            }
+            other => panic!("expected Sibling, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_anchor_target_bare_center_in_shorthand_resolves_the_sibling() {
+        let src = "Outer < UIWidget\n  Header < UILabel\n    id: header\n  Body < UIWidget\n    anchors.centerIn: header\n";
+        let got = resolve_anchor_target(src, src.rfind("header").expect("present")).expect("hit");
+        assert!(matches!(got, AnchorTargetResolution::Sibling { .. }));
+    }
+
+    #[test]
+    fn resolve_anchor_target_bare_magic_keyword_is_magic() {
+        let src = "Outer < UIWidget\n  Body < UIWidget\n    anchors.fill: parent\n";
+        let got = resolve_anchor_target(src, at(src, "parent")).expect("hit");
+        match got {
+            AnchorTargetResolution::Magic {
+                keyword,
+                target_span,
+            } => {
+                assert_eq!(keyword, "parent");
+                assert_eq!(&src[target_span.start..target_span.end], "parent");
+            }
+            other => panic!("expected Magic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_anchor_target_dotted_magic_keyword_is_magic() {
+        // `parent.bottom` — the magic keyword can carry a dotted edge too.
+        let src = "Outer < UIWidget\n  Body < UIWidget\n    anchors.top: parent.bottom\n";
+        let got = resolve_anchor_target(src, at(src, "parent.bottom")).expect("hit");
+        assert!(
+            matches!(got, AnchorTargetResolution::Magic { keyword, .. } if keyword == "parent")
+        );
+    }
+
+    #[test]
+    fn resolve_anchor_target_next_and_prev_are_magic_too() {
+        let src = "Outer < UIWidget\n  A < UIWidget\n    anchors.top: prev.bottom\n  B < UIWidget\n    anchors.top: next.bottom\n";
+        assert!(matches!(
+            resolve_anchor_target(src, at(src, "prev.bottom")),
+            Some(AnchorTargetResolution::Magic { .. })
+        ));
+        assert!(matches!(
+            resolve_anchor_target(src, at(src, "next.bottom")),
+            Some(AnchorTargetResolution::Magic { .. })
+        ));
+    }
+
+    #[test]
+    fn resolve_anchor_target_ancestor_id_is_unresolved_not_a_sibling() {
+        // `outer` is the *ancestor*'s own id, not a sibling of `Body` — `getChildById` only ever
+        // searches direct children, so this can never resolve at runtime either.
+        let src = "Outer < UIWidget\n  id: outer\n  Body < UIWidget\n    anchors.fill: outer\n";
+        let got = resolve_anchor_target(src, src.rfind("outer").expect("present")).expect("hit");
+        match got {
+            AnchorTargetResolution::Unresolved { id, target_span } => {
+                assert_eq!(id, "outer");
+                assert_eq!(&src[target_span.start..target_span.end], "outer");
+            }
+            other => panic!("expected Unresolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_anchor_target_own_id_is_unresolved_not_its_own_sibling() {
+        // A widget anchoring to its own id: it is excluded from its own sibling set.
+        let src = "Outer < UIWidget\n  Body < UIWidget\n    id: body\n    anchors.fill: body\n";
+        let got = resolve_anchor_target(src, src.rfind("body").expect("present")).expect("hit");
+        assert!(matches!(got, AnchorTargetResolution::Unresolved { .. }));
+    }
+
+    #[test]
+    fn resolve_anchor_target_unknown_id_is_unresolved() {
+        let src = "Outer < UIWidget\n  Body < UIWidget\n    anchors.fill: nosuchwidget\n";
+        let got = resolve_anchor_target(src, at(src, "nosuchwidget")).expect("hit");
+        assert!(
+            matches!(got, AnchorTargetResolution::Unresolved { id, .. } if id == "nosuchwidget")
+        );
+    }
+
+    #[test]
+    fn resolve_anchor_target_duplicate_sibling_id_last_one_wins() {
+        // Mirrors the engine's single-valued `m_childrenById` map: each later `addChild` overwrites
+        // the earlier entry under the same id.
+        let src = "Outer < UIWidget\n  A < UILabel\n    id: dup\n  B < UIButton\n    id: dup\n  Body < UIWidget\n    anchors.fill: dup\n";
+        let got = resolve_anchor_target(src, src.rfind("dup").expect("present")).expect("hit");
+        match got {
+            AnchorTargetResolution::Sibling { kind, .. } => assert_eq!(kind, "UIButton"),
+            other => panic!("expected Sibling, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_anchor_target_edge_suffix_hit_is_none() {
+        let src = "Outer < UIWidget\n  Header < UILabel\n    id: header\n  Body < UIWidget\n    anchors.top: header.bottom\n";
+        assert!(resolve_anchor_target(src, at(src, "bottom")).is_none());
+    }
+
+    #[test]
+    fn resolve_anchor_target_off_any_target_is_none() {
+        let src = "Outer < UIWidget\n  id: main\n";
+        assert!(resolve_anchor_target(src, at(src, "main")).is_none());
+        assert!(resolve_anchor_target("", 0).is_none());
+    }
+
+    #[test]
+    fn resolve_anchor_target_container_sibling_kind_is_its_tag() {
+        // A bare-tag (`container`) sibling's kind is its own tag, not a `Name < Base` header.
+        let src =
+            "Outer < UIWidget\n  Button\n    id: btn\n  Body < UIWidget\n    anchors.fill: btn\n";
+        let got = resolve_anchor_target(src, src.rfind("btn").expect("present")).expect("hit");
+        assert!(matches!(got, AnchorTargetResolution::Sibling { kind, .. } if kind == "Button"));
     }
 }

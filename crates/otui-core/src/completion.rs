@@ -799,36 +799,13 @@ fn sibling_anchor_ids(source: &str, offset: usize) -> Vec<String> {
         return Vec::new();
     };
     let root = tree.root();
-    let lo = offset.saturating_sub(1);
-    let Some(mut node) = root.descendant_for_byte_range(lo, offset) else {
+    let Some(owner) = anchor_owner_widget(root, offset) else {
         return Vec::new();
     };
-    // Walk up to the widget node that owns the anchor line the cursor sits on.
-    let owner = loop {
-        if is_widget(node) {
-            break node;
-        }
-        match node.parent() {
-            Some(parent) => node = parent,
-            None => return Vec::new(),
-        }
-    };
-
-    // In-scope widgets: the owner's sibling widgets (same parent, excluding the owner itself).
-    let mut scope: Vec<Node> = Vec::new();
-    if let Some(parent) = owner.parent() {
-        let mut cursor = parent.walk();
-        for sibling in parent.named_children(&mut cursor) {
-            if is_widget(sibling) && sibling.id() != owner.id() {
-                scope.push(sibling);
-            }
-        }
-    }
 
     // Source order, de-duplicated by id text.
-    scope.sort_by_key(Node::start_byte);
     let mut ids = Vec::new();
-    for widget in scope {
+    for widget in direct_sibling_widgets(owner) {
         if let Some(id) = widget_id(widget, source)
             && !ids.contains(&id)
         {
@@ -838,24 +815,73 @@ fn sibling_anchor_ids(source: &str, offset: usize) -> Vec<String> {
     ids
 }
 
+/// The widget node that owns the anchor line under `offset`: walk up from the nearest node to the
+/// nearest `container`/`style_header` ancestor. `None` on a parse failure the caller already handled,
+/// or when no such ancestor exists. Shared by [`sibling_anchor_ids`] (completion) and
+/// [`navigation::resolve_anchor_target`](crate::navigation::resolve_anchor_target) (hover /
+/// go-to-definition) — both ask the identical "which widget does this anchor belong to?" question,
+/// each from its own cursor position on the same `anchors.<edge>:` line.
+pub(crate) fn anchor_owner_widget(root: Node<'_>, offset: usize) -> Option<Node<'_>> {
+    let lo = offset.saturating_sub(1);
+    let mut node = root.descendant_for_byte_range(lo, offset)?;
+    loop {
+        if is_widget(node) {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+/// `owner`'s direct sibling widgets — same parent, excluding `owner` itself — in source order. The
+/// exact in-scope set an anchor target may resolve against (see [`sibling_anchor_ids`]'s engine
+/// citation); shared with
+/// [`navigation::resolve_anchor_target`](crate::navigation::resolve_anchor_target), which additionally
+/// needs each sibling's own widget kind and `id:` span, not just its id text.
+pub(crate) fn direct_sibling_widgets(owner: Node<'_>) -> Vec<Node<'_>> {
+    let mut scope: Vec<Node> = Vec::new();
+    if let Some(parent) = owner.parent() {
+        let mut cursor = parent.walk();
+        for sibling in parent.named_children(&mut cursor) {
+            if is_widget(sibling) && sibling.id() != owner.id() {
+                scope.push(sibling);
+            }
+        }
+    }
+    scope.sort_by_key(Node::start_byte);
+    scope
+}
+
 /// Whether `node` is a widget node (a bare `container` tag or a `Name < Base` `style_header`).
-fn is_widget(node: Node) -> bool {
+pub(crate) fn is_widget(node: Node) -> bool {
     matches!(node.kind(), "container" | "style_header")
 }
 
 /// The `id:` value declared directly on `widget`, if any (its `id_property` child's value text,
 /// trimmed). `None` when the widget declares no id.
-fn widget_id(widget: Node, source: &str) -> Option<String> {
+pub(crate) fn widget_id(widget: Node, source: &str) -> Option<String> {
+    widget_id_ref(widget, source).map(|(id, _)| id)
+}
+
+/// Like [`widget_id`], but also returns the trimmed value's own byte span — the `id:` declaration's
+/// exact location, needed by
+/// [`navigation::resolve_anchor_target`](crate::navigation::resolve_anchor_target) to build a
+/// go-to-definition target. `None` when the widget declares no id.
+pub(crate) fn widget_id_ref(widget: Node, source: &str) -> Option<(String, lang_api::ByteSpan)> {
     let mut cursor = widget.walk();
     for child in widget.named_children(&mut cursor) {
         if child.kind() != "id_property" {
             continue;
         }
         let value = child.child_by_field_name("value")?;
-        let text = source[value.start_byte()..value.end_byte()].trim();
-        if !text.is_empty() {
-            return Some(text.to_owned());
+        let raw_start = value.start_byte();
+        let raw = &source[raw_start..value.end_byte()];
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
         }
+        let start = raw_start + (raw.len() - raw.trim_start().len());
+        let end = start + trimmed.len();
+        return Some((trimmed.to_owned(), lang_api::ByteSpan::new(start, end)));
     }
     None
 }
