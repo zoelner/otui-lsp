@@ -4,12 +4,14 @@
 //!
 //! OTClient's own module loader (`Module::parse`, `src/framework/core/module.cpp`) resolves a
 //! module's `.otui` file(s) not from any naming convention, but from the literal string argument a
-//! controller passes to one of three UI-manager calls:
+//! controller passes to one of three UI-manager calls (plus one indirect fourth, `setUI`, described
+//! below):
 //!
 //! ```lua
 //! g_ui.loadUI('styles/wheelMenu', mainPanel)  -- form 1: load, attach to `mainPanel`
 //! g_ui.displayUI('battle')                    -- form 2: load and show
 //! g_ui.importStyle('style.otui')              -- form 3: import style declarations only
+//! self:setUI('options')                       -- form 4: `Controller:setUI`, see below
 //! ```
 //!
 //! Every one of these resolves its (non-`/`-rooted) argument **relative to the directory of the
@@ -22,10 +24,37 @@
 //! leading `/` instead resolves against the mounted virtual filesystem root — rare in the real
 //! corpus (a handful of complete-literal calls) and left unresolved by the server rather than
 //! guessed at (see `otui-lsp-server`'s `scan_module_dir`). [`scan_ui_loads`] finds every
-//! complete-literal call of the three forms; turning the returned (still-relative) path into an
+//! complete-literal call of all four forms; turning the returned (still-relative) path into an
 //! absolute file — and deciding whether that file actually exists — is server-side work (this crate
 //! does no I/O), done by `otui-lsp-server`'s module-association index alongside
 //! [`crate::otmod::otmod_scripts`] (which finds a module's controllers in the first place).
+//!
+//! ## `Controller:setUI` — a fourth, indirect form
+//!
+//! `modules/modulelib/controller.lua` layers a `Controller:setUI(name, parent)` method
+//! (controller.lua:344-346) on top of `g_ui.loadUI`: it merely records
+//! `self.dataUI = { name = name, parent = parent }`; the actual `g_ui.loadUI` call happens later,
+//! inside `Controller:loadUI` (controller.lua:337), as
+//! `g_ui.loadUI('/' .. self.name .. '/' .. self.dataUI.name, ...)` — a runtime concatenation this
+//! module already declines to follow (see the "complete literal" rule below). Resolved by hand,
+//! `self.name` is the *module's* name, so `setUI('foo')` names `modules/<moduleName>/foo.otui` (the
+//! module name equals its directory name in every real corpus case). Crucially, `setUI`'s effective
+//! path is **module-root-relative** (`/<moduleName>/name`), *not* controller-relative like a bare
+//! `loadUI('name')` — the two only
+//! coincide for a top-level controller. So `setUI` is kept as its own [`UiLoadKind::SetUi`] and the
+//! downstream resolver ([`crate::otmod`] consumers / the server's module scan) resolves it against
+//! the module root, so a nested controller's `setUI('foo')` still names `<moduleRoot>/foo.otui`
+//! rather than `<controllerSubdir>/foo.otui`. This crate stays free of `self.name`/manifest
+//! knowledge (see [`crate::otmod::otmod_scripts`] for where module identity lives) — it only tags
+//! the call kind; the resolver applies the module-root rule. The call is a *method* call
+//! (`controllerVar:setUI(...)`, a colon), so the scan matches the bare word `setUI` **only when the
+//! byte before it is a `:`** (`require_colon_prefix`) — a bare `setUI(`, a field call `foo.setUI(`,
+//! and `g_ui.setUI(` (no such engine function) are all rejected, as is a longer identifier
+//! (`mySetUI`/`setUIState`) by the whole-word boundary. The one other `setUI`-shaped text in the
+//! engine, the method's own definition (`function Controller:setUI(name, parent)`), is naturally
+//! excluded: its first "argument" is the bare identifier `name`, not a string literal, so the same
+//! complete-literal-first-argument rule that already rejects a variable argument rejects it too — no
+//! special-casing needed.
 //!
 //! ## Corpus-derived rules — this is what shapes the scan
 //!
@@ -63,7 +92,7 @@ use crate::lua_refs::{
 };
 use lang_api::ByteSpan;
 
-/// Which of the three UI-load call forms a [`UiLoadRef`] was found as.
+/// Which of the four UI-load call forms a [`UiLoadRef`] was found as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiLoadKind {
     /// `g_ui.loadUI('name'[, parent])` — load a `.otui` file, optionally attaching the result under
@@ -74,6 +103,12 @@ pub enum UiLoadKind {
     /// `g_ui.importStyle('name')` — import a `.otui` file's style declarations only (no widget tree
     /// is created).
     ImportStyle,
+    /// `controllerVar:setUI('name'[, parent])` — `Controller:setUI`, which records the name for a
+    /// later `Controller:loadUI('/' .. self.name .. '/' .. name)` call; see the module doc comment's
+    /// "a fourth, indirect form" section for the engine trace. Unlike [`Self::LoadUi`], its name is
+    /// resolved **against the module root** (`/<moduleName>/name`), not the calling controller's own
+    /// directory — the resolver must keep this kind distinct to apply that rule.
+    SetUi,
 }
 
 /// One place in a Lua source that loads a `.otui` file by name.
@@ -90,38 +125,53 @@ pub struct UiLoadRef {
     pub kind: UiLoadKind,
 }
 
-/// Find every `g_ui.loadUI`/`g_ui.displayUI`/`g_ui.importStyle` call in `source` whose first
-/// argument is a complete string literal (module doc comment). Comments and unrelated string
+/// Find every `g_ui.loadUI`/`g_ui.displayUI`/`g_ui.importStyle`/`setUI` call in `source` whose
+/// first argument is a complete string literal (module doc comment). Comments and unrelated string
 /// literals are excluded first, exactly like [`crate::lua_refs::scan_id_refs`]. The returned refs
 /// are ordered by their span's start offset.
 #[must_use]
 pub fn scan_ui_loads(source: &str) -> Vec<UiLoadRef> {
     let excluded = excluded_ranges(source);
-    let mut out: Vec<UiLoadRef> = call_first_string_literal(source, &excluded, "g_ui.loadUI")
-        .map(|(path, span)| UiLoadRef {
-            path,
-            span,
-            kind: UiLoadKind::LoadUi,
-        })
-        .chain(
-            call_first_string_literal(source, &excluded, "g_ui.displayUI").map(|(path, span)| {
-                UiLoadRef {
-                    path,
-                    span,
-                    kind: UiLoadKind::DisplayUi,
-                }
-            }),
-        )
-        .chain(
-            call_first_string_literal(source, &excluded, "g_ui.importStyle").map(|(path, span)| {
-                UiLoadRef {
-                    path,
-                    span,
-                    kind: UiLoadKind::ImportStyle,
-                }
-            }),
-        )
-        .collect();
+    let mut out: Vec<UiLoadRef> =
+        call_first_string_literal(source, &excluded, "g_ui.loadUI", false)
+            .map(|(path, span)| UiLoadRef {
+                path,
+                span,
+                kind: UiLoadKind::LoadUi,
+            })
+            .chain(
+                call_first_string_literal(source, &excluded, "g_ui.displayUI", false).map(
+                    |(path, span)| UiLoadRef {
+                        path,
+                        span,
+                        kind: UiLoadKind::DisplayUi,
+                    },
+                ),
+            )
+            .chain(
+                call_first_string_literal(source, &excluded, "g_ui.importStyle", false).map(
+                    |(path, span)| UiLoadRef {
+                        path,
+                        span,
+                        kind: UiLoadKind::ImportStyle,
+                    },
+                ),
+            )
+            .chain(
+                // `setUI` is a METHOD call (`controllerVar:setUI(...)`), matched as a bare word but
+                // REQUIRING a `:` immediately before it (`require_colon_prefix`), so a bare `setUI(`,
+                // a field call `foo.setUI(`, or `g_ui.setUI(` never match. The method's own definition
+                // (`function Controller:setUI(name, parent)`) is excluded because its first "argument"
+                // `name` is a bare identifier, not a string literal — see the module doc comment.
+                call_first_string_literal(source, &excluded, "setUI", true).map(|(path, span)| {
+                    UiLoadRef {
+                        path,
+                        span,
+                        kind: UiLoadKind::SetUi,
+                    }
+                }),
+            )
+            .collect();
     out.sort_by_key(|r| r.span.start);
     out
 }
@@ -140,11 +190,19 @@ fn call_first_string_literal<'a>(
     source: &'a str,
     excluded: &'a [(usize, usize)],
     name: &'a str,
+    require_colon_prefix: bool,
 ) -> impl Iterator<Item = (String, ByteSpan)> + 'a {
     source.match_indices(name).filter_map(move |(idx, _)| {
         if !is_ident_boundary_before(source, idx)
             || !is_ident_boundary_after(source, idx + name.len())
         {
+            return None;
+        }
+        // `setUI` is only ever the Lua method call `receiver:setUI(...)` — the byte immediately
+        // before it must be a `:`. This rejects a bare `setUI(...)`, a field call `foo.setUI(...)`,
+        // and `g_ui.setUI(...)` (there is no such engine function), any of which would otherwise
+        // whole-word-match and fabricate a controller/UI pairing.
+        if require_colon_prefix && idx.checked_sub(1).map(|i| source.as_bytes()[i]) != Some(b':') {
             return None;
         }
         if in_excluded(excluded, idx) {
@@ -217,6 +275,70 @@ mod tests {
     }
 
     #[test]
+    fn set_ui_with_a_bare_name_is_indexed() {
+        // Real corpus shape (`game_highscore.lua` and friends): a colon-qualified `ctrl:setUI('foo')`
+        // method call. The scanned path is the bare name; how it resolves (module-root, not
+        // controller-relative) is the downstream resolver's job — see the module doc comment.
+        let src = "function init()\n  controller:setUI('game_highscore')\nend\n";
+        let refs = scan_ui_loads(src);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].kind, UiLoadKind::SetUi);
+        assert_eq!(refs[0].path, "game_highscore");
+        assert_eq!(text(src, refs[0].span), "game_highscore");
+    }
+
+    #[test]
+    fn set_ui_without_a_colon_receiver_is_not_indexed() {
+        // Only the Controller method call `receiver:setUI(...)` is a real pairing. A bare `setUI(`,
+        // a field call `foo.setUI(`, and `g_ui.setUI(` (no such engine function) must all be
+        // rejected — the byte before `setUI` must be a `:`.
+        assert!(scan_ui_loads("setUI('x')\n").is_empty());
+        assert!(scan_ui_loads("foo.setUI('x')\n").is_empty());
+        assert!(scan_ui_loads("g_ui.setUI('x')\n").is_empty());
+    }
+
+    #[test]
+    fn set_ui_with_a_parent_second_argument_is_indexed() {
+        let src = "controller:setUI('options', parentWidget)\n";
+        let refs = scan_ui_loads(src);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].kind, UiLoadKind::SetUi);
+        assert_eq!(refs[0].path, "options");
+    }
+
+    #[test]
+    fn set_ui_method_definition_site_is_not_indexed() {
+        // `Controller:setUI`'s own definition (`modules/modulelib/controller.lua`): the first
+        // "argument" is the bare identifier `name`, not a string literal, so it is rejected by the
+        // same rule that rejects any variable argument — no special-casing needed.
+        let src = "function Controller:setUI(name, parent)\n  self.dataUI = { name = name, parent = parent }\nend\n";
+        assert!(scan_ui_loads(src).is_empty());
+    }
+
+    #[test]
+    fn set_ui_inside_a_comment_is_not_indexed() {
+        let src = "-- controller:setUI('ghost')\n";
+        assert!(scan_ui_loads(src).is_empty());
+    }
+
+    #[test]
+    fn set_ui_as_a_substring_of_a_longer_identifier_is_not_indexed() {
+        // The bare-word scan must reject identifiers that merely CONTAIN `setUI`: the whole-word
+        // boundary check guards both sides — a preceding ident byte (`resetUI`) and a following one
+        // (`setUIState`) both disqualify the match.
+        assert!(scan_ui_loads("controller:resetUI('x')\n").is_empty());
+        assert!(scan_ui_loads("controller:setUIState('x')\n").is_empty());
+    }
+
+    #[test]
+    fn set_ui_inside_a_string_is_not_indexed() {
+        let src = "local code = [[ controller:setUI('ghost') ]]\ncontroller:setUI('real')\n";
+        let refs = scan_ui_loads(src);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].path, "real");
+    }
+
+    #[test]
     fn a_second_argument_does_not_suppress_the_first() {
         // Real code (`client_options/options.lua`): a `parent` widget is a routine second argument,
         // unlike anything `getChildById`/`setId` ever take.
@@ -273,8 +395,9 @@ mod tests {
     }
 
     #[test]
-    fn all_three_forms_in_one_file_are_all_found_in_span_order() {
-        let src = "g_ui.importStyle('style.otui')\ng_ui.loadUI('a')\ng_ui.displayUI('b')\n";
+    fn all_four_forms_in_one_file_are_all_found_in_span_order() {
+        let src = "g_ui.importStyle('style.otui')\ng_ui.loadUI('a')\ng_ui.displayUI('b')\n\
+                   controller:setUI('c')\n";
         let refs = scan_ui_loads(src);
         let kinds: Vec<UiLoadKind> = refs.iter().map(|r| r.kind).collect();
         assert_eq!(
@@ -282,11 +405,12 @@ mod tests {
             [
                 UiLoadKind::ImportStyle,
                 UiLoadKind::LoadUi,
-                UiLoadKind::DisplayUi
+                UiLoadKind::DisplayUi,
+                UiLoadKind::SetUi,
             ]
         );
         let paths: Vec<&str> = refs.iter().map(|r| r.path.as_str()).collect();
-        assert_eq!(paths, ["style.otui", "a", "b"]);
+        assert_eq!(paths, ["style.otui", "a", "b", "c"]);
     }
 
     #[test]

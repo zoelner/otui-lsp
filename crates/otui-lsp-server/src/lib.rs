@@ -79,7 +79,7 @@ use otui_core::links::{
     PathRef, is_asset_sentinel_value, is_runtime_variable_path, resolve_asset_candidates,
 };
 use otui_core::lua_refs::{LuaRefIndex, scan_id_refs};
-use otui_core::lua_ui_loads::scan_ui_loads;
+use otui_core::lua_ui_loads::{UiLoadKind, scan_ui_loads};
 use otui_core::lua_widgets::LuaWidgetIndex;
 use otui_core::manifest::{analyze_font_manifest, analyze_manifest};
 use otui_core::navigation::{AnchorTargetResolution, IdRefKind};
@@ -1547,7 +1547,17 @@ fn scan_module_dir(module_dir: &Path, client_roots: &[PathBuf]) -> Vec<(Uri, Uri
                 // fix for an observed false pairing.
                 continue;
             }
-            let mut p = controller_dir.join(&load.path);
+            // `setUI('name')` is engine-resolved as `loadUI('/' .. self.name .. '/' .. name)` —
+            // against the MODULE ROOT (`self.name` is the module name), not the calling controller's
+            // own directory. The two coincide only for a top-level controller; a nested one must
+            // resolve `setUI` at `module_dir`, unlike a bare relative `loadUI` which is
+            // controller-relative (see the `scan_ui_loads` module doc comment).
+            let base_dir = if load.kind == UiLoadKind::SetUi {
+                module_dir
+            } else {
+                controller_dir
+            };
+            let mut p = base_dir.join(&load.path);
             if p.extension().is_none() {
                 p.set_extension("otui");
             }
@@ -8484,6 +8494,48 @@ end
             pairs[0].1.as_str().ends_with("styles/ui.otui")
                 || pairs[0].1.as_str().ends_with("styles%2Fui.otui"),
             "{pairs:?}"
+        );
+    }
+
+    #[test]
+    fn scan_module_dir_resolves_set_ui_against_the_module_root_not_the_controller_dir() {
+        // `Controller:setUI('foo')` is engine-resolved as `loadUI('/<moduleName>/foo')` — against the
+        // MODULE ROOT, not the calling controller's own directory. With a NESTED controller and a
+        // decoy `mymodule.otui` sitting beside it, the root file must still win; a controller-relative
+        // resolver would wrongly pick the decoy. See `otui_core::lua_ui_loads`'s module doc comment.
+        let base =
+            std::env::temp_dir().join(format!("otui-module-scan-setui-{}", std::process::id()));
+        let _cleanup = ModuleTestDir(base.clone());
+        std::fs::create_dir_all(base.join("sub")).expect("mkdir");
+        std::fs::write(
+            base.join("mymodule.otmod"),
+            "Module\n  name: mymodule\n  scripts: [ sub/ctrl ]\n",
+        )
+        .expect("write otmod");
+        std::fs::write(
+            base.join("sub").join("ctrl.lua"),
+            "function init()\n  controller = Controller:new()\n  \
+             controller:setUI('mymodule')\nend\n",
+        )
+        .expect("write ctrl.lua");
+        // The real target, at the module root.
+        std::fs::write(
+            base.join("mymodule.otui"),
+            "MainWindow < UIWidget\n  Button\n    id: x\n",
+        )
+        .expect("write root mymodule.otui");
+        // A decoy beside the nested controller — a controller-relative resolver would pick THIS.
+        std::fs::write(base.join("sub").join("mymodule.otui"), "Decoy < UIWidget\n")
+            .expect("write decoy mymodule.otui");
+
+        let pairs = scan_module_dir(&base, &[]);
+        assert_eq!(pairs.len(), 1, "{pairs:?}");
+        assert!(pairs[0].0.as_str().ends_with("ctrl.lua"), "{pairs:?}");
+        let otui = uri_to_file_path(&pairs[0].1).expect("otui path");
+        assert_eq!(
+            otui.parent(),
+            Some(base.as_path()),
+            "setUI must resolve at the module root, not the nested controller dir: {otui:?}"
         );
     }
 
