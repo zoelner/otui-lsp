@@ -81,9 +81,9 @@ use otui_core::lua_refs::{LuaRefIndex, scan_id_refs};
 use otui_core::lua_ui_loads::scan_ui_loads;
 use otui_core::lua_widgets::LuaWidgetIndex;
 use otui_core::manifest::{analyze_font_manifest, analyze_manifest};
-use otui_core::navigation::IdRefKind;
+use otui_core::navigation::{AnchorTargetResolution, IdRefKind};
 use otui_core::otmod::otmod_scripts;
-use otui_core::property_hover::PropertyHover;
+use otui_core::property_hover::{ANCHOR_TARGET_RESOLUTION_NOTE, PropertyHover};
 use otui_core::style_index::{DocId, StyleDef, StyleIndex, is_native_base};
 
 use crate::position::{LineIndex, PositionEncoding};
@@ -2598,6 +2598,73 @@ fn render_property_hover(
     }
 }
 
+/// Format an [`AnchorTargetResolution`] (an anchor **target** under the cursor) into an LSP Markdown
+/// [`Hover`] (spec §5.5). Three shapes, mirroring [`AnchorTargetResolution`]'s own variants:
+/// * [`Sibling`](AnchorTargetResolution::Sibling) — the resolved sibling's id + widget kind, with the
+///   same resolution sentence [`otui_core::property_hover`]'s `anchors.<edge>` key hover already uses
+///   ([`ANCHOR_TARGET_RESOLUTION_NOTE`]), so the two hovers on the same line never drift on wording;
+/// * [`Magic`](AnchorTargetResolution::Magic) — a short pseudo-target explanation (`parent`/`next`/
+///   `prev`); there is no id to resolve, so no lookup happens at all;
+/// * [`Unresolved`](AnchorTargetResolution::Unresolved) — "not found among the direct siblings", the
+///   same silent-no-op fate `ANCHOR_TARGET_RESOLUTION_NOTE` already documents for a non-sibling id.
+fn render_anchor_hover(
+    resolution: &AnchorTargetResolution,
+    line_index: &LineIndex,
+    encoding: PositionEncoding,
+) -> Hover {
+    let (value, span) = match resolution {
+        AnchorTargetResolution::Sibling {
+            id,
+            kind,
+            target_span,
+            ..
+        } => (
+            format!(
+                "**`{id}`** — a `{kind}`, the direct sibling this anchor target resolves to. \
+                 {ANCHOR_TARGET_RESOLUTION_NOTE}"
+            ),
+            *target_span,
+        ),
+        AnchorTargetResolution::Magic {
+            keyword,
+            target_span,
+        } => (magic_anchor_target_hover_body(keyword), *target_span),
+        AnchorTargetResolution::Unresolved { id, target_span } => (
+            format!(
+                "**`{id}`** — not found among this widget's direct siblings. \
+                 {ANCHOR_TARGET_RESOLUTION_NOTE}"
+            ),
+            *target_span,
+        ),
+    };
+    Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value,
+        }),
+        range: Some(line_index.range(span.start, span.end, encoding)),
+    }
+}
+
+/// The hover body for a magic anchor pseudo-target (spec §2.4 / §5.5): a short explanation of what the
+/// keyword means, with no id lookup at all — `parent`/`next`/`prev` are never looked up in
+/// `getChildById` (`UIAnchor::getHookedWidget`, `uianchorlayout.cpp:26-42`), they resolve directly to
+/// the owner's parent, or its next/previous sibling in source order.
+fn magic_anchor_target_hover_body(keyword: &str) -> String {
+    match keyword {
+        "parent" => "**`parent`** — a magic anchor target: the parent widget.".to_owned(),
+        "next" => "**`next`** — a magic anchor target: the next sibling widget in source order."
+            .to_owned(),
+        "prev" => {
+            "**`prev`** — a magic anchor target: the previous sibling widget in source order."
+                .to_owned()
+        }
+        // Defensive: `schema::MAGIC_ANCHOR_TARGETS` only ever contains the three keywords above, so
+        // this is unreachable in practice.
+        other => format!("**`{other}`** — a magic anchor target."),
+    }
+}
+
 /// Format a [`PathRef`] (an asset path *value* under the cursor) into an LSP Markdown [`Hover`] —
 /// the sprite-preview hover. `resolved` is the on-disk target file, already found by the caller via
 /// [`resolve_asset_candidates`] (the same resolution `document_link` and the missing-asset
@@ -3913,12 +3980,32 @@ impl Backend {
 
         // Map the cursor Position to a byte offset, then classify the token under it.
         let offset = LineIndex::new(&text).offset_at(position, encoding);
-        let base_ref = self.service.base_reference_at(&text, offset)?;
+        if let Some(base_ref) = self.service.base_reference_at(&text, offset) {
+            // Resolve against the workspace index, building each target range from its own document.
+            let documents = self.merged_documents();
+            let index = self.style_index.read().expect("style_index lock poisoned");
+            return resolve_base_definition(&index, &documents, &base_ref.name, encoding);
+        }
 
-        // Resolve against the workspace index, building each target range from its own document.
-        let documents = self.merged_documents();
-        let index = self.style_index.read().expect("style_index lock poisoned");
-        resolve_base_definition(&index, &documents, &base_ref.name, encoding)
+        // Not a base reference — is the cursor on an anchor **target** (spec §5.3)? Jump to the
+        // resolved direct sibling's own `id:` declaration, in this same file — anchor targets never
+        // cross files, so no workspace index is needed (mirroring `resolve_anchor_target`'s hover use
+        // above). A magic target (`parent`/`next`/`prev`) or a non-sibling id has nothing to jump to:
+        // the engine's `getChildById` lookup (see `resolve_anchor_target`'s citation) would never
+        // resolve it either, so both give `None` rather than a location that would mislead the author.
+        match self.service.resolve_anchor_target(&text, offset)? {
+            AnchorTargetResolution::Sibling { id_decl_span, .. } => {
+                Some(GotoDefinitionResponse::Scalar(convert::location_of(
+                    uri,
+                    &text,
+                    id_decl_span,
+                    encoding,
+                )))
+            }
+            AnchorTargetResolution::Magic { .. } | AnchorTargetResolution::Unresolved { .. } => {
+                None
+            }
+        }
     }
 
     fn goto_type_definition(
@@ -4400,8 +4487,9 @@ impl Backend {
         }
         // Not a property key either — is the cursor on an `id:` **declaration** value (spec §5.5:
         // "this widget's id" plus a reference count)? An anchor-target id (`IdRefKind::AnchorTarget`)
-        // is deliberately excluded here — spec §5.5 gives it a different hover (the resolved sibling's
-        // kind, or "not found"), a separate later node this one does not implement.
+        // is deliberately excluded here — spec §5.5 gives it a *different* hover, handled by its own
+        // branch below (the resolved sibling's kind, a magic pseudo-target explanation, or "not
+        // found").
         //
         // The count is the document-local anchor-target count (`id_occurrences`, which — like
         // `include_declaration: false` — never counts the declaration itself as its own reference)
@@ -4433,10 +4521,18 @@ impl Backend {
         }
         drop(lua);
         drop(index);
-        // Not a property key or an id declaration either — is the cursor on an asset path *value* (a
-        // sprite-preview hover)? Same resolution as `document_link`/the missing-asset diagnostic;
-        // unlike the diagnostic this is not a claim of absence, so it degrades silently (no image, no
-        // note) when the path cannot be resolved rather than requiring a workspace root up front.
+        // Not a property key or an id declaration either — is the cursor on an anchor **target**
+        // (spec §5.5): a dotted `<id>.edge` prefix, or the bare `anchors.fill:`/`anchors.centerIn:`
+        // shorthand value? `resolve_anchor_target` is pure (an anchor target only ever resolves
+        // within the current document's own widget tree), so no workspace index is needed here.
+        if let Some(resolution) = self.service.resolve_anchor_target(&text, offset) {
+            return Some(render_anchor_hover(&resolution, &line_index, encoding));
+        }
+        // Not a property key, an id declaration, or an anchor target either — is the cursor on an
+        // asset path *value* (a sprite-preview hover)? Same resolution as `document_link`/the
+        // missing-asset diagnostic; unlike the diagnostic this is not a claim of absence, so it
+        // degrades silently (no image, no note) when the path cannot be resolved rather than
+        // requiring a workspace root up front.
         let path_ref = self.service.asset_ref_at(&text, offset)?;
         let doc_dir = uri_to_file_path(&uri).and_then(|p| p.parent().map(Path::to_path_buf));
         let resolved = doc_dir.and_then(|doc_dir| {
@@ -7484,13 +7580,18 @@ end
     #[test]
     fn hover_on_an_anchor_target_id_does_not_get_the_id_declaration_hover() {
         // The `IdRefKind::AnchorTarget` guard: hovering the `header` prefix of `header.bottom` must
-        // NOT produce the "this widget's id" hover — that is spec §5.5's *different*, separate hover
-        // (the resolved sibling's kind / "not found"), a later node this one does not implement. With
-        // no asset path and no known property at that position either, the whole hover must stay
-        // `None`.
+        // NOT produce the "this widget's id" hover — that is spec §5.5's *different* hover (the
+        // resolved sibling's kind, a magic pseudo-target explanation, or "not found"; see the
+        // `anchor_hover_*` tests below for that hover's own coverage), never the declaration's "this
+        // widget's id" + reference-count wording.
         let uri = Uri::from_str("file:///ws/panel.otui").expect("uri");
         let text = "Panel\n  id: header\nOther\n  anchors.top: header.bottom\n";
-        assert!(id_hover_at(&uri, text, "header.bottom").is_none());
+        let h = id_hover_at(&uri, text, "header.bottom").expect("the anchor-target hover fires");
+        let value = hover_text(&h);
+        assert!(
+            !value.contains("this widget's id"),
+            "must not be the id-declaration hover: {value}"
+        );
     }
 
     #[test]

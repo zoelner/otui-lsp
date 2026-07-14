@@ -18,12 +18,12 @@ use lsp_types::{
     CompletionClientCapabilities, CompletionItemCapability, CompletionParams, CompletionResponse,
     DiagnosticSeverity, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, Documentation, FileChangeType,
-    FileEvent, GotoDefinitionResponse, HoverParams, InitializeParams, InitializedParams,
-    InlayHintParams, Location, MarkupKind, NumberOrString, PartialResultParams, Position,
-    PublishDiagnosticsParams, ReferenceContext, ReferenceParams, TextDocumentClientCapabilities,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, Uri, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
-    WorkspaceFolder,
+    FileEvent, GotoDefinitionParams, GotoDefinitionResponse, HoverParams, InitializeParams,
+    InitializedParams, InlayHintParams, Location, MarkupKind, NumberOrString, PartialResultParams,
+    Position, PublishDiagnosticsParams, ReferenceContext, ReferenceParams,
+    TextDocumentClientCapabilities, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentPositionParams, Uri, VersionedTextDocumentIdentifier,
+    WorkDoneProgressParams, WorkspaceFolder,
 };
 use otui_lsp_server::{Backend, Termination, serve};
 
@@ -1337,6 +1337,59 @@ fn hover_markdown(resp: &Response) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or_else(|| panic!("expected markup hover contents, got {result}"))
         .to_owned()
+}
+
+/// Send a `textDocument/hover` request for `uri`/`position` and return the raw [`Response`] (the
+/// caller decodes it — `hover_markdown` for the common Markdown-string case, or a direct `is_null`
+/// check for a "no hover" assertion).
+fn send_hover(client: &Connection, id: i32, uri: &Uri, position: Position) -> Response {
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(id),
+            "textDocument/hover".to_owned(),
+            HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position,
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            },
+        )))
+        .expect("send hover");
+    let resp = recv_response(client, &RequestId::from(id));
+    assert!(resp.error.is_none(), "hover errored: {resp:?}");
+    resp
+}
+
+/// Send a `textDocument/definition` request for `uri`/`position` and decode the response into
+/// `Option<GotoDefinitionResponse>` (`None` for the LSP-null "no definition" answer).
+fn send_goto_definition(
+    client: &Connection,
+    id: i32,
+    uri: &Uri,
+    position: Position,
+) -> Option<GotoDefinitionResponse> {
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(id),
+            "textDocument/definition".to_owned(),
+            GotoDefinitionParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position,
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            },
+        )))
+        .expect("send definition");
+    let resp = recv_response(client, &RequestId::from(id));
+    assert!(resp.error.is_none(), "definition errored: {resp:?}");
+    resp.result
+        .filter(|v| !v.is_null())
+        .map(|v| serde_json::from_value(v).expect("GotoDefinitionResponse"))
 }
 
 /// Send a `textDocument/references` request for `uri`/`position` and decode the response into
@@ -4207,6 +4260,300 @@ fn otmod_tab_indentation_offers_the_tabs_to_spaces_quick_fix() {
     assert_eq!(edits[0].new_text, "  ", "a leading tab becomes two spaces");
     assert_eq!(edits[0].range.start, Position::new(1, 0));
     assert_eq!(edits[0].range.end, Position::new(1, 1));
+
+    shutdown_and_exit(&client, server_thread, 3);
+}
+
+/// Hover on a **dotted** anchor target id (`anchors.top: header.bottom`) that names a direct sibling
+/// (spec §5.5): the hover shows the resolved sibling's own widget kind, not just the id text.
+#[test]
+fn hover_on_a_sibling_anchor_target_shows_the_sibling_widget_kind() {
+    let uri = Uri::from_str("file:///scratch/anchor-hover-sibling.otui").expect("uri");
+    let source = "MainWindow < UIWidget\n  Header < UILabel\n    id: header\n  \
+        Body < UIWidget\n    anchors.top: header.bottom\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: source.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+    let _ = recv_diagnostics(&client, &uri);
+
+    let resp = send_hover(&client, 2, &uri, position_of(source, "header.bottom"));
+    let value = hover_markdown(&resp);
+    assert!(
+        value.contains("header"),
+        "expected the id in the hover: {value:?}"
+    );
+    assert!(
+        value.contains("UILabel"),
+        "expected the resolved sibling's widget kind in the hover: {value:?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 3);
+}
+
+/// Hover on the bare `anchors.fill:`/`anchors.centerIn:` shorthand target — the shape `id_at` cannot
+/// classify (no `.edge` suffix at all) but `resolve_anchor_target` must still resolve.
+#[test]
+fn hover_on_a_bare_fill_shorthand_target_shows_the_sibling_widget_kind() {
+    let uri = Uri::from_str("file:///scratch/anchor-hover-bare-fill.otui").expect("uri");
+    let source = "MainWindow < UIWidget\n  Header < UILabel\n    id: header\n  \
+        Body < UIWidget\n    anchors.fill: header\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: source.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+    let _ = recv_diagnostics(&client, &uri);
+
+    // The last `header` occurrence is the `anchors.fill:` value, not the `id: header` declaration.
+    let resp = send_hover(&client, 2, &uri, position_of_last(source, "header"));
+    let value = hover_markdown(&resp);
+    assert!(
+        value.contains("UILabel"),
+        "expected the resolved sibling's widget kind in the hover: {value:?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 3);
+}
+
+/// Hover on each magic anchor pseudo-target (`parent`/`next`/`prev`) shows a short explanation of the
+/// keyword, never an id lookup.
+#[test]
+fn hover_on_magic_anchor_targets_shows_the_pseudo_target_explanation() {
+    let uri = Uri::from_str("file:///scratch/anchor-hover-magic.otui").expect("uri");
+    let source = "MainWindow < UIWidget\n  A < UIWidget\n    anchors.top: parent.top\n  \
+        B < UIWidget\n    anchors.top: prev.bottom\n  \
+        C < UIWidget\n    anchors.top: next.bottom\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: source.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+    let _ = recv_diagnostics(&client, &uri);
+
+    let parent_value = hover_markdown(&send_hover(
+        &client,
+        2,
+        &uri,
+        position_of(source, "parent.top"),
+    ));
+    assert!(parent_value.contains("parent"), "{parent_value:?}");
+    assert!(parent_value.contains("parent widget"), "{parent_value:?}");
+
+    let prev_value = hover_markdown(&send_hover(
+        &client,
+        3,
+        &uri,
+        position_of(source, "prev.bottom"),
+    ));
+    assert!(prev_value.contains("previous sibling"), "{prev_value:?}");
+
+    let next_value = hover_markdown(&send_hover(
+        &client,
+        4,
+        &uri,
+        position_of(source, "next.bottom"),
+    ));
+    assert!(next_value.contains("next sibling"), "{next_value:?}");
+
+    shutdown_and_exit(&client, server_thread, 5);
+}
+
+/// Hover on an anchor target id that is not a magic keyword and does not name any direct sibling (an
+/// ancestor's own id here) says "not found" — the engine's `getChildById` lookup would silently drop
+/// it too, never a diagnostic.
+#[test]
+fn hover_on_a_non_sibling_anchor_target_id_says_not_found() {
+    let uri = Uri::from_str("file:///scratch/anchor-hover-unresolved.otui").expect("uri");
+    let source = "MainWindow < UIWidget\n  id: outer\n  Body < UIWidget\n    anchors.fill: outer\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: source.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+    let _ = recv_diagnostics(&client, &uri);
+
+    // The last `outer` occurrence is the anchor target, not the `id: outer` declaration.
+    let resp = send_hover(&client, 2, &uri, position_of_last(source, "outer"));
+    let value = hover_markdown(&resp);
+    assert!(
+        value.contains("not found"),
+        "an ancestor's id must not resolve, and must say so: {value:?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 3);
+}
+
+/// Go-to-definition on an anchor target id that names a direct sibling jumps to that sibling's own
+/// `id:` declaration, in the same file (spec §5.3).
+#[test]
+fn goto_definition_on_a_sibling_anchor_target_jumps_to_its_id_declaration() {
+    let uri = Uri::from_str("file:///scratch/anchor-goto-sibling.otui").expect("uri");
+    let source = "MainWindow < UIWidget\n  Header < UILabel\n    id: header\n  \
+        Body < UIWidget\n    anchors.top: header.bottom\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: source.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+    let _ = recv_diagnostics(&client, &uri);
+
+    let resp = send_goto_definition(&client, 2, &uri, position_of(source, "header.bottom"))
+        .expect("a direct sibling must resolve to a definition");
+    let GotoDefinitionResponse::Scalar(location) = resp else {
+        panic!("expected a single Location, got {resp:?}");
+    };
+    assert_eq!(location.uri, uri, "the jump stays in the same file");
+    assert_eq!(
+        location.range,
+        range_of(source, "header"),
+        "the jump lands on the sibling's own `id: header` declaration, not the anchor target"
+    );
+
+    shutdown_and_exit(&client, server_thread, 3);
+}
+
+/// Go-to-definition on a magic anchor target (`parent`/`next`/`prev`) has nothing to jump to — it is
+/// not a user id at all.
+#[test]
+fn goto_definition_on_a_magic_anchor_target_is_none() {
+    let uri = Uri::from_str("file:///scratch/anchor-goto-magic.otui").expect("uri");
+    let source = "MainWindow < UIWidget\n  Body < UIWidget\n    anchors.fill: parent\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: source.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+    let _ = recv_diagnostics(&client, &uri);
+
+    let resp = send_goto_definition(&client, 2, &uri, position_of(source, "parent"));
+    assert!(
+        resp.is_none(),
+        "a magic target has no id to jump to: {resp:?}"
+    );
+
+    shutdown_and_exit(&client, server_thread, 3);
+}
+
+/// Go-to-definition on an anchor target id that does not name any direct sibling (an ancestor's own
+/// id) is `None` — the engine's `getChildById` would never resolve it, so jumping anywhere would
+/// mislead the author.
+#[test]
+fn goto_definition_on_a_non_sibling_anchor_target_id_is_none() {
+    let uri = Uri::from_str("file:///scratch/anchor-goto-unresolved.otui").expect("uri");
+    let source = "MainWindow < UIWidget\n  id: outer\n  Body < UIWidget\n    anchors.fill: outer\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+    client_handshake(&client);
+
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didOpen".to_owned(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "otui".to_owned(),
+                    version: 1,
+                    text: source.to_owned(),
+                },
+            },
+        )))
+        .expect("send didOpen");
+    let _ = recv_diagnostics(&client, &uri);
+
+    // The last `outer` occurrence is the anchor target, not the `id: outer` declaration.
+    let resp = send_goto_definition(&client, 2, &uri, position_of_last(source, "outer"));
+    assert!(
+        resp.is_none(),
+        "an ancestor's id must not resolve to a (misleading) jump target: {resp:?}"
+    );
 
     shutdown_and_exit(&client, server_thread, 3);
 }

@@ -526,24 +526,34 @@ fn is_validating_property(name: &str) -> bool {
 ///   called out explicitly rather than left as a vague "a target widget".
 fn anchor_edge_body(edge: &str) -> String {
     const VALIDATION_NOTE: &str = "OTClient rejects an invalid anchor edge.";
-    const RESOLUTION_NOTE: &str = "The target is a direct sibling widget's `id:` value, or a magic \
-        pseudo-target (`parent`, `next`, `prev`); an ancestor or non-sibling id silently fails to \
-        resolve at layout time.";
     match edge {
         "fill" => format!(
             "Anchors shorthand: anchors all four edges to the target, filling it \
-             (`anchors.fill: <target>`). {VALIDATION_NOTE} {RESOLUTION_NOTE}"
+             (`anchors.fill: <target>`). {VALIDATION_NOTE} {ANCHOR_TARGET_RESOLUTION_NOTE}"
         ),
         "centerIn" => format!(
             "Anchors shorthand: anchors this widget's center to the target's center \
-             (`anchors.centerIn: <target>`). {VALIDATION_NOTE} {RESOLUTION_NOTE}"
+             (`anchors.centerIn: <target>`). {VALIDATION_NOTE} {ANCHOR_TARGET_RESOLUTION_NOTE}"
         ),
         _ => format!(
             "Anchors this widget's `{edge}` edge to a target (`anchors.{edge}: <target>`). \
-             {VALIDATION_NOTE} {RESOLUTION_NOTE}"
+             {VALIDATION_NOTE} {ANCHOR_TARGET_RESOLUTION_NOTE}"
         ),
     }
 }
+
+/// The shared sentence describing how an anchor *target* resolves (spec §5.3/§5.5): a direct sibling's
+/// `id:` value or a magic pseudo-target, never an ancestor. Reused verbatim by [`anchor_edge_body`]
+/// (the `anchors.<edge>` key hover) and by the server's anchor-*target* hover
+/// (`textDocument/hover` on the `<id>` in `anchors.top: <id>.bottom`, or a bare
+/// `anchors.fill:`/`anchors.centerIn:` target) — the two hovers describe the same resolution rule
+/// from two different cursor positions on the same line, and must never drift apart on wording.
+///
+/// `pub` (not `pub(crate)`): the server crate renders the anchor-target hover and quotes this note,
+/// same as [`documentation_body`] is `pub` for the completion module's own cross-crate documentation.
+pub const ANCHOR_TARGET_RESOLUTION_NOTE: &str = "The target is a direct sibling widget's `id:` \
+    value, or a magic pseudo-target (`parent`, `next`, `prev`); an ancestor or non-sibling id \
+    silently fails to resolve at layout time.";
 
 /// The documentation body for a `layout:`-block key ([`schema::is_layout_block_property`]) — `name`
 /// is the bare key (`type`, `fit-children`, `cell-size`, …), never a global catalog property (the

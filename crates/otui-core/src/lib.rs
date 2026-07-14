@@ -55,7 +55,7 @@ use lang_api::{
 };
 use lua_refs::{LuaIdDef, LuaIdRef};
 use lua_widgets::{LuaWidgetDef, LuaWidgetIndex};
-use navigation::{BaseRef, IdRef, StyleHeaderRef};
+use navigation::{AnchorTargetResolution, BaseRef, IdRef, StyleHeaderRef};
 use references::{IdOccurrences, StyleNameOccurrences};
 use style_index::{StyleDef, StyleIndex};
 use syntax::SyntaxTree;
@@ -205,6 +205,24 @@ impl OtuiService {
     #[must_use]
     pub fn id_at(&self, source: &str, offset: usize) -> Option<IdRef> {
         navigation::id_at(source, offset)
+    }
+
+    /// Resolve the anchor **target** under `offset` — dotted (`<id>.edge`) or the bare
+    /// `anchors.fill:`/`anchors.centerIn:` shorthand — against the anchor owner's direct siblings
+    /// (spec §5.3 go-to-definition, §5.5 hover). `None` when `offset` is not on a target token.
+    ///
+    /// Unlike [`base_reference_at`](Self::base_reference_at) this resolves in full, not just locates:
+    /// an anchor target's resolution never leaves the current document (direct siblings only), so the
+    /// whole answer is pure — see [`navigation::resolve_anchor_target`] for the engine citation.
+    ///
+    /// Inherent (not on the [`LanguageService`] trait), mirroring [`id_at`](Self::id_at).
+    #[must_use]
+    pub fn resolve_anchor_target(
+        &self,
+        source: &str,
+        offset: usize,
+    ) -> Option<AnchorTargetResolution> {
+        navigation::resolve_anchor_target(source, offset)
     }
 
     /// Find every occurrence of the style name `name` in one document (spec §5.4): the top-level

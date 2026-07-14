@@ -288,7 +288,7 @@ source location" — distinct from "unresolved" (a diagnostic, §4) and from "re
 | Cursor is on... | Resolves against |
 |---|---|
 | A `Name < Base` header's base-name token | The workspace style index (5.2); `UI*` → built-in, no jump |
-| An `anchors.<edge>` target id | The current file's `id:` tree; `parent`/`next`/`prev` are pseudo-targets |
+| An `anchors.<edge>` target id (dotted `<id>.edge`, or the bare `anchors.fill:`/`anchors.centerIn:` shorthand value) | The anchor owner's **direct-sibling** `id:` values only (same parent, excluding the owner itself) — never the whole file's `id:` tree, and never an ancestor. A `parent`/`next`/`prev` pseudo-target is not an id and has no jump (`None`); an id that resolves to no direct sibling also yields `None` rather than a misleading jump |
 | A Lua `self.ui.<id>...` dotted-chain segment, or a `getChildById('<id>')`/`recursiveGetChildById('<id>')` string argument | The paired `.otui` file's `id:` tree (2.3), PLUS any `setId('<id>')` call in that same `.lua` document (a widget id'd purely at runtime, with no `.otui id:` at all) |
 
 ### 5.4 Find-references
@@ -304,7 +304,11 @@ of the paired `.lua` controller for the same Lua-reference shapes (dot chains an
 - `id:` value → "this widget's id" plus a reference count (from 5.4).
 - `&tag:` key → **both** meanings from 2.6, rendered together.
 - `Name < Base` header's base name → resolved location (5.2) or "built-in widget class" for `UI*`.
-- Anchor target identifier → the resolved direct-sibling's kind, or "not found".
+- Anchor target identifier (dotted `<id>.edge`, or the bare `anchors.fill:`/`anchors.centerIn:`
+  shorthand value) → the resolved direct-sibling's widget kind, or "not found" for a non-magic id
+  that names no direct sibling (an ancestor's id included — resolution is scoped exactly as in 5.3).
+  A `parent`/`next`/`prev` pseudo-target is not looked up at all; hover instead explains what the
+  keyword means (the parent widget, or the next/previous sibling in source order).
 
 ## 6. Completion interface
 
