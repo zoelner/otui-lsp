@@ -7,8 +7,8 @@
 //!
 //! Behavior is a faithful mirror of the real OTClient engine (opentibiabr), per the spec vendored at
 //! `docs/otui-language-service-spec.md`. The [`syntax`] tree-sitter substrate underpins every
-//! feature module: [`diagnostics`], [`completion`], [`hover`], [`property_hover`], [`symbols`],
-//! [`navigation`], [`references`], [`hierarchy`], [`format`], [`indent`], [`folding`], [`semantic`],
+//! feature module: [`diagnostics`], [`completion`], [`hover`], [`property_hover`], [`id_hover`],
+//! [`symbols`], [`navigation`], [`references`], [`hierarchy`], [`format`], [`indent`], [`folding`], [`semantic`],
 //! [`colors`], [`links`], [`fixes`], [`lenses`], [`inlay`], plus the workspace-index building blocks
 //! ([`style_index`], [`lua_widgets`], [`lua_refs`], [`lua_ui_loads`], [`otmod`], [`widget_resolve`],
 //! [`ids`]), the module-manifest-flavored diagnostics pass ([`manifest`]), and the engine data
@@ -25,6 +25,7 @@ pub mod folding;
 pub mod format;
 pub mod hierarchy;
 pub mod hover;
+pub mod id_hover;
 pub mod ids;
 pub mod indent;
 pub mod inlay;

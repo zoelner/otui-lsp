@@ -93,6 +93,21 @@ pub struct IdOccurrences {
     pub declaration: Option<ByteSpan>,
     /// The spans of the `id` prefix in every `<id>.edge` anchor target referencing it.
     pub anchor_refs: Vec<ByteSpan>,
+    /// How many `id_property` declarations in the document carry this exact value — **not** just 0/1:
+    /// [`declaration`](Self::declaration) only ever keeps the first (spec §2.3: ids are not
+    /// uniqueness-enforced by the engine — `UIWidget::setId` is last-writer-wins in the parent's
+    /// `m_childrenById` map, first-writer-wins for the Lua field). A count `> 1` is what lets a caller
+    /// (e.g. hover) flag that ambiguity instead of silently implying the id is unique.
+    pub declaration_count: usize,
+}
+
+impl IdOccurrences {
+    /// Whether this id is declared more than once in the document (spec §2.3 — ids are not
+    /// uniqueness-enforced; see [`declaration_count`](Self::declaration_count)'s doc comment).
+    #[must_use]
+    pub fn has_duplicate_declaration(&self) -> bool {
+        self.declaration_count > 1
+    }
 }
 
 /// Find every occurrence of the id `id` in `source` (spec §5.4), scanning the whole document.
@@ -118,10 +133,12 @@ fn collect_id_occurrences(node: Node<'_>, source: &str, id: &str, out: &mut IdOc
     match node.kind() {
         "id_property" => {
             if let Some(value) = node.child_by_field_name("value")
-                && out.declaration.is_none()
                 && slice(source, value) == id
             {
-                out.declaration = Some(SyntaxTree::span_of(value));
+                out.declaration_count += 1;
+                if out.declaration.is_none() {
+                    out.declaration = Some(SyntaxTree::span_of(value));
+                }
             }
         }
         "anchor_target" => {
@@ -300,6 +317,26 @@ mod tests {
             src.find("dup").unwrap(),
             "the first declaration wins"
         );
+        // ...but the count still reflects both, so a caller can flag the ambiguity (spec §2.3: ids
+        // are not uniqueness-enforced by the engine).
+        assert_eq!(occ.declaration_count, 2);
+        assert!(occ.has_duplicate_declaration());
+    }
+
+    #[test]
+    fn a_single_declaration_is_not_flagged_as_duplicate() {
+        let src = "Panel\n  id: solo\n";
+        let occ = id_occurrences(src, "solo");
+        assert_eq!(occ.declaration_count, 1);
+        assert!(!occ.has_duplicate_declaration());
+    }
+
+    #[test]
+    fn an_absent_id_has_a_zero_declaration_count() {
+        let src = "Panel\n  id: header\n";
+        let occ = id_occurrences(src, "missing");
+        assert_eq!(occ.declaration_count, 0);
+        assert!(!occ.has_duplicate_declaration());
     }
 
     #[test]

@@ -70,6 +70,7 @@ use lsp_types::{
 use otui_core::OtuiService;
 use otui_core::fixes::Fix;
 use otui_core::hover::{Inheritance, StyleHover, StyleHoverKind};
+use otui_core::id_hover::id_hover_body;
 use otui_core::ids::{IdOrigin, visible_ids};
 use otui_core::inlay::ancestor_hints;
 use otui_core::lenses::style_lenses;
@@ -80,6 +81,7 @@ use otui_core::lua_refs::{LuaRefIndex, scan_id_refs};
 use otui_core::lua_ui_loads::scan_ui_loads;
 use otui_core::lua_widgets::LuaWidgetIndex;
 use otui_core::manifest::{analyze_font_manifest, analyze_manifest};
+use otui_core::navigation::IdRefKind;
 use otui_core::otmod::otmod_scripts;
 use otui_core::property_hover::PropertyHover;
 use otui_core::style_index::{DocId, StyleDef, StyleIndex, is_native_base};
@@ -4322,12 +4324,45 @@ impl Backend {
         if let Some(pdesc) = self.service.property_hover_at(&text, offset, &index, &lua) {
             return Some(render_property_hover(&pdesc, &line_index, encoding));
         }
+        // Not a property key either — is the cursor on an `id:` **declaration** value (spec §5.5:
+        // "this widget's id" plus a reference count)? An anchor-target id (`IdRefKind::AnchorTarget`)
+        // is deliberately excluded here — spec §5.5 gives it a different hover (the resolved sibling's
+        // kind, or "not found"), a separate later node this one does not implement.
+        //
+        // The count is the document-local anchor-target count (`id_occurrences`, which — like
+        // `include_declaration: false` — never counts the declaration itself as its own reference)
+        // plus the paired `.lua` controller's use count via `lua_forward_references`: the *identical*
+        // call the `references` handler makes (`Backend::references`, ~4062), so this hover's count
+        // and a `textDocument/references` request on the same token always agree by construction.
+        if let Some(id_ref) = self.service.id_at(&text, offset)
+            && id_ref.kind == IdRefKind::Declaration
+        {
+            let occ = self.service.id_occurrences(&text, &id_ref.id);
+            let lua_count = self
+                .lua_forward_references(&uri, &id_ref.id, encoding)
+                .len();
+            drop(lua);
+            drop(index);
+            let value = id_hover_body(
+                &id_ref.id,
+                occ.anchor_refs.len(),
+                lua_count,
+                occ.has_duplicate_declaration(),
+            );
+            return Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value,
+                }),
+                range: Some(line_index.range(id_ref.span.start, id_ref.span.end, encoding)),
+            });
+        }
         drop(lua);
         drop(index);
-        // Not a property key either — is the cursor on an asset path *value* (a sprite-preview
-        // hover)? Same resolution as `document_link`/the missing-asset diagnostic; unlike the
-        // diagnostic this is not a claim of absence, so it degrades silently (no image, no note) when
-        // the path cannot be resolved rather than requiring a workspace root up front.
+        // Not a property key or an id declaration either — is the cursor on an asset path *value* (a
+        // sprite-preview hover)? Same resolution as `document_link`/the missing-asset diagnostic;
+        // unlike the diagnostic this is not a claim of absence, so it degrades silently (no image, no
+        // note) when the path cannot be resolved rather than requiring a workspace root up front.
         let path_ref = self.service.asset_ref_at(&text, offset)?;
         let doc_dir = uri_to_file_path(&uri).and_then(|p| p.parent().map(Path::to_path_buf));
         let resolved = doc_dir.and_then(|doc_dir| {
@@ -7306,6 +7341,103 @@ end
             OtuiService::new()
                 .style_hover_at(src, offset, &index, &LuaWidgetIndex::new())
                 .is_none()
+        );
+    }
+
+    // --- `id:` declaration hover (spec §5.5): "this widget's id" + a reference count -------------
+
+    /// The LSP `Position` of the first occurrence of `needle` in `text` (UTF-16 encoding, mirroring
+    /// the handler's own default).
+    fn id_hover_position_of(text: &str, needle: &str) -> Position {
+        let offset = text.find(needle).expect("needle present");
+        LineIndex::new(text)
+            .range(offset, offset, PositionEncoding::Utf16)
+            .start
+    }
+
+    /// The LSP `Range` covering `needle`'s first occurrence in `text`.
+    fn id_hover_range_of(text: &str, needle: &str) -> lsp_types::Range {
+        let start = text.find(needle).expect("needle present");
+        let end = start + needle.len();
+        LineIndex::new(text).range(start, end, PositionEncoding::Utf16)
+    }
+
+    /// Drive `Backend::hover` for a document opened with `text`, cursor at the first occurrence of
+    /// `needle`.
+    fn id_hover_at(uri: &Uri, text: &str, needle: &str) -> Option<Hover> {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let backend = Backend::new(tx, &InitializeParams::default());
+        backend.did_open(did_open_params(uri, "otui", text));
+        backend.hover(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                position: id_hover_position_of(text, needle),
+            },
+            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+        })
+    }
+
+    #[test]
+    fn hover_on_an_id_declaration_says_this_widgets_id_and_a_reference_count() {
+        let uri = Uri::from_str("file:///ws/panel.otui").expect("uri");
+        let text = "Panel\n  id: header\nOther\n  anchors.top: header.bottom\n";
+        let h = id_hover_at(&uri, text, "header").expect("hover");
+        let value = hover_text(&h);
+        assert!(
+            value.contains("**`header`** — this widget's id."),
+            "{value}"
+        );
+        assert!(value.contains("1 reference."), "{value}");
+    }
+
+    #[test]
+    fn hover_on_an_id_declaration_range_equals_the_id_token_span() {
+        let uri = Uri::from_str("file:///ws/panel.otui").expect("uri");
+        let text = "Panel\n  id: header\n";
+        let h = id_hover_at(&uri, text, "header").expect("hover");
+        assert_eq!(h.range.unwrap(), id_hover_range_of(text, "header"));
+    }
+
+    #[test]
+    fn hover_on_an_id_with_zero_references_says_no_references() {
+        let uri = Uri::from_str("file:///ws/panel.otui").expect("uri");
+        let text = "Panel\n  id: solo\n";
+        let h = id_hover_at(&uri, text, "solo").expect("hover");
+        let value = hover_text(&h);
+        assert!(value.contains("No references."), "{value}");
+    }
+
+    #[test]
+    fn hover_on_an_anchor_target_id_does_not_get_the_id_declaration_hover() {
+        // The `IdRefKind::AnchorTarget` guard: hovering the `header` prefix of `header.bottom` must
+        // NOT produce the "this widget's id" hover — that is spec §5.5's *different*, separate hover
+        // (the resolved sibling's kind / "not found"), a later node this one does not implement. With
+        // no asset path and no known property at that position either, the whole hover must stay
+        // `None`.
+        let uri = Uri::from_str("file:///ws/panel.otui").expect("uri");
+        let text = "Panel\n  id: header\nOther\n  anchors.top: header.bottom\n";
+        assert!(id_hover_at(&uri, text, "header.bottom").is_none());
+    }
+
+    #[test]
+    fn hover_on_a_duplicated_id_declaration_adds_a_not_unique_caveat() {
+        let uri = Uri::from_str("file:///ws/panel.otui").expect("uri");
+        let text = "A\n  id: dup\nB\n  id: dup\n";
+        let h = id_hover_at(&uri, text, "dup").expect("hover");
+        let value = hover_text(&h);
+        assert!(value.contains("declared more than once"), "{value}");
+        assert!(!value.to_lowercase().contains("must be unique"), "{value}");
+    }
+
+    #[test]
+    fn hover_on_an_id_declaration_never_claims_uniqueness_when_declared_once() {
+        let uri = Uri::from_str("file:///ws/panel.otui").expect("uri");
+        let text = "Panel\n  id: header\n";
+        let h = id_hover_at(&uri, text, "header").expect("hover");
+        let value = hover_text(&h);
+        assert!(
+            !value.to_lowercase().contains("declared more than once"),
+            "{value}"
         );
     }
 
