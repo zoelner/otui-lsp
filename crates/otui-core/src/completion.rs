@@ -570,13 +570,17 @@ fn items_for(context: Context, source: &str, offset: usize) -> Vec<CompletionIte
 }
 
 /// The completion values for the value position of property `key`, from its audited value kind
-/// ([`property_hover::classify_value`]): the `display`/`layout` keyword set, or the named-color list
-/// for a color property. A freeform-valued property (a number, a path, the `border` shorthand, an
-/// arbitrary string, or an unknown key) offers nothing.
+/// ([`property_hover::classify_value`]): the `display`/`layout`/alignment/flexbox keyword sets, the
+/// `true`/`false` pair for a boolean property, or the named-color list for a color property. A
+/// freeform-valued property (a number, a path, the `border` shorthand, an arbitrary string, or an
+/// unknown key) offers nothing.
 fn property_value_items(key: &str) -> Vec<CompletionItem> {
     match property_hover::classify_value(key) {
         property_hover::PropertyValueKind::Enum { values } => {
             set_items(values, CompletionKind::EnumMember, "value")
+        }
+        property_hover::PropertyValueKind::Boolean => {
+            set_items(&["true", "false"], CompletionKind::Value, "value")
         }
         property_hover::PropertyValueKind::Color => catalog::NAMED_COLORS
             .iter()
@@ -872,6 +876,37 @@ mod tests {
         let src = "Widget\n  layout:\n";
         let off = at(src, "layout:") + "layout:".len();
         assert_eq!(labels(&complete_at(src, off)), schema::LAYOUT_TYPES);
+    }
+
+    #[test]
+    fn value_position_for_a_boolean_property_offers_true_and_false() {
+        let src = "Widget\n  enabled:\n";
+        let off = at(src, "enabled:") + "enabled:".len();
+        let items = complete_at(src, off);
+        assert_eq!(labels(&items), ["true", "false"]);
+        assert!(items.iter().all(|i| i.kind == CompletionKind::Value));
+    }
+
+    #[test]
+    fn value_position_for_the_flexbox_and_alignment_enums_offers_their_keywords() {
+        let src = "Widget\n  text-align: ce\n";
+        assert_eq!(
+            labels(&complete_at(src, at(src, "ce\n") + 2)),
+            schema::ALIGNMENT_VALUES
+        );
+        let src = "Widget\n  overflow: hi\n";
+        assert_eq!(
+            labels(&complete_at(src, at(src, "hi\n") + 2)),
+            schema::OVERFLOW_VALUES
+        );
+    }
+
+    #[test]
+    fn an_unverified_property_still_offers_no_values() {
+        // `min-width` is a known catalog property but carries no audited value kind: it must not
+        // spuriously gain a completion set.
+        let src = "Widget\n  min-width: ab\n";
+        assert!(complete_at(src, at(src, "ab\n") + 2).is_empty());
     }
 
     #[test]

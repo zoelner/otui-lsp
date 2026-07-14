@@ -9,8 +9,12 @@
 //!
 //! * a **color** property ([`catalog::COLOR_PROPERTIES`]) → takes a color;
 //! * an **asset-path** property ([`schema::PATH_PROPERTIES`]) → a texture path;
-//! * `display` / `layout` → one of a fixed value set ([`schema::DISPLAY_VALUES`] /
-//!   [`schema::LAYOUT_TYPES`]);
+//! * a **boolean** property ([`schema::BOOLEAN_PROPERTIES`]) → `true`/`false`;
+//! * `display` / `layout` / `text-align` / `icon-align` / `flex-direction` / `justify-content` /
+//!   `align-items` / `overflow` → one of a fixed value set ([`schema::DISPLAY_VALUES`] /
+//!   [`schema::LAYOUT_TYPES`] / [`schema::ALIGNMENT_VALUES`] / [`schema::FLEX_DIRECTION_VALUES`] /
+//!   [`schema::JUSTIFY_CONTENT_VALUES`] / [`schema::ALIGN_ITEMS_VALUES`] /
+//!   [`schema::OVERFLOW_VALUES`]);
 //! * `border` → the width-and-color shorthand;
 //! * any other **known** catalog property → no extra value-kind sentence, but still says whether an
 //!   invalid value is rejected or silently ignored (see [`documentation_body`]).
@@ -67,6 +71,8 @@ pub enum PropertyValueKind {
         /// The accepted values, in canonical order.
         values: &'static [&'static str],
     },
+    /// A `true`/`false` value, per [`schema::BOOLEAN_PROPERTIES`].
+    Boolean,
     /// The `border` shorthand: a width and a color (or the `none` keyword).
     Border,
     /// A known catalog property with no specially-typed value.
@@ -251,12 +257,30 @@ pub fn classify_value(name: &str) -> PropertyValueKind {
     if schema::PATH_PROPERTIES.contains(&name) {
         return PropertyValueKind::AssetPath;
     }
+    if schema::BOOLEAN_PROPERTIES.contains(&name) {
+        return PropertyValueKind::Boolean;
+    }
     match name {
         "display" => PropertyValueKind::Enum {
             values: schema::DISPLAY_VALUES,
         },
         "layout" => PropertyValueKind::Enum {
             values: schema::LAYOUT_TYPES,
+        },
+        "text-align" | "icon-align" => PropertyValueKind::Enum {
+            values: schema::ALIGNMENT_VALUES,
+        },
+        "flex-direction" => PropertyValueKind::Enum {
+            values: schema::FLEX_DIRECTION_VALUES,
+        },
+        "justify-content" => PropertyValueKind::Enum {
+            values: schema::JUSTIFY_CONTENT_VALUES,
+        },
+        "align-items" => PropertyValueKind::Enum {
+            values: schema::ALIGN_ITEMS_VALUES,
+        },
+        "overflow" => PropertyValueKind::Enum {
+            values: schema::OVERFLOW_VALUES,
         },
         "border" => PropertyValueKind::Border,
         _ => PropertyValueKind::Plain,
@@ -318,6 +342,7 @@ pub fn documentation_body(name: &str) -> Option<String> {
                 .join(", ");
             parts.push(format!("One of: {list}"));
         }
+        PropertyValueKind::Boolean => parts.push("Takes `true` or `false`.".to_owned()),
         // Nothing extra beyond the curated doc (if any) for a plainly-typed property.
         PropertyValueKind::Plain => {}
     }
@@ -438,6 +463,23 @@ mod tests {
     }
 
     #[test]
+    fn describes_a_boolean_property() {
+        let h = hover("Panel\n  enabled: true\n", "enabled").expect("hover");
+        assert_eq!(h.value, PropertyValueKind::Boolean);
+    }
+
+    #[test]
+    fn describes_the_flex_direction_enum() {
+        let h = hover("Panel\n  flex-direction: row\n", "flex-direction").expect("hover");
+        assert_eq!(
+            h.value,
+            PropertyValueKind::Enum {
+                values: schema::FLEX_DIRECTION_VALUES
+            }
+        );
+    }
+
+    #[test]
     fn the_span_covers_exactly_the_key_token() {
         let src = "Panel\n  width: 10\n";
         let h = hover(src, "width").expect("hover");
@@ -549,6 +591,31 @@ mod tests {
     }
 
     #[test]
+    fn documentation_body_states_the_boolean_value_kind_and_stays_non_validating() {
+        // `enabled` is curated AND boolean-valued: curated prose + the "Takes `true` or `false`."
+        // value-kind sentence, but the engine performs no real validation on the token itself, so the
+        // note must stay "silently ignored", NOT "rejects an invalid value" — booleans are
+        // deliberately excluded from `is_validating_property` even though this is a closed value set.
+        let body = documentation_body("enabled").expect("enabled has a doc");
+        assert!(body.contains("Takes `true` or `false`."), "{body}");
+        assert!(body.contains("silently ignored"), "{body}");
+        assert!(!body.contains("rejects an invalid value"), "{body}");
+    }
+
+    #[test]
+    fn documentation_body_appends_one_of_for_a_new_non_validating_enum_property() {
+        // `overflow` is Enum-valued but NOT one of the validating families (unlike `display`): the
+        // "One of: ..." line still appears, but the note stays "silently ignored".
+        let body = documentation_body("overflow").expect("overflow has a doc");
+        assert!(body.contains("One of:"), "{body}");
+        for value in schema::OVERFLOW_VALUES {
+            assert!(body.contains(&format!("`{value}`")), "{body}");
+        }
+        assert!(body.contains("silently ignored"), "{body}");
+        assert!(!body.contains("rejects an invalid value"), "{body}");
+    }
+
+    #[test]
     fn documentation_body_is_always_some_for_a_known_property_even_uncurated_and_plain() {
         // `min-width` is known, Plain-valued and uncurated: no curated prose, no value-kind
         // sentence — but it is still a KNOWN property, so the body is never `None`; it carries at
@@ -614,5 +681,21 @@ mod tests {
         // A non-validating, unrelated known property.
         assert!(!is_validating_property("width"));
         assert!(!is_validating_property("min-width"));
+        // Booleans and the new keyword-enum properties are NOT in the validating family: the engine
+        // never throws on them (an unrecognized token silently degrades to a default), and —
+        // critically — `diagnostics::check_property_value` does not flag them either, so the hover
+        // note must never claim the engine "rejects" a bad value here.
+        for &prop in schema::BOOLEAN_PROPERTIES {
+            assert!(
+                !is_validating_property(prop),
+                "{prop} is boolean-typed but must not be in the validating family"
+            );
+        }
+        assert!(!is_validating_property("text-align"));
+        assert!(!is_validating_property("icon-align"));
+        assert!(!is_validating_property("flex-direction"));
+        assert!(!is_validating_property("justify-content"));
+        assert!(!is_validating_property("align-items"));
+        assert!(!is_validating_property("overflow"));
     }
 }
