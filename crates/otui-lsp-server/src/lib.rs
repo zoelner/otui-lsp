@@ -16,6 +16,7 @@
 // Allow the (false-positive) lint crate-wide rather than annotate every `Uri`-keyed map.
 #![allow(clippy::mutable_key_type)]
 
+pub mod cli;
 pub mod convert;
 pub mod position;
 pub mod semantic;
