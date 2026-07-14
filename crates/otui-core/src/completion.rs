@@ -99,6 +99,11 @@ enum Context {
     /// key's engine-verified value set (see [`layout_value_items`]), or nothing for a free
     /// numeric/dimension key. The string is the layout-block key.
     LayoutValue(String),
+    /// In the **base slot** of a top-level `Name < Base` style header (spec §6, §2.2): past the
+    /// `<`, offer the valid-base union — every workspace style name plus the `UI*` native classes
+    /// in use ([`widget_names`]). A base is a plain type reference (not a child statement), so no
+    /// `id:` snippet follows it, unlike [`Context::IndentedSlot`]'s child-widget entries.
+    BaseSlot,
 }
 
 /// Compute the completion candidates for the cursor at byte `offset` in `source` (spec §6).
@@ -192,6 +197,10 @@ pub fn complete_at_with_widgets(
         {
             items_for(Context::LayoutValue(key), source, offset)
         }
+        // The style-header base slot is workspace-aware (the same union `widget_names` builds for
+        // the child-widget slot), so it is built by `base_slot_items` and routed before
+        // `items_for` is reached — mirrors `Context::IndentedSlot` above.
+        Some(Context::BaseSlot) => base_slot_items(styles, lua),
         Some(context) => items_for(context, source, offset),
         None => Vec::new(),
     }
@@ -385,6 +394,28 @@ fn snippet_escape(text: &str) -> String {
     out
 }
 
+/// Build the items offered in a `Name < Base` style header's **base slot** ([`Context::BaseSlot`]):
+/// the same valid-base union `widget_names` builds for the child-widget slot — every workspace
+/// `.otui` style name plus the `UI*` native classes in use (spec §6, §2.2; engine ground:
+/// `UIManager::getStyle`, `src/framework/ui/uimanager.cpp:527-545`, which resolves a style's base
+/// against exactly that set). Unlike [`indented_slot_items`]'s child-widget entries, a base is a
+/// plain type reference — not a nested statement — so each item is a **bare label**, with no
+/// `id:`-skeleton snippet.
+fn base_slot_items(styles: &StyleIndex, lua: &LuaWidgetIndex) -> Vec<CompletionItem> {
+    widget_names(styles, lua)
+        .into_iter()
+        .map(|(label, detail)| CompletionItem {
+            label,
+            kind: CompletionKind::Class,
+            detail: Some(detail.to_owned()),
+            sort_text: None,
+            insert_text: None,
+            insert_format: InsertFormat::Plain,
+            documentation: None,
+        })
+        .collect()
+}
+
 /// The widget/style type names usable as a nested child tag, each with a short origin `detail`:
 /// workspace `.otui` styles and the native `UI*` bases they reference ([`StyleIndex`]), plus the Lua
 /// widget classes ([`LuaWidgetIndex`]). Returned sorted by name for determinism; the caller
@@ -517,6 +548,28 @@ fn classify(prefix: &str) -> Option<Context> {
         ));
     }
 
+    // The **base slot** of a top-level `Name < Base` style header (spec §6, §2.2): unindented, the
+    // line carries a `<`, and it is not `#`-frozen (per otmlparser.cpp:311 a leading `#` makes the
+    // WHOLE line a comment, so nothing on it is completable — the NAME side, before the `<`, is
+    // likewise never completable: it is the author's own new name, not a reference). The base is
+    // everything after the *last* `<` in the prefix, trimmed of its leading whitespace. Offer while
+    // that segment is empty or a single in-progress identifier (letters/digits/`_`/`-`); `style_base`
+    // (grammar.js:111) is one greedy whole-line token, so any interior whitespace or `:` in the
+    // segment means a completed base is already followed by more content, and nothing further is
+    // offered.
+    if indent.is_empty() && !trimmed.starts_with('#') {
+        if let Some(last_lt) = trimmed.rfind('<') {
+            let segment = trimmed[last_lt + 1..].trim_start();
+            let building = segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            return building.then_some(Context::BaseSlot);
+        }
+        // No `<` yet: the cursor is still on the NAME side (or the line has no header at all) —
+        // neither is a completable slot.
+        return None;
+    }
+
     // An indented statement slot — a property key or a nested child widget being typed.
     classify_indented_slot(indent, trimmed)
 }
@@ -622,6 +675,9 @@ fn items_for(context: Context, source: &str, offset: usize) -> Vec<CompletionIte
         Context::PropertyValue(key) => property_value_items(&key),
         Context::LayoutBlock => layout_block_key_items(),
         Context::LayoutValue(key) => layout_value_items(&key),
+        // The base slot is workspace-aware (the same `widget_names` union as the child-widget
+        // slot), so it is built by `base_slot_items` and routed before this function is reached.
+        Context::BaseSlot => unreachable!("BaseSlot is handled in complete_at_with_widgets"),
     }
 }
 
@@ -1980,5 +2036,106 @@ end
             .find(|i| i.label == "$odd-style")
             .expect("lua prop offered even with a $ in its name");
         assert_eq!(odd.insert_text.as_deref(), Some("\\$odd-style: $0"));
+    }
+
+    // --- `Name < Base` style-header base slot (spec §6, §2.2) -------------------------------------
+
+    #[test]
+    fn base_slot_offers_workspace_styles_and_native_bases() {
+        // Cursor right after `<` on a top-level header: offer the valid-base union — every
+        // workspace style name plus the `UI*` native classes in use.
+        let styles = styles(&[("lib.otui", "Panel < UIWidget\n")]);
+        let lua = lua(&[]);
+        let src = "Table < \n";
+        let items = complete_at_with_widgets(src, at(src, "< ") + "< ".len(), &styles, &lua);
+        let got = labels(&items);
+        assert!(got.contains(&"Panel".to_owned()), "workspace style offered");
+        assert!(got.contains(&"UIWidget".to_owned()), "native base offered");
+        assert!(items.iter().all(|i| i.kind == CompletionKind::Class));
+        // A base is a plain type reference — no `id:` child snippet, unlike a child-widget entry.
+        assert!(items.iter().all(|i| i.insert_text.is_none()));
+        assert!(items.iter().all(|i| i.insert_format == InsertFormat::Plain));
+    }
+
+    #[test]
+    fn base_slot_partial_token_still_offers_the_whole_union() {
+        // A partial base name being typed still offers the whole set; the client filters.
+        let styles = styles(&[("lib.otui", "Panel < UIWidget\n")]);
+        let lua = lua(&[]);
+        let src = "Foo < UIB\n";
+        let items = complete_at_with_widgets(src, at(src, "UIB") + "UIB".len(), &styles, &lua);
+        let got = labels(&items);
+        assert!(got.contains(&"Panel".to_owned()));
+        assert!(got.contains(&"UIWidget".to_owned()));
+    }
+
+    #[test]
+    fn frozen_header_base_slot_offers_nothing() {
+        // `#Name < Base` — a leading `#` makes the WHOLE line a comment (otmlparser.cpp:311), so
+        // the base slot on a frozen header offers nothing.
+        let styles = styles(&[("lib.otui", "Panel < UIWidget\n")]);
+        let lua = lua(&[]);
+        let src = "#Table < \n";
+        let items = complete_at_with_widgets(src, at(src, "< ") + "< ".len(), &styles, &lua);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn slashslash_comment_containing_an_angle_bracket_offers_nothing() {
+        // A top-level `//` comment that happens to contain a `<` must not be mistaken for a header
+        // base slot: the CST suppresses completion inside a comment before `classify` ever runs.
+        let styles = styles(&[("lib.otui", "Panel < UIWidget\n")]);
+        let lua = lua(&[]);
+        let src = "// a < b\n";
+        let items = complete_at_with_widgets(src, at(src, "< ") + "< ".len(), &styles, &lua);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn base_slot_name_side_offers_nothing() {
+        // Before the `<`, the cursor sits on the header's NAME side — the author's own new name,
+        // not a reference — so nothing is offered there.
+        let src = "Tab\n";
+        assert!(complete_at(src, at(src, "Tab") + "Tab".len()).is_empty());
+    }
+
+    #[test]
+    fn base_slot_whitespace_variants_after_the_angle_bracket_both_offer_the_union() {
+        // `Name <|` (no space yet) and `Name < |` (a space already typed) both offer the union —
+        // the segment's leading whitespace is stripped either way.
+        let styles = styles(&[("lib.otui", "Panel < UIWidget\n")]);
+        let lua = lua(&[]);
+
+        let src = "Table <\n";
+        let items = complete_at_with_widgets(src, at(src, "<") + 1, &styles, &lua);
+        assert!(labels(&items).contains(&"Panel".to_owned()));
+
+        let src2 = "Table < \n";
+        let items2 = complete_at_with_widgets(src2, at(src2, "< ") + 2, &styles, &lua);
+        assert!(labels(&items2).contains(&"Panel".to_owned()));
+    }
+
+    #[test]
+    fn base_slot_completed_token_followed_by_more_content_offers_nothing() {
+        // `style_base` (grammar.js:111) is one greedy whole-line token: once the segment after `<`
+        // holds a completed word followed by more content (interior whitespace here), it is no
+        // longer being built.
+        let src = "Table < UIWidget extra\n";
+        let offset = at(src, "extra") + "extra".len();
+        assert!(complete_at(src, offset).is_empty());
+    }
+
+    #[test]
+    fn indented_line_is_unaffected_by_the_base_slot_branch() {
+        // Regression: an indented line (the ordinary IndentedSlot union) must not be routed into
+        // the new base-slot branch, even though the header line above it contains a `<`.
+        let styles = styles(&[("lib.otui", "Panel < UIWidget\n")]);
+        let lua = lua(&[]);
+        let src = "Table < UIWidget\n  wid\n";
+        let items = complete_at_with_widgets(src, at(src, "wid") + "wid".len(), &styles, &lua);
+        assert!(
+            labels(&items).contains(&"width".to_owned()),
+            "catalog present"
+        );
     }
 }
