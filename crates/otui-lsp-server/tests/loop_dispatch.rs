@@ -1955,11 +1955,19 @@ fn hover_on_an_id_declaration_reference_count_matches_the_references_response() 
 /// * `mymodule/styles/ui.otui` declares `id: x` — a DIFFERENT stem AND directory than `ctrl.lua`,
 ///   so `paired_uri` alone finds nothing here; only the module association does.
 /// * `othermodule/othermodule.otmod` + `othermodule/otherctrl.lua` (`getChildById('x')`, but NO
-///   `loadUI` call at all) is the **negative** case: same id string, its own `.otmod`, but no
-///   association naming `ui.otui` — its location must never appear in the forward direction.
-/// * `othermodule/decoy.otui` (`id: x`, never loaded by any controller) is the reverse-direction
-///   negative case — it must never appear when resolving `ctrl.lua`'s `getChildById('x')` back to a
-///   declaration.
+///   `loadUI` call at all) is the **negative** case for the FORWARD direction and for `ctrl.lua`'s
+///   OWN module (`mymodule`): same id string, its own `.otmod`, but no association naming `ui.otui`
+///   — its location must never appear among `ui.otui`'s forward references, and `decoy.otui` (a
+///   DIFFERENT module than `otherctrl.lua`'s own) must never be what `ctrl.lua`'s reverse query
+///   resolves to either.
+/// * `othermodule/decoy.otui` (`id: x`, never loaded by any controller) is what makes `otherctrl.lua`
+///   itself the *positive* case for the module-union fallback (node `module-union-unique`): within
+///   `otherctrl.lua`'s OWN module (`othermodule`), `decoy.otui` is the sole `.otui` declaring `x` —
+///   exact pairing (no `loadUI` call at all) resolves nothing, so the fallback resolves it there. It
+///   must still never appear when resolving `ctrl.lua`'s `getChildById('x')` (a DIFFERENT module,
+///   `mymodule`, whose own exact pairing already succeeds — see this node's
+///   `lua_bridge_module_union_fallback_covers_unique_ambiguous_and_exact_pairing` for that ranking
+///   covered directly).
 #[test]
 fn module_association_pairs_a_controller_with_a_differently_named_and_located_ui_file() {
     let base = std::env::temp_dir().join(format!(
@@ -2073,23 +2081,33 @@ fn module_association_pairs_a_controller_with_a_differently_named_and_located_ui
         "an otui file no controller ever loads must never be a reverse target"
     );
 
-    // --- Reverse, unpaired: otherctrl.lua calls no loadUI/displayUI/importStyle at all, so it has
-    // no module association (and no same-stem sibling either) -> nothing resolves, permanently.
-    // "Any `Some`" is safe here (unlike above): the reverse poll just above already proved
-    // `module_ui_index`'s single atomic swap has happened, and server state here is monotonic — a
-    // later request can only see that same fully-settled index or a still-later one, never an
-    // earlier, partial one.
-    let reverse_unpaired = references_until(
+    // --- Reverse, exact-pairing-less but module-union-resolved: otherctrl.lua calls no
+    // loadUI/displayUI/importStyle at all, so it has no exact pairing (no module association, no
+    // same-stem sibling either) — the shape this test predates `module-union-unique` documenting as
+    // "must never resolve". It now DOES resolve, via the fallback that node adds: `decoy.otui` is the
+    // sole `.otui` declaring `x` anywhere in `otherctrl.lua`'s own module (`othermodule`), so a live
+    // reference to `x` there can only mean that file (see `resolve_module_unique_id_declaration`'s
+    // doc comment for the full rationale). Polled for non-emptiness, the same convergence criterion
+    // the reverse poll just above uses, for the same reason (this fallback's own disk-scan
+    // dependency, `disk_texts`, is a strictly EARLIER phase than `module_ui_index`, whose completion
+    // that first poll already proved, so a plain, unretried call would also be safe here — polling
+    // is kept anyway for symmetry/robustness against a future phase-ordering change).
+    let reverse_via_fallback = references_until(
         &client,
         &mut next_id,
         &other_lua_uri,
         position_of(other_ctrl_lua_src, "x"),
         true,
-        |_locs| true,
+        |locs: &[Location]| !locs.is_empty(),
     );
-    assert!(
-        reverse_unpaired.is_empty(),
-        "otherctrl.lua has no module association and no same-stem sibling: {reverse_unpaired:#?}"
+    assert_eq!(
+        reverse_via_fallback,
+        vec![Location {
+            uri: decoy_otui_uri.clone(),
+            range: range_of(decoy_otui_src, "x"),
+        }],
+        "the module-union fallback must resolve otherctrl.lua's getChildById to decoy.otui, the sole \
+         declarer of `x` in othermodule: {reverse_via_fallback:#?}"
     );
 
     // --- Forward: id: x -> its uses, scoped to the associated ctrl.lua only. Both ctrl.lua and
@@ -2803,6 +2821,231 @@ fn references_are_unchanged_by_the_lua_definition_refactor() {
     );
 
     shutdown_and_exit(&client, server_thread, 4);
+}
+
+/// The module-union fallback ([`Backend::resolve_module_unique_id_declaration`], reached only when
+/// exact pairing resolves nothing): three modules, one workspace, one background disk scan, covering
+/// all three ranked outcomes plus both directions of the bridge in a single deterministic pass.
+///
+/// * `scenario_unique/`: `controller.lua` never calls `loadUI` and has no same-stem `.otui` sibling,
+///   so exact pairing ([`Backend::associated_uris`]) finds nothing at all for it. The module's ONLY
+///   `.otui` declaring `targetId` is a nested sibling (`panels/settings.otui`) the controller never
+///   loads — unique in the module, so the fallback resolves it.
+/// * `scenario_ambiguous/`: same shape, but the id (`dupId`) is declared in TWO sibling `.otui` files
+///   (`panels/a.otui` and `panels/b.otui`). Genuinely ambiguous — the fallback must decline (resolve
+///   to nothing) rather than guess between them.
+/// * `scenario_exact/`: `controller.lua`/`controller.otui` share a directory AND stem, so the fast
+///   path alone already resolves `pairedId` — even though a THIRD file in the same module
+///   (`other/decoy.otui`) also declares `pairedId`, making it just as ambiguous at the module level as
+///   `scenario_ambiguous`'s id. Exact pairing already succeeding must short-circuit the fallback
+///   entirely, so the paired declaration (not "nothing", the fallback's answer to that same ambiguity)
+///   is what comes back — proving the ranking in `resolve_lua_id_declarations`.
+///
+/// Every `.otui`/`.lua` file here is left CLOSED (never `didOpen`) so every result in this test can
+/// only have come from the background disk scan — exercising the real `find_owning_module_dir`/
+/// `collect_files_under` disk walk the fallback performs, not the open-buffer fast path. Both
+/// `textDocument/references` (`include_declaration: true`) and `textDocument/definition` are checked
+/// per scenario, proving both share the fallback via `resolve_lua_id_declarations` (spec §5.3/§5.4).
+#[test]
+fn lua_bridge_module_union_fallback_covers_unique_ambiguous_and_exact_pairing() {
+    let base = std::env::temp_dir().join(format!(
+        "otui-module-union-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _cleanup = TempDirGuard(base.clone());
+
+    // --- scenario_unique: fallback resolves a sibling `.otui` this controller never loads. ---
+    let unique_dir = base.join("modules").join("scenario_unique");
+    std::fs::create_dir_all(unique_dir.join("panels")).expect("mkdir scenario_unique/panels");
+    std::fs::write(
+        unique_dir.join("scenario_unique.otmod"),
+        "Module\n  name: scenario_unique\n  scripts: [ controller ]\n",
+    )
+    .expect("write otmod");
+    let unique_lua_src =
+        "function onCreate(self)\n  local btn = self.ui.targetId\n  btn:hide()\nend\n";
+    std::fs::write(unique_dir.join("controller.lua"), unique_lua_src)
+        .expect("write controller.lua");
+    let unique_otui_src = "Panel < UIWidget\n  Button\n    id: targetId\n";
+    std::fs::write(
+        unique_dir.join("panels").join("settings.otui"),
+        unique_otui_src,
+    )
+    .expect("write settings.otui");
+    let unique_lua_uri = file_uri(&unique_dir.join("controller.lua"));
+    let unique_otui_uri = file_uri(&unique_dir.join("panels").join("settings.otui"));
+
+    // --- scenario_ambiguous: the id is declared in TWO sibling `.otui` files -> declines. ---
+    let ambiguous_dir = base.join("modules").join("scenario_ambiguous");
+    std::fs::create_dir_all(ambiguous_dir.join("panels")).expect("mkdir scenario_ambiguous/panels");
+    std::fs::write(
+        ambiguous_dir.join("scenario_ambiguous.otmod"),
+        "Module\n  name: scenario_ambiguous\n  scripts: [ controller ]\n",
+    )
+    .expect("write otmod");
+    let ambiguous_lua_src =
+        "function onCreate(self)\n  local btn = self.ui.dupId\n  btn:hide()\nend\n";
+    std::fs::write(ambiguous_dir.join("controller.lua"), ambiguous_lua_src)
+        .expect("write controller.lua");
+    let dup_otui_src = "Panel < UIWidget\n  Button\n    id: dupId\n";
+    std::fs::write(ambiguous_dir.join("panels").join("a.otui"), dup_otui_src)
+        .expect("write a.otui");
+    std::fs::write(ambiguous_dir.join("panels").join("b.otui"), dup_otui_src)
+        .expect("write b.otui");
+    let ambiguous_lua_uri = file_uri(&ambiguous_dir.join("controller.lua"));
+
+    // --- scenario_exact: exact pairing already resolves `pairedId`, even though the module also
+    // holds a second, unrelated declaration of it (`other/decoy.otui`) that would otherwise make it
+    // just as ambiguous as `scenario_ambiguous`'s id. ---
+    let exact_dir = base.join("modules").join("scenario_exact");
+    std::fs::create_dir_all(exact_dir.join("other")).expect("mkdir scenario_exact/other");
+    std::fs::write(
+        exact_dir.join("scenario_exact.otmod"),
+        "Module\n  name: scenario_exact\n  scripts: [ controller ]\n",
+    )
+    .expect("write otmod");
+    let exact_lua_src =
+        "function onCreate(self)\n  local btn = self.ui.pairedId\n  btn:hide()\nend\n";
+    std::fs::write(exact_dir.join("controller.lua"), exact_lua_src).expect("write controller.lua");
+    let paired_otui_src = "Panel < UIWidget\n  Button\n    id: pairedId\n";
+    std::fs::write(exact_dir.join("controller.otui"), paired_otui_src)
+        .expect("write controller.otui");
+    std::fs::write(exact_dir.join("other").join("decoy.otui"), paired_otui_src)
+        .expect("write decoy.otui");
+    let exact_lua_uri = file_uri(&exact_dir.join("controller.lua"));
+    let exact_otui_uri = file_uri(&exact_dir.join("controller.otui"));
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || run_server(server));
+
+    #[allow(deprecated)]
+    client_handshake_with_params(
+        &client,
+        InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: file_uri(&base),
+                name: "ws".to_owned(),
+            }]),
+            ..InitializeParams::default()
+        },
+    );
+
+    let mut next_id = 2i32;
+
+    // The `.otui` scan phase (which populates every candidate the fallback reads) runs to
+    // completion, in full, strictly BEFORE the `.lua` scan phase starts (see `run_initialized`'s
+    // doc comment on the two sequential loops) — so the first `Some` this poll observes for
+    // `unique_lua_uri` already proves every `.otui` file in the whole workspace, across all three
+    // scenario directories, is indexed. Every other assertion below can then be a single,
+    // un-retried call.
+    let unique_refs = references_until(
+        &client,
+        &mut next_id,
+        &unique_lua_uri,
+        position_of(unique_lua_src, "targetId"),
+        true,
+        |_locs| true,
+    );
+    assert_eq!(
+        unique_refs,
+        vec![Location {
+            uri: unique_otui_uri.clone(),
+            range: range_of(unique_otui_src, "targetId"),
+        }],
+        "unique-in-module fallback must resolve the sole declaring sibling .otui: {unique_refs:#?}"
+    );
+
+    let unique_def_id = next_id;
+    next_id += 1;
+    let unique_def = send_definition(
+        &client,
+        unique_def_id,
+        &unique_lua_uri,
+        position_of(unique_lua_src, "targetId"),
+    )
+    .expect("definition present");
+    match unique_def {
+        GotoDefinitionResponse::Scalar(loc) => {
+            assert_eq!(loc.uri, unique_otui_uri);
+            assert_eq!(loc.range, range_of(unique_otui_src, "targetId"));
+        }
+        other => panic!("expected a single Scalar location: {other:?}"),
+    }
+
+    // The ambiguous verdict is scan-timing-independent: the fallback reads its candidate `.otui`
+    // straight from disk (`collect_files_under`, with the merged-buffer text only as an override),
+    // so both duplicate declarers are always seen regardless of index state — a single un-polled call
+    // is stable here (unlike the exact case below, which resolves through the merged-`documents`
+    // index and so must poll for the scan).
+    let ambiguous_refs_id = next_id;
+    next_id += 1;
+    let ambiguous_refs = send_references(
+        &client,
+        ambiguous_refs_id,
+        &ambiguous_lua_uri,
+        position_of(ambiguous_lua_src, "dupId"),
+        true,
+    )
+    .expect("references present (Some(empty), not None: the cursor IS on a recognized ref)");
+    assert!(
+        ambiguous_refs.is_empty(),
+        "an id declared in two sibling .otui files must decline, not guess: {ambiguous_refs:#?}"
+    );
+
+    let ambiguous_def_id = next_id;
+    next_id += 1;
+    let ambiguous_def = send_definition(
+        &client,
+        ambiguous_def_id,
+        &ambiguous_lua_uri,
+        position_of(ambiguous_lua_src, "dupId"),
+    );
+    assert!(
+        ambiguous_def.is_none(),
+        "an ambiguous module-wide id must resolve to nothing: {ambiguous_def:?}"
+    );
+
+    // Exact pairing resolves through the merged-`documents` index, so this path IS scan-timing
+    // dependent — poll until the background scan has indexed the paired `.otui`, rather than relying
+    // on filesystem scan order.
+    let exact_refs = references_until(
+        &client,
+        &mut next_id,
+        &exact_lua_uri,
+        position_of(exact_lua_src, "pairedId"),
+        true,
+        |locs| !locs.is_empty(),
+    );
+    assert_eq!(
+        exact_refs,
+        vec![Location {
+            uri: exact_otui_uri.clone(),
+            range: range_of(paired_otui_src, "pairedId"),
+        }],
+        "exact pairing must win outright — the fallback's own ambiguity verdict (nothing) must never \
+         override an already-successful exact pairing: {exact_refs:#?}"
+    );
+
+    // Same module, already proven indexed by the poll above — a single call is stable now.
+    let exact_def_id = next_id;
+    next_id += 1;
+    let exact_def = send_definition(
+        &client,
+        exact_def_id,
+        &exact_lua_uri,
+        position_of(exact_lua_src, "pairedId"),
+    )
+    .expect("definition present");
+    match exact_def {
+        GotoDefinitionResponse::Scalar(loc) => {
+            assert_eq!(loc.uri, exact_otui_uri);
+            assert_eq!(loc.range, range_of(paired_otui_src, "pairedId"));
+        }
+        other => panic!("expected a single Scalar location: {other:?}"),
+    }
+
+    shutdown_and_exit(&client, server_thread, next_id);
 }
 
 /// The forward direction of the bridge must see an **unsaved** edit to an open `.lua` buffer — not
