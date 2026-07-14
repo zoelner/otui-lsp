@@ -837,9 +837,20 @@ pub(crate) fn anchor_owner_widget(root: Node<'_>, offset: usize) -> Option<Node<
 /// citation); shared with
 /// [`navigation::resolve_anchor_target`](crate::navigation::resolve_anchor_target), which additionally
 /// needs each sibling's own widget kind and `id:` span, not just its id text.
+///
+/// Engine rule: a top-level `Name < Base` header — one whose parent is the grammar's `document`
+/// root — is a **global style definition** registered in `UIManager::m_styles`
+/// (`UIManager::importStyleFromOTML`, uimanager.cpp:467-514; dispatched from `loadUI` at
+/// :612/:625-629, where only one top-level node without `<` becomes the main widget). It is never
+/// added to any widget's child list, so `UIWidget::getChildById` (uiwidget.cpp:1487, which only
+/// ever searches that instance's own `m_childrenById`) can never resolve one top-level style's id
+/// from another. Such an owner has no anchor-resolvable siblings at all, so this returns empty
+/// rather than the other `document`-level entries the raw CST walk would otherwise offer.
 pub(crate) fn direct_sibling_widgets(owner: Node<'_>) -> Vec<Node<'_>> {
     let mut scope: Vec<Node> = Vec::new();
-    if let Some(parent) = owner.parent() {
+    if let Some(parent) = owner.parent()
+        && parent.kind() != "document"
+    {
         let mut cursor = parent.walk();
         for sibling in parent.named_children(&mut cursor) {
             if is_widget(sibling) && sibling.id() != owner.id() {
@@ -1404,6 +1415,28 @@ Panel
                 .and_then(|i| i.detail.as_deref()),
             Some("widget id")
         );
+    }
+
+    #[test]
+    fn anchor_target_top_level_style_headers_are_not_siblings_of_each_other() {
+        // Two top-level `Name < Base` headers: each is a *global style definition* registered in
+        // `UIManager::m_styles` (`UIManager::importStyleFromOTML`), never added to any widget's
+        // child list — so `First`'s anchor can never resolve `Second`'s id `other` via
+        // `getChildById`, even though the raw CST walk would otherwise see them as siblings under
+        // the shared `document` root. Only the magic targets are offered.
+        let src = "\
+First < UIWidget
+  anchors.top:
+Second < UIWidget
+  id: other
+";
+        let offset = at(src, "anchors.top:") + "anchors.top:".len();
+        assert_eq!(
+            labels(&complete_at(src, offset)),
+            schema::MAGIC_ANCHOR_TARGETS
+        );
+        let items = complete_at(src, offset);
+        assert!(!items.iter().any(|i| i.label == "other"));
     }
 
     #[test]
