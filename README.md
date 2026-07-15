@@ -117,21 +117,9 @@ the PR) even when the lint step itself would otherwise fail the job.
 
 ## Architecture
 
-A Cargo workspace that keeps language semantics separate from the LSP transport:
-
-| Crate | Role |
-|---|---|
-| `tree-sitter-otui` | tree-sitter grammar (external scanner for indentation) + highlight/injection queries |
-| `otui-core` | pure language library — parsing, diagnostics, symbols, completion, formatting (byte-offset, protocol-agnostic) |
-| `lang-api` | a `LanguageService` trait seam so a future HTML/CSS language can be added without rewriting the server |
-| `otui-lsp-server` | the LSP server binary — a synchronous `lsp-server` (the rust-analyzer transport crate) + `lsp-types` shell over `otui-core` |
-| `xtask` | dev tooling — generates the per-fork property/color catalog from the engine source |
-
-Because the editor and the CLI run the *same* `otui-core` analysis over the *same* index, a
-diagnostic can never differ between what you see in the editor and what CI reports.
-
-The format contract this server implements is vendored at
-[`docs/otui-language-service-spec.md`](docs/otui-language-service-spec.md).
+A Cargo workspace that keeps language semantics (`otui-core`, a pure and protocol-agnostic library)
+separate from the LSP transport (`otui-lsp-server`) — which is why the editor and the CLI can never
+drift apart. See [ARCHITECTURE.md](ARCHITECTURE.md) for the crate layout and the design rationale.
 
 ## Building
 
