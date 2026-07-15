@@ -365,3 +365,200 @@ fn summary_line_and_clean_project_exit_zero() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn format_sarif_prints_a_valid_sarif_log_with_a_relative_artifact_uri() {
+    let dir = scratch_dir("format-sarif");
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    std::fs::write(dir.join("fixture.otmod"), OTMOD).expect("write otmod");
+    // Same invalid-anchor-edge fixture as the human-format test above, so this pins the SAME
+    // finding rendered in the other shape.
+    let otui = "MyWidget < UIWidget\n  anchors.lft: parent\n";
+    let file = dir.join("widget.otui");
+    std::fs::write(&file, otui).expect("write fixture");
+
+    let (code, stdout, _stderr) =
+        run_otui_lsp(&["check", dir.to_str().unwrap(), "--format", "sarif"], &dir);
+    assert_ne!(
+        code, 0,
+        "the SARIF format must not change the --deny-driven exit code: {stdout}"
+    );
+
+    let sarif: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must be a single valid JSON document");
+    assert_eq!(sarif["version"], "2.1.0");
+    let results = sarif["runs"][0]["results"]
+        .as_array()
+        .expect("runs[0].results is an array");
+    // The fixture's `anchors.lft: parent` line yields TWO findings: `lft` is not a valid edge,
+    // AND `parent` alone is not a valid `<id>.<edge>` anchor target (both `invalid-anchor-edge`).
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["ruleId"], "invalid-anchor-edge");
+    assert_eq!(results[0]["level"], "error");
+    let region = &results[0]["locations"][0]["physicalLocation"]["region"];
+    assert_eq!(region["startLine"], 2);
+    assert_eq!(region["startColumn"], 11);
+
+    let uri = results[0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+        .as_str()
+        .expect("uri is a string");
+    assert!(
+        !uri.starts_with('/'),
+        "artifactLocation.uri must be relative, not an absolute machine path: {uri}"
+    );
+    assert_eq!(uri, "widget.otui");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn format_human_is_unchanged_by_the_new_flag_being_present_in_the_binary() {
+    // `--format human` explicitly given must behave exactly like the (unchanged) default —
+    // guards against the new flag accidentally becoming load-bearing for the default path.
+    let dir = scratch_dir("format-human-explicit");
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    std::fs::write(dir.join("fixture.otmod"), OTMOD).expect("write otmod");
+    std::fs::write(dir.join("widget.otui"), "MyPanel < UIWidget\n  width: 10\n")
+        .expect("write fixture");
+
+    let (code, stdout, _stderr) =
+        run_otui_lsp(&["check", dir.to_str().unwrap(), "--format", "human"], &dir);
+    assert_eq!(code, 0, "a clean project must exit zero: {stdout}");
+    assert!(
+        stdout.contains("0 error(s), 0 warning(s), 0 hint(s)"),
+        "stdout should print the unchanged human summary line: {stdout}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn format_sarif_uri_is_relative_to_the_process_cwd_not_a_narrower_discovered_root() {
+    // Regression (CodeRabbit): `relative_uri` used to strip a discovered workspace `root` prefix
+    // BEFORE falling back to the process `cwd`, so linting a subdirectory nested under the repo
+    // root — whose own `discover_roots` walk lands on that subdirectory itself, absent any
+    // client-root markers above it — produced a URI relative to that narrower subdirectory instead
+    // of the repo root a CI action actually runs `check` from. GitHub's `upload-sarif` action always
+    // maps `artifactLocation.uri` onto the repo tree relative to ITS OWN cwd, so the URI here must
+    // stay `ui/widget.otui` (relative to `dir`, the process cwd), never collapse to `widget.otui`
+    // (relative to the narrower `ui/` root `discover_roots` falls back to).
+    let dir = scratch_dir("sarif-uri-cwd");
+    let ui = dir.join("ui");
+    std::fs::create_dir_all(&ui).expect("create scratch dirs");
+    // Intentionally no `.otmod`/client-root markers anywhere under `dir`: `discover_roots` then
+    // falls back to `ui` itself as the scan root — the "narrower discovered root" this regression
+    // is about.
+    let otui = "MyWidget < UIWidget\n  anchors.lft: parent\n";
+    std::fs::write(ui.join("widget.otui"), otui).expect("write fixture");
+
+    // `ui` given as a RELATIVE path, resolved against `cwd` = `dir` — mirroring a CI action running
+    // `otui-lsp check ui --format sarif` from the repo root.
+    let (code, stdout, _stderr) = run_otui_lsp(&["check", "ui", "--format", "sarif"], &dir);
+    assert_ne!(
+        code, 0,
+        "the invalid-anchor-edge error must still fail the build: {stdout}"
+    );
+
+    let sarif: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must be a single valid JSON document");
+    let results = sarif["runs"][0]["results"]
+        .as_array()
+        .expect("results is an array");
+    assert!(
+        !results.is_empty(),
+        "expected at least one finding: {stdout}"
+    );
+    for result in results {
+        let uri = result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+            .as_str()
+            .expect("uri is a string");
+        assert_eq!(
+            uri, "ui/widget.otui",
+            "uri must be relative to the process cwd, not the narrower discovered root: {stdout}"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn sarif_start_column_is_utf16_while_human_output_keeps_the_byte_column() {
+    // Regression (CodeRabbit): SARIF 2.1.0's default `columnKind` is `utf16CodeUnits`, but
+    // `region.startColumn` used to carry the SAME byte column the human `path:line:col:` output
+    // uses, so any line with multibyte text before a finding's span would misplace the SARIF
+    // annotation.
+    //
+    // Faithfully constructing "an accented word before a diagnostic on the same line" runs into the
+    // OTUI grammar's own ASCII restriction on every identifier-shaped token (`anchors.<edge>`
+    // targets, property keys, state names, ...) — none of them can carry non-ASCII bytes at all, so
+    // there is no way to put an accented WORD strictly before a diagnostic's own span without it
+    // becoming part of that diagnostic's flagged text. The one per-line construction that legitimately
+    // puts non-ASCII bytes BEFORE a diagnostic's span, excluded from it: a stray Unicode whitespace
+    // character in a value-validating property's value. The `display`/`layout`/`border`/color check's
+    // span computation (`leaf_value`) trims it via Rust's Unicode-aware `str::trim_start`, but the
+    // OTUI *scanner* (a faithful, byte-level port of the engine's own line parser) only treats ASCII
+    // ' '/'\t' as trimmable, so the character survives as real bytes earlier on the line. A leading
+    // U+00A0 NO-BREAK SPACE — a realistic artifact of pasting a property value out of a rich-text
+    // source into a `.otui` file — before an invalid `display` value is exactly this shape.
+    let dir = scratch_dir("sarif-utf16-column");
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    std::fs::write(dir.join("fixture.otmod"), OTMOD).expect("write otmod");
+
+    let prefix = "  display: \u{a0}";
+    let bad_value = "bogus";
+    let otui = format!("MyPanel < UIWidget\n{prefix}{bad_value}\n");
+    let file = dir.join("widget.otui");
+    std::fs::write(&file, &otui).expect("write fixture");
+
+    // Sanity: the NBSP genuinely diverges the byte and UTF-16 prefix lengths — else this fixture
+    // would not exercise the bug at all. Computed from the fixture text itself rather than hardcoded,
+    // so the assertions below can never silently drift from what was actually written to disk.
+    let byte_col = prefix.len() as u64 + 1; // 1-based
+    let utf16_col = prefix.encode_utf16().count() as u64 + 1; // 1-based
+    assert!(
+        utf16_col < byte_col,
+        "fixture must have a genuinely multibyte prefix: byte_col={byte_col} utf16_col={utf16_col}"
+    );
+
+    // Human output: byte column (unchanged).
+    let (code, stdout, _stderr) = run_otui_lsp(&["check", dir.to_str().unwrap()], &dir);
+    assert_ne!(
+        code, 0,
+        "the invalid display value must fail the build: {stdout}"
+    );
+    let expected_prefix = format!("{}:2:{byte_col}:", file.display());
+    assert!(
+        stdout.contains(&expected_prefix),
+        "human output must keep the byte column ({expected_prefix}): {stdout}"
+    );
+
+    // SARIF output: the UTF-16 column, strictly less than the byte column on this fixture.
+    let (sarif_code, sarif_stdout, _stderr) =
+        run_otui_lsp(&["check", dir.to_str().unwrap(), "--format", "sarif"], &dir);
+    assert_eq!(sarif_code, code, "SARIF must not change the exit code");
+    let sarif: serde_json::Value =
+        serde_json::from_str(&sarif_stdout).expect("stdout must be a single valid JSON document");
+    let results = sarif["runs"][0]["results"]
+        .as_array()
+        .expect("results is an array");
+    assert_eq!(
+        results.len(),
+        1,
+        "expected exactly one finding: {sarif_stdout}"
+    );
+    let region = &results[0]["locations"][0]["physicalLocation"]["region"];
+    assert_eq!(region["startLine"], 2);
+    assert_eq!(
+        region["startColumn"].as_u64().unwrap(),
+        utf16_col,
+        "SARIF startColumn must be the UTF-16 column, not the byte column: {sarif_stdout}"
+    );
+    assert_ne!(
+        region["startColumn"].as_u64().unwrap(),
+        byte_col,
+        "the UTF-16 and byte columns must be demonstrably different on this fixture"
+    );
+    assert_eq!(sarif["runs"][0]["columnKind"], "utf16CodeUnits");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
