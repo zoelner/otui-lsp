@@ -123,8 +123,8 @@ the PR) even when the lint step itself would otherwise fail the job.
 ## Architecture
 
 A Cargo workspace that keeps language semantics (`otui-core`, a pure and protocol-agnostic library)
-separate from the LSP transport (`otui-lsp-server`) — which is why the editor and the CLI can never
-drift apart. See [ARCHITECTURE.md](ARCHITECTURE.md) for the crate layout and the design rationale.
+separate from the LSP transport (`otui-lsp-server`), so the editor and the CLI agree on the same
+on-disk corpus. See [ARCHITECTURE.md](ARCHITECTURE.md) for the crate layout and the design rationale.
 
 ## Building
 
