@@ -8,9 +8,9 @@ intelligence for `.otui` / `.otmod` / `.otfont` files — diagnostics, completio
 go-to-definition, find-references, formatting and more — with behavior that faithfully mirrors the
 real OTClient engine. The **same binary** doubles as a one-shot CLI formatter and linter for CI.
 
-> **Status:** early, under active development. This repository ships **only the language server**.
-> Editor clients (a VS Code extension, a Neovim plugin, …) live in separate repositories and talk to
-> this server over LSP.
+> **Status:** in active development, preparing its first public release (`0.1.0`). This repository
+> ships **only the language server**. Editor clients (a VS Code extension, a Neovim plugin, …) live in
+> separate repositories and talk to this server over LSP.
 
 ## Why
 
@@ -43,18 +43,23 @@ Open the project **folder** (not a lone file) so the server can index the whole 
 
 ## Features
 
-Working today, all resolving **workspace-wide** (the server indexes `.otui` files across the
-workspace, not just the open ones):
+Working today, all resolving **workspace-wide** (the server indexes `.otui`, `.otmod` and `.otfont`
+files across the workspace — plus the `.lua` modules that declare widget classes — not just the open
+ones):
 
-- **Diagnostics** — tab-in-indentation errors, invalid depth jumps, unknown-property hints, unknown
-  `$state`, invalid anchor edges, invalid `display`/`layout`/`border` values.
+- **Diagnostics** — tab/odd indentation and invalid depth jumps, syntax errors, unknown base/root
+  styles (`Name < Base`), unknown properties (a *hint* — the engine silently ignores them), invalid
+  `$state`, invalid anchor edges and anchors without an anchor layout, invalid
+  `display`/`layout`/`border` values, properties placed after child widgets, missing asset files
+  (`image-source`, icons), and manifest checks for `.otmod`/`.otfont` (missing roots, unknown keys).
 - **Completion** — properties, `$state` names, anchor edges/targets, `@event` names.
 - **Hover**, **go-to-definition**, **type definition** (instance → its style), **implementation**
   (style → its subtypes), **type hierarchy** (the `Name < Base` graph), **find references**,
   **rename**, **document & workspace symbols**, **document highlight**.
 - **Semantic highlighting**, **color swatches** (`documentColor`), **clickable asset links**
   (`documentLink` on `image-source` etc.), **code actions** (tab→spaces, "did you mean" fixes),
-  **formatting** (whole document and range), **folding**.
+  **code lens** ("N widgets inherit this style"), **inlay hints** (the resolved native `UI*` ancestor
+  of a based style), **formatting** (whole document, range, and on-type auto-indent), **folding**.
 
 **Planned, not yet built:** the OTClient HTML/CSS UI (behind the `lang-api` seam) and semantic
 intelligence *inside* embedded Lua bodies (embedded-Lua highlighting already works).
