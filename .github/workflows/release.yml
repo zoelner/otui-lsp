@@ -12,8 +12,10 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+# Deny by default; only the `release` job is granted `contents: write` (to create the Release). The
+# `build` job just compiles and uploads artifacts, so it keeps read-only.
 permissions:
-  contents: write # the release job creates a GitHub Release and uploads assets
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -39,6 +41,8 @@ jobs:
             os: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false # no job pushes to git; don't leave the token on disk
       # Same toolchain story as ci.yml: argument-less install reads rust-toolchain.toml (the pinned
       # version, components and all). `target add` then attaches the release target — a no-op when it
       # is the host (every row but macOS x86_64, which cross-builds on the arm64 runner).
@@ -76,8 +80,12 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/') # only real tags publish; dispatch is build-only
+    permissions:
+      contents: write # this job (and only this job) creates the GitHub Release
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false # the release is created via the gh CLI token, not git push
       - name: Guard — tag matches crate version
         run: |
           set -euo pipefail
@@ -98,10 +106,17 @@ jobs:
           set -euo pipefail
           cd dist
           for f in *.gz; do sha256sum "$f" > "$f.sha256"; done
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/*.gz
-            dist/*.sha256
-          prerelease: ${{ contains(github.ref_name, '-') }} # v0.1.0-rc.1 → pre-release
-          generate_release_notes: true
+      - name: Create GitHub Release
+        # Use the preinstalled gh CLI rather than a third-party action — no extra supply-chain surface.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # A hyphen in the tag (v0.1.0-rc.1) marks a pre-release.
+          pre=""
+          case "${{ github.ref_name }}" in *-*) pre="--prerelease" ;; esac
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            $pre \
+            dist/*.gz dist/*.sha256
