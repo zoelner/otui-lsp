@@ -535,6 +535,19 @@ pub fn run_check(args: impl Iterator<Item = String>) -> ExitCode {
         }
     }
 
+    // Resolve (and validate) the lint targets BEFORE the potentially expensive workspace scan
+    // below. `check` also lints `.otmod`/`.otfont` manifests (collected separately further down), so
+    // a manifest file passed directly is tolerated here rather than rejected as "not a `.otui` file".
+    // Doing this first means a typo'd or wrong-type argument (`check some.png`) fails fast instead of
+    // paying for a full `build_indexes` traversal before erroring.
+    let targets = match resolve_targets(&canonical_paths, &["otmod", "otfont"]) {
+        Ok(t) => t,
+        Err(msg) => {
+            eprintln!("otui-lsp check: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // The directory each canonical path resolves to (itself if already a directory, its parent for
     // a file argument) — the anchor `discover_roots` walks up from.
     let mut target_dirs: Vec<PathBuf> = Vec::new();
@@ -562,16 +575,6 @@ pub fn run_check(args: impl Iterator<Item = String>) -> ExitCode {
     // CLI is a one-shot process with nothing to cancel for, so it passes a never-stop closure —
     // `build_indexes` always runs to completion here.
     let built = build_indexes(&roots, &|| false);
-
-    // `check` also lints `.otmod`/`.otfont` manifests (collected separately below), so a manifest
-    // file passed directly must be tolerated here rather than rejected as "not a `.otui` file".
-    let targets = match resolve_targets(&canonical_paths, &["otmod", "otfont"]) {
-        Ok(t) => t,
-        Err(msg) => {
-            eprintln!("otui-lsp check: {msg}");
-            return ExitCode::FAILURE;
-        }
-    };
 
     let service = otui_core::OtuiService::new();
     let otpkg_cache: RwLock<HashMap<PathBuf, bool>> = RwLock::new(HashMap::new());

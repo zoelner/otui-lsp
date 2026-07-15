@@ -2107,6 +2107,21 @@ pub(crate) struct BuiltIndexes {
 /// the caller is discarding the result anyway. The CLI (`cli::run_check`) passes a never-stop closure
 /// (`&|| false`) since a one-shot process has nothing to cancel for, so its full-corpus build is
 /// unaffected.
+/// RAII backstop that resets [`Backend::scan_active`] to `false` on drop. The scan thread's normal
+/// (and early-return) paths still clear the flag explicitly — that clears it *before* the completion
+/// refresh, a small optimization so post-scan watched-file writes install directly. This guard exists
+/// only for the unwinding case: if one of the scan's guarded install blocks panics (e.g. a poisoned
+/// lock), the explicit store is skipped, and without this the flag would be stranded `true` forever —
+/// making every later watched-file writer keep recording into `scan_dirty` for a scan that will never
+/// install anything (unbounded growth). It is never *incorrect*, only wasteful; this makes it safe.
+struct ScanActiveGuard(Arc<AtomicBool>);
+
+impl Drop for ScanActiveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 pub(crate) fn build_indexes(roots: &[Uri], should_stop: &dyn Fn() -> bool) -> BuiltIndexes {
     let service = OtuiService::new();
 
@@ -3829,6 +3844,12 @@ impl Backend {
                 // during the read itself) gets recorded, and this scan's later (now-stale) install for
                 // that `uri` is correctly skipped. See `scan_active`/`scan_dirty`/`mark_scan_dirty`.
                 scan_active.store(true, Ordering::SeqCst);
+                // RAII backstop against a panic anywhere below (a poisoned lock) stranding
+                // `scan_active` at `true` forever — see `ScanActiveGuard`. Armed immediately after
+                // `store(true)` and before any re-lock, so even the `scan_dirty` clear just below is
+                // covered. The explicit stores on the normal and early-return paths below remain (they
+                // clear before the completion refresh); this only takes over when unwinding skips them.
+                let _scan_active_reset = ScanActiveGuard(Arc::clone(&scan_active));
                 scan_dirty.lock().expect("scan_dirty poisoned").clear();
                 let should_stop = || shutdown.load(Ordering::Relaxed);
                 let mut built = build_indexes(&roots, &should_stop);
@@ -6162,6 +6183,43 @@ mod tests {
                 .contains(&deleted),
             "a watched delete must record dirty while a scan is active"
         );
+
+        // The four `.lua` writers carry the exact same obligation as the two `.otui` ones above — a
+        // create/change/delete of a watched Lua file races the scan's per-document `lua_index` /
+        // `lua_ref_index` install just as the OTUI side does — so each must also record dirty while the
+        // scan is active. (`scan_active` is still `true` from the store above.) A helper keeps the four
+        // cases uniform: run the writer, then assert its URI landed in `scan_dirty`.
+        let assert_records_dirty = |uri: &Uri, writer: &str, run: &dyn Fn()| {
+            run();
+            assert!(
+                backend
+                    .scan_dirty
+                    .lock()
+                    .expect("scan_dirty poisoned")
+                    .contains(uri),
+                "{writer} must record dirty while a scan is active"
+            );
+        };
+
+        let lua_widget = Uri::from_str("file:///widget.lua").expect("uri");
+        assert_records_dirty(&lua_widget, "index_lua_from_disk", &|| {
+            backend.index_lua_from_disk(&lua_widget, "function foo() end\n");
+        });
+
+        let lua_widget_deleted = Uri::from_str("file:///widget_deleted.lua").expect("uri");
+        assert_records_dirty(&lua_widget_deleted, "deindex_lua", &|| {
+            backend.deindex_lua(&lua_widget_deleted);
+        });
+
+        let lua_refs = Uri::from_str("file:///refs.lua").expect("uri");
+        assert_records_dirty(&lua_refs, "index_lua_refs_from_disk", &|| {
+            backend.index_lua_refs_from_disk(&lua_refs, "getChildById('x')\n".to_owned());
+        });
+
+        let lua_refs_deleted = Uri::from_str("file:///refs_deleted.lua").expect("uri");
+        assert_records_dirty(&lua_refs_deleted, "deindex_lua_refs", &|| {
+            backend.deindex_lua_refs(&lua_refs_deleted);
+        });
     }
 
     #[test]
