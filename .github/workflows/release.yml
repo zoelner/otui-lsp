@@ -112,9 +112,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Reference the tag via the built-in $GITHUB_REF_NAME env var, never a ${{ }} expansion:
-          # tag names are attacker-influenceable, and expanding one into the script text could inject
-          # shell into this write-scoped job. A hyphen in the tag (v0.1.0-rc.1) marks a pre-release.
+          # Reference the tag via the built-in $GITHUB_REF_NAME env var, never an inline Actions
+          # expression: tag names are attacker-influenceable, and expanding one into the script text
+          # could inject shell into this write-scoped job. A hyphen (v0.1.0-rc.1) marks a pre-release.
           pre=""
           case "$GITHUB_REF_NAME" in *-*) pre="--prerelease" ;; esac
           gh release create "$GITHUB_REF_NAME" \
