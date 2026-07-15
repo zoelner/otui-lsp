@@ -1,0 +1,107 @@
+name: Release
+
+# Publish per-platform `otui-lsp` binaries as GitHub Release assets. The VS Code extension
+# (separate repo) consumes these assets — see docs/releasing.md for the asset-name contract and the
+# extension-side integration.
+#
+# To cut a release: bump `[workspace.package] version` in Cargo.toml, commit, then push a matching
+# tag (`vX.Y.Z`). A tag whose version differs from Cargo.toml is rejected by the guard below.
+# `workflow_dispatch` runs the build matrix only (no Release is created) — a safe dry run.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write # the release job creates a GitHub Release and uploads assets
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false # never abort an in-flight publish (a tag re-push must not leave a partial Release)
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04 # older glibc → broadly compatible linux-x64 binary
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm # GitHub-hosted ARM runner: native build, no cross
+          - target: x86_64-apple-darwin
+            os: macos-14 # Apple Silicon runner; x86_64 via the universal Apple toolchain
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Same toolchain story as ci.yml: argument-less install reads rust-toolchain.toml (the pinned
+      # version, components and all). `target add` then attaches the release target — a no-op when it
+      # is the host (every row but macOS x86_64, which cross-builds on the arm64 runner).
+      - run: rustup toolchain install
+      - run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked -p otui-lsp-server --bin otui-lsp --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe=""
+          [ "${{ runner.os }}" = "Windows" ] && exe=".exe"
+          src="target/${{ matrix.target }}/release/otui-lsp${exe}"
+          # Strip on unix to shrink the asset; MSVC carries no separate symbol table to strip.
+          if [ "${{ runner.os }}" != "Windows" ]; then strip "$src"; fi
+          # macOS arm64 refuses to run a Mach-O with no valid signature, and stripping can drop the
+          # ad-hoc signature the linker applied. Re-apply one so the aarch64 asset doesn't die with
+          # "killed: Code Signature Invalid" on Apple Silicon (a no-op risk on the x86_64 slice).
+          if [ "${{ runner.os }}" = "macOS" ]; then codesign --force --sign - "$src"; fi
+          out="otui-lsp-${{ matrix.target }}${exe}"
+          cp "$src" "$out"
+          gzip -n "$out" # → otui-lsp-<triple>[.exe].gz ; gunzip restores the runnable name
+      - uses: actions/upload-artifact@v4
+        with:
+          name: otui-lsp-${{ matrix.target }}
+          path: otui-lsp-${{ matrix.target }}*.gz
+          if-no-files-found: error
+
+  release:
+    name: release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') # only real tags publish; dispatch is build-only
+    steps:
+      - uses: actions/checkout@v4
+      - name: Guard — tag matches crate version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          # Read the version from the [workspace.package] section specifically — a bare grep would
+          # silently match some other column-0 `version =` if the root manifest ever gains one.
+          crate="$(awk -F'"' '/^\[workspace.package\]/{f=1} f && /^version = /{print $2; exit}' Cargo.toml)"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::Tag v$tag does not match Cargo.toml version $crate. Bump the version, commit, then re-tag."
+            exit 1
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true # flatten every build's artifact into dist/
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          for f in *.gz; do sha256sum "$f" > "$f.sha256"; done
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.gz
+            dist/*.sha256
+          prerelease: ${{ contains(github.ref_name, '-') }} # v0.1.0-rc.1 → pre-release
+          generate_release_notes: true
