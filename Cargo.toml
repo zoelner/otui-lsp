@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 # Tracks the pinned toolchain in rust-toolchain.toml — bump the two together. Nothing downstream
 # consumes these crates, so a lower MSRV would protect no one while forbidding language features.

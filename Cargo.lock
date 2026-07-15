@@ -210,7 +210,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "lang-api"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "litemap"
@@ -258,7 +258,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "otui-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lang-api",
  "tree-sitter",
@@ -267,7 +267,7 @@ dependencies = [
 
 [[package]]
 name = "otui-lsp-server"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "lang-api",
@@ -473,7 +473,7 @@ checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
 
 [[package]]
 name = "tree-sitter-otui"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "cc",
  "tree-sitter",
@@ -512,7 +512,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "xtask"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lang-api",
  "otui-core",

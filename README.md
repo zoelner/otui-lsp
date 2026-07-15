@@ -66,7 +66,9 @@ intelligence *inside* embedded Lua bodies (embedded-Lua highlighting already wor
 
 ## Using it in an editor
 
-The release build produces `target/release/otui-lsp`, an stdio LSP binary. Point an editor's LSP
+The release build produces `target/release/otui-lsp`, an stdio LSP binary — or download a pre-built
+binary for your platform from the [Releases](https://github.com/zoelner/otui-lsp/releases) page (see
+[docs/releasing.md](docs/releasing.md) for how releases are cut and consumed). Point an editor's LSP
 client at it for `.otui` / `.otmod` / `.otfont` files.
 
 - **VS Code** — install the companion [`otui-vscode-extension`](https://github.com/zoelner/otui-vscode-extension)
