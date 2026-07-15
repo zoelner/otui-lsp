@@ -4,36 +4,42 @@ A [Language Server](https://microsoft.github.io/language-server-protocol/) for *
 the UI markup language of the [OTClient](https://github.com/mehah/otclient) game client.
 
 `otui-lsp` gives any LSP-capable editor (VS Code, Neovim, and custom editors) real language
-intelligence for `.otui` / `.otmod` / `.otfont` files: syntax highlighting, diagnostics,
-completion, hover, go-to-definition, find-references, document/workspace symbols, formatting and
-more — with behavior that faithfully mirrors the real OTClient engine.
+intelligence for `.otui` / `.otmod` / `.otfont` files — diagnostics, completion, hover,
+go-to-definition, find-references, formatting and more — with behavior that faithfully mirrors the
+real OTClient engine. The **same binary** doubles as a one-shot CLI formatter and linter for CI.
 
-> **Status:** early, under active development. This repository ships **only the language
-> server**. Editor clients (a VS Code extension, a Neovim plugin, …) live in separate
-> repositories and talk to this server over LSP.
+> **Status:** early, under active development. This repository ships **only the language server**.
+> Editor clients (a VS Code extension, a Neovim plugin, …) live in separate repositories and talk to
+> this server over LSP.
 
 ## Why
 
 OTUI is an indentation-based markup (2 spaces per level, `Name < Base` inheritance, anchors,
 `$state` selectors, `@`/`&`/`!` Lua-bearing tags). Editors today treat it as plain YAML. This
-server understands the format the way the engine does — including its exact tolerances (an
-unknown property is *silently ignored*, so it's a hint, not an error) and strictnesses (a tab in
-the indentation is a hard error).
+server understands the format the way the engine does — including its exact tolerances (an unknown
+property is *silently ignored*, so it's a hint, not an error) and strictnesses (a tab in the
+indentation is a hard error).
 
-## Architecture
+## Quick start
 
-A Cargo workspace that keeps language semantics separate from the LSP transport:
+```bash
+git clone https://github.com/zoelner/otui-lsp && cd otui-lsp
+cargo build --release          # → target/release/otui-lsp  (an stdio LSP binary that is also the CLI)
+```
 
-| Crate | Role |
-|---|---|
-| `tree-sitter-otui` | tree-sitter grammar (external scanner for indentation) + highlight/injection queries |
-| `otui-core` | pure language library — parsing, diagnostics, symbols, completion, formatting (byte-offset, protocol-agnostic) |
-| `lang-api` | a `LanguageService` trait seam so a future HTML/CSS language can be added without rewriting the server |
-| `otui-lsp-server` | the LSP server binary — a synchronous `lsp-server` (the rust-analyzer transport crate) + `lsp-types` shell over `otui-core` |
-| `xtask` | dev tooling — generates the per-fork property/color catalog from the engine source |
+Then pick a path:
 
-The format contract this server implements is vendored at
-[`docs/otui-language-service-spec.md`](docs/otui-language-service-spec.md).
+- **In an editor** — wire the binary into your editor's LSP client and open your module folder. See
+  [Using it in an editor](#using-it-in-an-editor).
+- **In CI** — lint a project without speaking LSP at all:
+
+  ```bash
+  target/release/otui-lsp check path/to/modules
+  ```
+
+  See [Command-line (CI)](#command-line-ci).
+
+Open the project **folder** (not a lone file) so the server can index the whole workspace.
 
 ## Features
 
@@ -55,8 +61,8 @@ intelligence *inside* embedded Lua bodies (embedded-Lua highlighting already wor
 
 ## Using it in an editor
 
-Build the server (`cargo build --release` → `target/release/otui-lsp`, an stdio LSP binary), then
-point an editor's LSP client at it for `.otui` / `.otmod` / `.otfont` files.
+The release build produces `target/release/otui-lsp`, an stdio LSP binary. Point an editor's LSP
+client at it for `.otui` / `.otmod` / `.otfont` files.
 
 - **VS Code** — install the companion [`otui-vscode-extension`](https://github.com/zoelner/otui-vscode-extension)
   (a thin client; set `otui.server.path` to your built binary).
@@ -108,6 +114,24 @@ a pull request:
 The exit code is unaffected by `--format`: it is still governed entirely by `--deny`, so pair the
 `check` step above with `continue-on-error: true` if you want the SARIF upload to run (and annotate
 the PR) even when the lint step itself would otherwise fail the job.
+
+## Architecture
+
+A Cargo workspace that keeps language semantics separate from the LSP transport:
+
+| Crate | Role |
+|---|---|
+| `tree-sitter-otui` | tree-sitter grammar (external scanner for indentation) + highlight/injection queries |
+| `otui-core` | pure language library — parsing, diagnostics, symbols, completion, formatting (byte-offset, protocol-agnostic) |
+| `lang-api` | a `LanguageService` trait seam so a future HTML/CSS language can be added without rewriting the server |
+| `otui-lsp-server` | the LSP server binary — a synchronous `lsp-server` (the rust-analyzer transport crate) + `lsp-types` shell over `otui-core` |
+| `xtask` | dev tooling — generates the per-fork property/color catalog from the engine source |
+
+Because the editor and the CLI run the *same* `otui-core` analysis over the *same* index, a
+diagnostic can never differ between what you see in the editor and what CI reports.
+
+The format contract this server implements is vendored at
+[`docs/otui-language-service-spec.md`](docs/otui-language-service-spec.md).
 
 ## Building
 
